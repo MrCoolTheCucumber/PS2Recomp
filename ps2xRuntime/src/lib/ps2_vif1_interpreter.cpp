@@ -484,7 +484,7 @@ void PS2Memory::cancelVIF1VuWait()
     m_vif1WaitingForVu = false;
     if (m_rdram)
         vif1_regs.stat &= ~(1u << 2); // VEW
-    m_vif1DeferredData.clear();
+    clearVif1Stream();
 }
 
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
@@ -500,12 +500,93 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 }
 
 void PS2Memory::appendVif1Stream(
-    const uint8_t *data, uint32_t sizeBytes)
+    const uint8_t *data, uint32_t sizeBytes,
+    std::optional<uint8_t> firstByteOffset)
 {
     if (!data || sizeBytes == 0u)
         return;
+
+    const uint8_t startOffset = static_cast<uint8_t>(
+        firstByteOffset.value_or(
+            m_vif1NextByteOffset) &
+        0x0Fu);
     m_vif1DeferredData.insert(
         m_vif1DeferredData.end(), data, data + sizeBytes);
+
+    if (!m_vif1DeferredSegments.empty())
+    {
+        Vif1StreamSegment &tail =
+            m_vif1DeferredSegments.back();
+        const uint8_t expectedOffset =
+            static_cast<uint8_t>(
+                (tail.firstByteOffset +
+                 tail.byteCount) &
+                0x0Fu);
+        if (expectedOffset == startOffset)
+        {
+            tail.byteCount += sizeBytes;
+            m_vif1NextByteOffset =
+                static_cast<uint8_t>(
+                    (startOffset + sizeBytes) &
+                    0x0Fu);
+            return;
+        }
+    }
+
+    m_vif1DeferredSegments.push_back(
+        {sizeBytes, startOffset});
+    m_vif1NextByteOffset =
+        static_cast<uint8_t>(
+            (startOffset + sizeBytes) & 0x0Fu);
+}
+
+void PS2Memory::consumeVif1StreamSegments(
+    size_t sizeBytes)
+{
+    while (sizeBytes != 0u &&
+           !m_vif1DeferredSegments.empty())
+    {
+        Vif1StreamSegment &segment =
+            m_vif1DeferredSegments.front();
+        if (sizeBytes < segment.byteCount)
+        {
+            segment.firstByteOffset =
+                static_cast<uint8_t>(
+                    (segment.firstByteOffset +
+                     sizeBytes) &
+                    0x0Fu);
+            segment.byteCount -= sizeBytes;
+            return;
+        }
+
+        sizeBytes -= segment.byteCount;
+        m_vif1DeferredSegments.pop_front();
+    }
+}
+
+uint8_t PS2Memory::vif1StreamByteOffset(
+    size_t position) const
+{
+    for (const Vif1StreamSegment &segment :
+         m_vif1DeferredSegments)
+    {
+        if (position < segment.byteCount)
+        {
+            return static_cast<uint8_t>(
+                (segment.firstByteOffset +
+                 position) &
+                0x0Fu);
+        }
+        position -= segment.byteCount;
+    }
+    return m_vif1NextByteOffset;
+}
+
+void PS2Memory::clearVif1Stream()
+{
+    m_vif1DeferredData.clear();
+    m_vif1DeferredSegments.clear();
+    m_vif1NextByteOffset = 0u;
 }
 
 PS2Memory::Vif1ParserDisposition
@@ -535,6 +616,7 @@ PS2Memory::processVif1Stream()
         {
             if (pos != 0u)
             {
+                consumeVif1StreamSegments(pos);
                 m_vif1DeferredData.erase(
                     m_vif1DeferredData.begin(),
                     m_vif1DeferredData.begin() + pos);
@@ -913,6 +995,16 @@ PS2Memory::processVif1Stream()
                 break;
             }
 
+            // PCSX2's VIF implementation records this as start_aligned.
+            // Values 1..3 identify the source word within its input
+            // quadword; 4 represents an exactly aligned source.
+            const uint32_t sourceByteOffset =
+                vif1StreamByteOffset(pos);
+            const uint32_t sourceWordAlignment =
+                sourceByteOffset == 0u
+                    ? 4u
+                    : sourceByteOffset / 4u;
+
             uint32_t vuAddr = (uint32_t)imm & 0x3FFu;
             if ((imm & 0x8000u) != 0u)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
@@ -959,6 +1051,17 @@ PS2Memory::processVif1Stream()
                         decoded = true;
                     }
 
+                    const auto sourceHasBytes =
+                        [&](uint32_t offset, uint32_t count) -> bool
+                        {
+                            if (!srcVec)
+                                return false;
+                            const size_t sourceOffset =
+                                static_cast<size_t>(srcVec - srcBase);
+                            return sourceOffset + offset + count <=
+                                   static_cast<size_t>(totalBytes);
+                        };
+
                     auto extend16 = [&](uint16_t raw) -> uint32_t
                     {
                         if (zeroExtend)
@@ -991,12 +1094,26 @@ PS2Memory::processVif1Stream()
                         }
                         else
                         {
-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+                            // V3 uses the V4 decoder on real hardware. Its W
+                            // lane therefore reads the adjacent packed source
+                            // component while the source still advances by
+                            // only three components. V2 repeats XY into ZW.
+                            const uint32_t limit =
+                                components == 3
+                                    ? 4u
+                                    : static_cast<uint32_t>(components);
                             for (uint32_t c = 0; c < limit; ++c)
                             {
+                                if (!sourceHasBytes(c * 4u, 4u))
+                                    break;
                                 uint32_t scalar = 0;
                                 std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
                                 decompressed[c] = scalar;
+                            }
+                            if (components == 2)
+                            {
+                                decompressed[2] = decompressed[0];
+                                decompressed[3] = decompressed[1];
                             }
                         }
                     }
@@ -1014,12 +1131,22 @@ PS2Memory::processVif1Stream()
                         }
                         else
                         {
-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+                            const uint32_t limit =
+                                components == 3
+                                    ? 4u
+                                    : static_cast<uint32_t>(components);
                             for (uint32_t c = 0; c < limit; ++c)
                             {
+                                if (!sourceHasBytes(c * 2u, 2u))
+                                    break;
                                 uint16_t raw = 0;
                                 std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
                                 decompressed[c] = extend16(raw);
+                            }
+                            if (components == 2)
+                            {
+                                decompressed[2] = decompressed[0];
+                                decompressed[3] = decompressed[1];
                             }
                         }
                     }
@@ -1035,10 +1162,20 @@ PS2Memory::processVif1Stream()
                         }
                         else
                         {
-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+                            const uint32_t limit =
+                                components == 3
+                                    ? 4u
+                                    : static_cast<uint32_t>(components);
                             for (uint32_t c = 0; c < limit; ++c)
                             {
+                                if (!sourceHasBytes(c, 1u))
+                                    break;
                                 decompressed[c] = extend8(srcVec[c]);
+                            }
+                            if (components == 2)
+                            {
+                                decompressed[2] = decompressed[0];
+                                decompressed[3] = decompressed[1];
                             }
                         }
                     }
@@ -1055,6 +1192,53 @@ PS2Memory::processVif1Stream()
                     else
                     {
                         handledFormat = false;
+                    }
+
+                    // The hardware V3 decoder fetches a fourth component,
+                    // but selected source-quadword boundaries force W to
+                    // zero. These alignment rules are deterministic despite
+                    // the manual describing the lane as indeterminate.
+                    if (decoded && components == 3)
+                    {
+                        bool zeroW = false;
+                        if (vl == 0u)
+                        {
+                            const uint32_t iteration =
+                                (srcIndex - 1u) & 1u;
+                            zeroW =
+                                iteration !=
+                                sourceWordAlignment;
+                        }
+                        else if (vl == 1u)
+                        {
+                            const uint32_t iteration =
+                                srcIndex;
+                            const uint32_t boundary =
+                                ((iteration / 4u) + 1u +
+                                 (4u -
+                                  sourceWordAlignment)) &
+                                3u;
+                            zeroW =
+                                (iteration & 1u) == 0u &&
+                                boundary == 0u;
+                        }
+                        else if (vl == 2u)
+                        {
+                            zeroW =
+                                srcIndex !=
+                                sourceWordAlignment;
+                        }
+
+                        if (zeroW)
+                            decompressed[3] = 0u;
+                    }
+
+                    // V2-32 also exposes a hardware-tested zero W lane. The
+                    // narrower V2 formats retain their XYXY duplication.
+                    if (decoded && components == 2 &&
+                        vl == 0u)
+                    {
+                        decompressed[3] = 0u;
                     }
 
                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.

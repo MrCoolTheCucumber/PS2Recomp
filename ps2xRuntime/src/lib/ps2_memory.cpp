@@ -576,8 +576,8 @@ struct Ps2GsDmaTraceState
     bool enabled = false;
     bool active = false;
     std::FILE *output = nullptr;
-    uint64_t sequence = 0u;
     uint64_t activeSequence = 0u;
+    uint64_t startEeCycle = 0u;
     uint64_t start = 0u;
     uint64_t limit = std::numeric_limits<uint64_t>::max();
     uint32_t chcr = 0u;
@@ -642,6 +642,7 @@ struct Ps2GsDmaTraceState
     std::string path1DumpDirectory;
     std::string vif1InputDumpDirectory;
     std::string vu1DumpDirectory;
+    std::string outputPath;
     std::vector<std::pair<uint32_t, uint32_t>> writeRanges;
     std::vector<uint32_t> watchAddresses;
     std::vector<uint32_t> watchValues;
@@ -649,13 +650,25 @@ struct Ps2GsDmaTraceState
 
     ~Ps2GsDmaTraceState()
     {
+        disable();
+    }
+
+    void disable()
+    {
+        finish();
         if (g_ps2GsDmaTraceState == this)
         {
             g_ps2GsDmaWriteTraceEnabled.store(false, std::memory_order_relaxed);
             g_ps2GsDmaTraceState = nullptr;
         }
+        enabled = false;
+        active = false;
         if (output)
+        {
+            std::fflush(output);
             std::fclose(output);
+            output = nullptr;
+        }
     }
 
     bool parseWriteRanges(const char *text)
@@ -778,7 +791,8 @@ struct Ps2GsDmaTraceState
             return;
         }
 
-        output = std::fopen(path, "wb");
+        outputPath = path;
+        output = std::fopen(outputPath.c_str(), "wb");
         if (!output)
         {
             std::fprintf(stderr, "PS2 GS DMA trace: cannot open '%s': %s\n",
@@ -860,6 +874,51 @@ struct Ps2GsDmaTraceState
                      start, limit, writeRangesText ? writeRangesText : "",
                      watchAddressesText ? watchAddressesText : "");
         std::fflush(output);
+    }
+
+    bool configureDynamic(
+        const std::string &newOutputPath,
+        uint64_t newStart,
+        uint64_t newLimit,
+        const std::string &newVif1InputDumpDirectory,
+        const std::string &newPath1DumpDirectory,
+        const std::string &newVu1DumpDirectory,
+        std::string &diagnostic)
+    {
+        disable();
+        configured = true;
+        start = newStart;
+        limit = newLimit;
+        outputPath = newOutputPath;
+        vif1InputDumpDirectory = newVif1InputDumpDirectory;
+        path1DumpDirectory = newPath1DumpDirectory;
+        vu1DumpDirectory = newVu1DumpDirectory;
+        writeRanges.clear();
+        watchAddresses.clear();
+        watchValues.clear();
+        eeWrites.clear();
+        vu1StepSequence = std::numeric_limits<uint64_t>::max();
+        vu1StepOrdinal = std::numeric_limits<uint64_t>::max();
+        vu1DumpCount = 1u;
+
+        output = std::fopen(outputPath.c_str(), "wb");
+        if (!output)
+        {
+            diagnostic = "cannot open '" + outputPath + "': " +
+                         std::strerror(errno);
+            return false;
+        }
+
+        enabled = true;
+        std::fprintf(output,
+                     "{\"schema_version\":1,\"event\":\"configuration\","
+                     "\"producer\":\"PS2Recomp\",\"start\":%" PRIu64 ","
+                     "\"limit\":%" PRIu64 ","
+                     "\"ee_write_ranges\":\"\","
+                     "\"watch_addresses\":\"\"}\n",
+                     start, limit);
+        std::fflush(output);
+        return true;
     }
 
     static void writeHex(std::FILE *file, const Digest &digest)
@@ -991,7 +1050,9 @@ struct Ps2GsDmaTraceState
 
         std::fprintf(output,
                      "{\"schema_version\":1,\"event\":\"vif1-segment\","
-                     "\"sequence\":%" PRIu64 ",\"chcr_write\":\"0x%08" PRIx32 "\","
+                     "\"sequence\":%" PRIu64 ","
+                     "\"start_ee_cycle\":%" PRIu64 ","
+                     "\"chcr_write\":\"0x%08" PRIx32 "\","
                      "\"mode\":%" PRIu32 ",\"tte\":%s,"
                      "\"madr\":\"0x%08" PRIx32 "\",\"qwc\":%" PRIu32 ","
                      "\"tadr\":\"0x%08" PRIx32 "\","
@@ -1001,7 +1062,7 @@ struct Ps2GsDmaTraceState
                      "\"packet_hash_fnv1a64\":\"0x%016" PRIx64 "\","
                      "\"packet_bytes\":%" PRIu64 ",\"tag_count\":%" PRIu32 ","
                      "\"packet_truncated\":%s,\"packet_prefix\":\"",
-                     activeSequence, chcr, (chcr >> 2u) & 0x3u,
+                     activeSequence, startEeCycle, chcr, (chcr >> 2u) & 0x3u,
                      (chcr & (1u << 6u)) != 0u ? "true" : "false",
                      madr, qwc, tadr, asr0, asr1, sadr,
                      packet.hash, packet.bytes, tagCount,
@@ -2032,7 +2093,9 @@ void PS2Memory::beginVif1DmaTrace(uint32_t chcr,
     Ps2GsDmaTraceState &trace = *m_gsDmaTrace;
     trace.configure();
     trace.finish();
-    trace.flushEeWrites(trace.sequence);
+    const uint64_t sequence =
+        m_vif1DmaTraceSequence.fetch_add(1u, std::memory_order_relaxed);
+    trace.flushEeWrites(sequence);
     if (!trace.enabled)
     {
         if (g_ps2GsDmaTraceState == &trace)
@@ -2040,16 +2103,18 @@ void PS2Memory::beginVif1DmaTrace(uint32_t chcr,
         return;
     }
 
-    const uint64_t sequence = trace.sequence++;
     if (sequence < trace.start || sequence >= trace.limit)
     {
         if (g_ps2GsDmaTraceState == &trace)
             g_ps2GsDmaWriteTraceEnabled.store(false, std::memory_order_relaxed);
+        if (sequence >= trace.limit)
+            trace.disable();
         return;
     }
 
     trace.active = true;
     trace.activeSequence = sequence;
+    trace.startEeCycle = currentEeCounterCycle();
     trace.chcr = chcr;
     trace.madr = madr;
     trace.qwc = qwc;
@@ -2558,6 +2623,78 @@ void PS2Memory::finishVif1DmaTrace()
         m_gsDmaTrace->finish();
 }
 
+bool PS2Memory::debugStartVif1DmaTrace(
+    const std::string &outputPath,
+    uint64_t sequenceCount,
+    const std::string &vif1InputDumpDirectory,
+    const std::string &path1DumpDirectory,
+    const std::string &vu1DumpDirectory,
+    std::string *diagnostic)
+{
+    std::string localDiagnostic;
+    if (outputPath.empty())
+    {
+        localDiagnostic = "output path must not be empty";
+    }
+    else if (sequenceCount == 0u)
+    {
+        localDiagnostic = "sequence count must be positive";
+    }
+
+    const uint64_t startSequence = vif1DmaTraceSequence();
+    if (localDiagnostic.empty() &&
+        sequenceCount > std::numeric_limits<uint64_t>::max() - startSequence)
+    {
+        localDiagnostic = "sequence range overflows uint64_t";
+    }
+
+    if (!localDiagnostic.empty())
+    {
+        if (diagnostic)
+            *diagnostic = localDiagnostic;
+        return false;
+    }
+
+    if (!m_gsDmaTrace)
+        m_gsDmaTrace = new Ps2GsDmaTraceState();
+    const bool configured = m_gsDmaTrace->configureDynamic(
+        outputPath,
+        startSequence,
+        startSequence + sequenceCount,
+        vif1InputDumpDirectory,
+        path1DumpDirectory,
+        vu1DumpDirectory,
+        localDiagnostic);
+    if (diagnostic)
+        *diagnostic = localDiagnostic;
+    return configured;
+}
+
+void PS2Memory::debugStopVif1DmaTrace()
+{
+    if (m_gsDmaTrace)
+        m_gsDmaTrace->disable();
+}
+
+Vif1DmaTraceSnapshot PS2Memory::debugVif1DmaTraceSnapshot() const
+{
+    Vif1DmaTraceSnapshot snapshot{};
+    snapshot.nextSequence = vif1DmaTraceSequence();
+    if (!m_gsDmaTrace)
+        return snapshot;
+
+    snapshot.enabled = m_gsDmaTrace->enabled;
+    snapshot.active = m_gsDmaTrace->active;
+    snapshot.startSequence = m_gsDmaTrace->start;
+    snapshot.limitSequence = m_gsDmaTrace->limit;
+    snapshot.outputPath = m_gsDmaTrace->outputPath;
+    snapshot.vif1InputDumpDirectory =
+        m_gsDmaTrace->vif1InputDumpDirectory;
+    snapshot.path1DumpDirectory = m_gsDmaTrace->path1DumpDirectory;
+    snapshot.vu1DumpDirectory = m_gsDmaTrace->vu1DumpDirectory;
+    return snapshot;
+}
+
 bool PS2Memory::initialize(size_t ramSize)
 {
     auto cleanup = [this]()
@@ -2622,7 +2759,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_vif1PendingPath2DirectHl = false;
     m_vif1PendingIrqAfterCommand = false;
     m_vif1WaitingForVu = false;
-    m_vif1DeferredData.clear();
+    clearVif1Stream();
     m_eeCounters.reset();
 
     try
@@ -4803,7 +4940,7 @@ bool PS2Memory::writeIORegisterMasked(
                 m_vif1PendingPath2DirectHl = false;
                 m_vif1PendingIrqAfterCommand = false;
                 m_vif1WaitingForVu = false;
-                m_vif1DeferredData.clear();
+                clearVif1Stream();
                 const bool path3WasMasked =
                     isPath3Masked();
                 m_path3Masked = false;
@@ -9135,7 +9272,11 @@ Vif1DmaAdvanceResult PS2Memory::advanceVif1Dma()
         uint32_t delay = 1u;
         if (m_vif1Dma.tte)
         {
-            appendVif1Stream(tagData + 8u, 8u);
+            // TTE injects the tag's upper 64 bits as words 2/3 of a VIF
+            // input quadword. Payload qwords begin aligned afterward.
+            appendVif1Stream(
+                tagData + 8u, 8u,
+                static_cast<uint8_t>(8u));
             traceVif1Input(tagData + 8u, 8u);
             ++delay;
         }
@@ -9176,6 +9317,7 @@ Vif1DmaAdvanceResult PS2Memory::advanceVif1Dma()
             scratch ? m_scratchpad : m_rdram;
         const uint32_t limit =
             scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        uint32_t payloadByteOffset = 0u;
         while (bytesLeft != 0u)
         {
             if (sourceOffset >= limit)
@@ -9191,12 +9333,16 @@ Vif1DmaAdvanceResult PS2Memory::advanceVif1Dma()
                 fault("empty payload memory region");
                 return result;
             }
-            appendVif1Stream(base + sourceOffset, chunk);
+            appendVif1Stream(
+                base + sourceOffset, chunk,
+                static_cast<uint8_t>(
+                    payloadByteOffset & 0x0Fu));
             traceVif1DmaPayload(
                 base + sourceOffset, chunk);
             traceVif1Input(
                 base + sourceOffset, chunk);
             sourceOffset += chunk;
+            payloadByteOffset += chunk;
             bytesLeft -= chunk;
         }
 

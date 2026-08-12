@@ -13,6 +13,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <thread>
@@ -2405,6 +2408,232 @@ void register_ps2_memory_tests()
             t.Equals(sy, 0x00000001u, "zero-extend y");
             t.Equals(sz, 0x00007FFFu, "zero-extend z");
             t.Equals(sw, 0x00008001u, "zero-extend w");
+        });
+
+        tc.Run("VIF UNPACK V2 and V3 reproduce hardware indeterminate lanes", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+
+            std::vector<uint8_t> packet;
+
+            // Real hardware repeats XY into ZW for V2 rather than preserving
+            // the destination's nominally indeterminate lanes.
+            appendU32(packet, makeVifCmd(0x65u, 1u, 0u)); // UNPACK V2-16
+            const uint16_t v2[2] = {0x1111u, 0x8222u};
+            packet.insert(
+                packet.end(),
+                reinterpret_cast<const uint8_t *>(v2),
+                reinterpret_cast<const uint8_t *>(v2) + sizeof(v2));
+
+            // V3 uses the V4 decoder while advancing by only three source
+            // components. The first vector's W therefore observes the next
+            // vector's X component, as on the Emotion Engine.
+            appendU32(packet, makeVifCmd(0x69u, 2u, 4u)); // UNPACK V3-16
+            const uint16_t v3[6] = {
+                0x1001u, 0x1002u, 0x1003u,
+                0x8001u, 0x2002u, 0x2003u,
+            };
+            packet.insert(
+                packet.end(),
+                reinterpret_cast<const uint8_t *>(v3),
+                reinterpret_cast<const uint8_t *>(v3) + sizeof(v3));
+
+            mem.processVIF1Data(
+                packet.data(), static_cast<uint32_t>(packet.size()));
+
+            auto lane = [&](uint32_t vector, uint32_t component)
+            {
+                uint32_t value = 0u;
+                std::memcpy(
+                    &value,
+                    mem.getVU1Data() + vector * 16u + component * 4u,
+                    sizeof(value));
+                return value;
+            };
+
+            t.Equals(lane(0u, 0u), 0x00001111u, "V2 X should contain source X");
+            t.Equals(lane(0u, 1u), 0xffff8222u, "V2 Y should sign-extend source Y");
+            t.Equals(lane(0u, 2u), 0x00001111u, "V2 Z should repeat source X");
+            t.Equals(lane(0u, 3u), 0xffff8222u, "V2 W should repeat source Y");
+
+            t.Equals(lane(4u, 0u), 0x00001001u, "V3 X should contain source X");
+            t.Equals(lane(4u, 1u), 0x00001002u, "V3 Y should contain source Y");
+            t.Equals(lane(4u, 2u), 0x00001003u, "V3 Z should contain source Z");
+            t.Equals(
+                lane(4u, 3u), 0xffff8001u,
+                "V3 W should decode the adjacent next-vector X component");
+            t.Equals(lane(5u, 0u), 0xffff8001u, "the next V3 X should use the same packed component");
+        });
+
+        tc.Run("VIF1 DMA tracing can be armed dynamically for a bounded sequence", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            mem.beginVif1DmaTrace(0x105u, 0x1000u, 1u, 0x2000u,
+                                  0u, 0u, 0u);
+            mem.finishVif1DmaTrace();
+            t.Equals(
+                mem.vif1DmaTraceSequence(), 1ull,
+                "untraced VIF1 chains should still advance the global sequence");
+
+            const std::filesystem::path output =
+                std::filesystem::temp_directory_path() /
+                ("ps2recomp-vif1-dma-trace-" +
+                 std::to_string(reinterpret_cast<uintptr_t>(&mem)) +
+                 ".jsonl");
+            std::error_code cleanupError;
+            std::filesystem::remove(output, cleanupError);
+
+            std::string diagnostic;
+            t.IsTrue(
+                mem.debugStartVif1DmaTrace(
+                    output.string(), 1u, "", "", "", &diagnostic),
+                "dynamic VIF1 trace should open its output: " + diagnostic);
+            Vif1DmaTraceSnapshot snapshot =
+                mem.debugVif1DmaTraceSnapshot();
+            t.IsTrue(snapshot.enabled, "dynamic trace should be enabled");
+            t.Equals(snapshot.startSequence, 1ull,
+                     "dynamic trace should begin at the next chain");
+            t.Equals(snapshot.limitSequence, 2ull,
+                     "one requested chain should produce an exclusive limit");
+
+            std::array<uint8_t, 16u> tag{};
+            std::array<uint8_t, 8u> vifInput{};
+            std::array<uint8_t, 32u> path1{};
+            tag[0] = 0x11u;
+            vifInput[0] = 0x22u;
+            path1[0] = 0x33u;
+            mem.beginVif1DmaTrace(0x145u, 0x3000u, 2u, 0x4000u,
+                                  0u, 0u, 0u);
+            mem.traceVif1DmaTag(tag.data());
+            mem.traceVif1Input(
+                vifInput.data(), static_cast<uint32_t>(vifInput.size()));
+            mem.tracePath1Packet(
+                path1.data(), static_cast<uint32_t>(path1.size()));
+            mem.finishVif1DmaTrace();
+
+            // Crossing the exclusive limit closes and flushes the file while
+            // leaving this later chain untraced.
+            mem.beginVif1DmaTrace(0x105u, 0x5000u, 3u, 0x6000u,
+                                  0u, 0u, 0u);
+            mem.finishVif1DmaTrace();
+            snapshot = mem.debugVif1DmaTraceSnapshot();
+            t.IsTrue(!snapshot.enabled,
+                     "trace should disable itself at the sequence limit");
+            t.Equals(snapshot.nextSequence, 3ull,
+                     "all traced and untraced chains should remain monotonic");
+
+            std::ifstream traceFile(output, std::ios::binary);
+            const std::string traceText{
+                std::istreambuf_iterator<char>(traceFile),
+                std::istreambuf_iterator<char>()};
+            t.IsTrue(
+                traceText.find("\"event\":\"configuration\"") !=
+                    std::string::npos,
+                "trace should contain its bounded configuration record");
+            t.IsTrue(
+                traceText.find("\"event\":\"vif1-segment\",\"sequence\":1") !=
+                    std::string::npos,
+                "trace should contain only the dynamically selected chain");
+            t.IsTrue(
+                traceText.find("\"vif_bytes\":8") != std::string::npos,
+                "trace should digest the selected chain's VIF input");
+            t.IsTrue(
+                traceText.find("\"path1_bytes\":32") != std::string::npos,
+                "trace should digest the selected chain's Path1 output");
+            std::filesystem::remove(output, cleanupError);
+        });
+
+        tc.Run("VIF1 DMA TTE preserves V3-16 source quadword boundaries", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0xCD, PS2_VU1_DATA_SIZE);
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kTag = 0x00024900u;
+            constexpr uint32_t kVectorCount = 48u;
+            constexpr uint32_t kPayloadQwc =
+                (kVectorCount * 3u * sizeof(uint16_t)) / 16u;
+
+            uint8_t *const rdram = mem.getRDRAM();
+            writeDmaTag(
+                rdram, kTag,
+                makeDmaTag(
+                    static_cast<uint16_t>(kPayloadQwc),
+                    7u, 0u, false)); // END
+
+            // TTE presents the tag's upper 64 bits as words 2/3 of a VIF
+            // quadword. Put the command in word 3, so its packed source starts
+            // exactly at the following quadword boundary.
+            const uint32_t command =
+                makeVifCmd(0x69u, kVectorCount, 0u); // UNPACK V3-16
+            std::memcpy(
+                rdram + kTag + 12u,
+                &command, sizeof(command));
+            for (uint32_t vector = 0u;
+                 vector < kVectorCount;
+                 ++vector)
+            {
+                const uint16_t components[3] = {
+                    static_cast<uint16_t>(0x1000u + vector),
+                    static_cast<uint16_t>(0x2000u + vector),
+                    static_cast<uint16_t>(0x3000u + vector),
+                };
+                std::memcpy(
+                    rdram + kTag + 16u +
+                        vector * sizeof(components),
+                    components, sizeof(components));
+            }
+
+            t.IsTrue(
+                mem.writeIORegister(
+                    kVif1Ch + 0x30u, kTag),
+                "write VIF1 TADR should succeed");
+            t.IsTrue(
+                mem.writeIORegister(
+                    kVif1Ch + 0x00u, 0x145u),
+                "write VIF1 CHCR DIR|TTE|STR|CHAIN should succeed");
+            mem.processPendingTransfers();
+            publishDmacCompletions(mem);
+
+            const auto lane = [&](uint32_t vector, uint32_t component)
+            {
+                uint32_t value = 0u;
+                std::memcpy(
+                    &value,
+                    mem.getVU1Data() +
+                        vector * 16u + component * 4u,
+                    sizeof(value));
+                return value;
+            };
+
+            t.Equals(lane(11u, 0u), 0x0000100bu,
+                     "boundary vector X should still unpack");
+            t.Equals(lane(11u, 3u), 0u,
+                     "aligned source boundary should zero vector 11 W");
+            t.Equals(lane(13u, 3u), 0u,
+                     "aligned source boundary should zero vector 13 W");
+            t.Equals(lane(27u, 3u), 0u,
+                     "aligned source boundary should zero vector 27 W");
+            t.Equals(lane(29u, 3u), 0u,
+                     "aligned source boundary should zero vector 29 W");
+            t.Equals(lane(43u, 3u), 0u,
+                     "aligned source boundary should zero vector 43 W");
+            t.Equals(lane(45u, 3u), 0u,
+                     "aligned source boundary should zero vector 45 W");
+            t.Equals(lane(10u, 3u), 0x0000100bu,
+                     "non-boundary W should observe the next packed X");
+            t.Equals(lane(12u, 3u), 0x0000100du,
+                     "adjacent non-boundary W should remain observable");
+            t.IsTrue(
+                (mem.readIORegister(
+                     kVif1Ch + 0x00u) &
+                 0x100u) == 0u,
+                "VIF1 transfer should complete");
         });
 
         tc.Run("VIF UNPACK bit15 adds TOPS to destination address", [](TestCase &t)

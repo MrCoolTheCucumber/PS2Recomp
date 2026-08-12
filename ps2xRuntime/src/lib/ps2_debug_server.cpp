@@ -1006,6 +1006,9 @@ struct PS2DebugServer::Impl
         progress.AddMember("gif_copies", runtime.memory().gifCopyCount(), allocator);
         progress.AddMember("gs_writes", runtime.memory().gsWriteCount(), allocator);
         progress.AddMember("vif_writes", runtime.memory().vifWriteCount(), allocator);
+        progress.AddMember(
+            "vif1_dma_trace_sequence",
+            runtime.memory().vif1DmaTraceSequence(), allocator);
         progress.AddMember("presentations", gsProgress.presentations, allocator);
         progress.AddMember("gs_draws_started", gsProgress.drawsStarted, allocator);
         progress.AddMember("gs_draws_completed", gsProgress.drawsCompleted, allocator);
@@ -1568,6 +1571,7 @@ struct PS2DebugServer::Impl
                  "state.registers:iop", "state.registers:vu0",
                  "state.registers:vu1", "memory.read", "memory.hash",
                  "breakpoint:ee", "watchpoint:ee", "capture",
+                 "trace.vif1-dma",
                  "trace.vu0-sync", "trace.vu0-instruction",
                  "trace.ee-events",
                  "diagnostics.status", "watchdog.status",
@@ -1698,6 +1702,9 @@ struct PS2DebugServer::Impl
         progress.AddMember("gif_copies", sample.gifCopies, allocator);
         progress.AddMember("gs_writes", sample.gsWrites, allocator);
         progress.AddMember("vif_writes", sample.vifWrites, allocator);
+        progress.AddMember(
+            "vif1_dma_trace_sequence",
+            runtime.memory().vif1DmaTraceSequence(), allocator);
         progress.AddMember("presentations", sample.presentations, allocator);
         progress.AddMember("gs_draws_started", sample.gsDrawsStarted, allocator);
         progress.AddMember("gs_draws_completed", sample.gsDrawsCompleted, allocator);
@@ -2534,6 +2541,128 @@ struct PS2DebugServer::Impl
         }
         result.AddMember("entries", entries, allocator);
         return result;
+    }
+
+    Value vif1DmaTraceValue(Allocator &allocator)
+    {
+        const Vif1DmaTraceSnapshot trace =
+            runtime.memory().debugVif1DmaTraceSnapshot();
+        Value result(rapidjson::kObjectType);
+        result.AddMember("enabled", trace.enabled, allocator);
+        result.AddMember("active", trace.active, allocator);
+        result.AddMember("next_sequence", trace.nextSequence, allocator);
+        result.AddMember("start_sequence", trace.startSequence, allocator);
+        result.AddMember("limit_sequence", trace.limitSequence, allocator);
+        auto addPath = [&](const char *name, const std::string &path)
+        {
+            if (path.empty())
+                result.AddMember(Value(name, allocator),
+                                 Value(rapidjson::kNullType), allocator);
+            else
+                addString(result, name, path, allocator);
+        };
+        addPath("output", trace.outputPath);
+        addPath("vif1_input_dump_directory",
+                trace.vif1InputDumpDirectory);
+        addPath("path1_dump_directory", trace.path1DumpDirectory);
+        addPath("vu1_dump_directory", trace.vu1DumpDirectory);
+        return result;
+    }
+
+    Value vif1DmaTraceStart(
+        const Value *params, Allocator &allocator)
+    {
+        if (!runtime.debugIsPaused())
+        {
+            throw RequestError(
+                -32002, "VIF1 DMA tracing requires a paused guest");
+        }
+
+        const std::filesystem::path output =
+            requiredString(params, "output");
+        const uint64_t sequenceCount =
+            requiredUnsigned(params, "sequence_count");
+        if (output.empty())
+        {
+            throw RequestError(-32602, "output must not be empty");
+        }
+        if (sequenceCount == 0u || sequenceCount > 256u)
+        {
+            throw RequestError(
+                -32602, "sequence_count must be between 1 and 256");
+        }
+
+        auto optionalPath = [&](const char *name)
+        {
+            std::filesystem::path path;
+            const auto member = params->FindMember(name);
+            if (member == params->MemberEnd())
+                return path;
+            if (!member->value.IsString())
+            {
+                throw RequestError(
+                    -32602, std::string(name) + " must be a string");
+            }
+            path = std::string(
+                member->value.GetString(), member->value.GetStringLength());
+            if (path.empty())
+            {
+                throw RequestError(
+                    -32602, std::string(name) + " must not be empty");
+            }
+            return path;
+        };
+        const std::filesystem::path vif1InputDumpDirectory =
+            optionalPath("vif1_input_dump_directory");
+        const std::filesystem::path path1DumpDirectory =
+            optionalPath("path1_dump_directory");
+        const std::filesystem::path vu1DumpDirectory =
+            optionalPath("vu1_dump_directory");
+
+        auto createDirectory = [](const std::filesystem::path &path)
+        {
+            if (path.empty())
+                return;
+            std::error_code error;
+            std::filesystem::create_directories(path, error);
+            if (error)
+            {
+                throw RequestError(
+                    -32003,
+                    "cannot create " + path.string() + ": " +
+                        error.message());
+            }
+        };
+        createDirectory(output.parent_path());
+        createDirectory(vif1InputDumpDirectory);
+        createDirectory(path1DumpDirectory);
+        createDirectory(vu1DumpDirectory);
+
+        std::string diagnostic;
+        if (!runtime.memory().debugStartVif1DmaTrace(
+                output.string(), sequenceCount,
+                vif1InputDumpDirectory.string(),
+                path1DumpDirectory.string(),
+                vu1DumpDirectory.string(), &diagnostic))
+        {
+            throw RequestError(
+                -32003,
+                diagnostic.empty()
+                    ? "cannot start VIF1 DMA trace"
+                    : diagnostic);
+        }
+        return vif1DmaTraceValue(allocator);
+    }
+
+    Value vif1DmaTraceStop(Allocator &allocator)
+    {
+        if (!runtime.debugIsPaused())
+        {
+            throw RequestError(
+                -32002, "VIF1 DMA tracing requires a paused guest");
+        }
+        runtime.memory().debugStopVif1DmaTrace();
+        return vif1DmaTraceValue(allocator);
     }
 
     Value vu0SyncTraceStart(const Value *params, Allocator &allocator)
@@ -4294,6 +4423,18 @@ struct PS2DebugServer::Impl
         if (method == "vu.block-profile")
         {
             return vuBlockProfile(params, allocator);
+        }
+        if (method == "trace.vif1-dma.start")
+        {
+            return vif1DmaTraceStart(params, allocator);
+        }
+        if (method == "trace.vif1-dma.status")
+        {
+            return vif1DmaTraceValue(allocator);
+        }
+        if (method == "trace.vif1-dma.stop")
+        {
+            return vif1DmaTraceStop(allocator);
         }
         if (method == "trace.vu0-sync.start")
         {

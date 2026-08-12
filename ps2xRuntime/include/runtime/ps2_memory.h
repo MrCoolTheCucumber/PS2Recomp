@@ -4,9 +4,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 #include <unordered_map>
@@ -30,6 +32,19 @@ class GS;
 struct Ps2GsDmaTraceState;
 struct Ps2Vu1WorkloadProfileState;
 struct VuExecutionState;
+
+struct Vif1DmaTraceSnapshot
+{
+    bool enabled = false;
+    bool active = false;
+    uint64_t nextSequence = 0u;
+    uint64_t startSequence = 0u;
+    uint64_t limitSequence = 0u;
+    std::string outputPath;
+    std::string vif1InputDumpDirectory;
+    std::string path1DumpDirectory;
+    std::string vu1DumpDirectory;
+};
 
 enum class EeAddressSpaceMode : uint8_t
 {
@@ -1045,6 +1060,20 @@ public:
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
+    uint64_t vif1DmaTraceSequence() const
+    {
+        return m_vif1DmaTraceSequence.load(std::memory_order_relaxed);
+    }
+    bool debugStartVif1DmaTrace(
+        const std::string &outputPath,
+        uint64_t sequenceCount,
+        const std::string &vif1InputDumpDirectory,
+        const std::string &path1DumpDirectory,
+        const std::string &vu1DumpDirectory,
+        std::string *diagnostic = nullptr);
+    void debugStopVif1DmaTrace();
+    [[nodiscard]] Vif1DmaTraceSnapshot
+    debugVif1DmaTraceSnapshot() const;
     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
     bool configureVu1WorkloadProfile(
@@ -1802,6 +1831,14 @@ public:
     bool m_vif1PendingIrqAfterCommand = false;
     bool m_vif1WaitingForVu = false;
     std::vector<uint8_t> m_vif1DeferredData;
+    struct Vif1StreamSegment
+    {
+        size_t byteCount = 0u;
+        uint8_t firstByteOffset = 0u;
+    };
+    std::deque<Vif1StreamSegment>
+        m_vif1DeferredSegments;
+    uint8_t m_vif1NextByteOffset = 0u;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct DmacSourceChainKey
@@ -2164,7 +2201,13 @@ public:
     };
     Vif1ParserDisposition processVif1Stream();
     void appendVif1Stream(
-        const uint8_t *data, uint32_t sizeBytes);
+        const uint8_t *data, uint32_t sizeBytes,
+        std::optional<uint8_t> firstByteOffset =
+            std::nullopt);
+    void consumeVif1StreamSegments(size_t sizeBytes);
+    [[nodiscard]] uint8_t vif1StreamByteOffset(
+        size_t position) const;
+    void clearVif1Stream();
     [[nodiscard]] Vif1DmaStallReason
     currentVif1DmaStall() const;
     static uint64_t nextDmacSequence(uint64_t value) noexcept;
@@ -2191,6 +2234,7 @@ public:
                                const int32_t *viRegisters, size_t viRegisterCount);
     void finishVif1DmaTrace();
     Ps2GsDmaTraceState *m_gsDmaTrace = nullptr;
+    std::atomic<uint64_t> m_vif1DmaTraceSequence{0u};
     void recordVu1WorkloadProfileCodeUpload(
         uint32_t destination,
         const uint8_t *payload,
