@@ -1293,6 +1293,26 @@ GsSubmissionResult GsBackendRouter::submit(
         m_counters.drawPixels += pixels;
     }
 
+    // An exact empty rectangle cannot touch GS local memory regardless of the
+    // remaining primitive state. Keep it out of both queues so clipped strip
+    // members do not break a resident GPU run or force a pointless backend
+    // transition. The permanent backend still receives a lightweight
+    // notification for frontend/debug progress accounting.
+    if (command.bounds().exact && command.bounds().empty())
+    {
+        m_softwareBackend->recordNoop(command);
+        if (m_countersEnabled)
+        {
+            ++m_counters.noopCommands;
+            recordDecision(GsFallbackReason::EmptyBounds);
+        }
+        return {
+            true,
+            false,
+            false,
+            {true, GsFallbackReason::EmptyBounds}};
+    }
+
     if (m_mode == GsRendererMode::Software)
     {
         transitionTo(ActiveBackend::Software);

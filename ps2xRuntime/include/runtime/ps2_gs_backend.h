@@ -247,6 +247,7 @@ struct GsHybridBatchPolicy
 struct GsBackendCounters
 {
     uint64_t commands = 0;
+    uint64_t noopCommands = 0;
     uint64_t softwareCommands = 0;
     uint64_t acceleratedCommands = 0;
     uint64_t verifiedCommands = 0;
@@ -278,6 +279,13 @@ public:
     [[nodiscard]] virtual GsBackendDecision
     classify(const GsDrawCommand &command) const = 0;
     virtual void submit(std::span<const GsDrawCommand> commands) = 0;
+    // Exact empty bounds are a semantic no-op. The router uses this optional
+    // notification to retain frontend/debug accounting without changing the
+    // active renderer or entering either backend's work queue.
+    virtual void recordNoop(const GsDrawCommand &command)
+    {
+        (void)command;
+    }
     virtual void flush(GsFlushReason reason) = 0;
     [[nodiscard]] virtual size_t pendingCommandCount() const noexcept = 0;
 

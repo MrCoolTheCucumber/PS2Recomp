@@ -1987,6 +1987,11 @@ struct GSRasterizer::BackendState
                 rasterizer.submitSoftwareCommand(owner, command);
         }
 
+        void recordNoop(const GsDrawCommand &command) override
+        {
+            rasterizer.recordNoopCommand(owner, command);
+        }
+
         void flush(GsFlushReason) override
         {
             rasterizer.flushSoftwareDrawBatch(owner);
@@ -2625,6 +2630,18 @@ void GSRasterizer::submitSoftwareCommand(
         return;
     flushSoftwareDrawBatch(gs);
     renderSoftwarePrimitive(gs, command);
+}
+
+void GSRasterizer::recordNoopCommand(
+    GS *gs,
+    const GsDrawCommand &command)
+{
+    // Diagnostic draw tracing still needs the complete row/state snapshot.
+    // Production accounting only needs one completed frontend draw.
+    if (rasterizerInstrumentationRequested())
+        renderSoftwarePrimitive(gs, command);
+    else
+        DebugProgressScope progress(*this, gs);
 }
 
 void GSRasterizer::recordAcceleratedCommit(

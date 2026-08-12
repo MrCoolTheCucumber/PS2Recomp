@@ -15058,27 +15058,16 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(strictVram == rejectionSentinel,
                      "strict point rejection must occur before VRAM mutation");
 
-            std::string emptyFailure;
-            try
-            {
-                strict.writeRegister(
-                    GS_REG_PRIM,
-                    static_cast<uint64_t>(GS_PRIM_SPRITE));
-                strict.writeRegister(GS_REG_RGBAQ, 0xE0778899u);
-                strict.writeRegister(
-                    GS_REG_XYZ2, packXyz2(14u * 16u, 12u * 16u));
-                strict.writeRegister(
-                    GS_REG_XYZ2, packXyz2(14u * 16u, 12u * 16u));
-            }
-            catch (const std::runtime_error &error)
-            {
-                emptyFailure = error.what();
-            }
-            t.IsTrue(emptyFailure.find("empty-bounds") !=
-                         std::string::npos,
-                     "strict should reject empty bounds before submission");
+            strict.writeRegister(
+                GS_REG_PRIM,
+                static_cast<uint64_t>(GS_PRIM_SPRITE));
+            strict.writeRegister(GS_REG_RGBAQ, 0xE0778899u);
+            strict.writeRegister(
+                GS_REG_XYZ2, packXyz2(14u * 16u, 12u * 16u));
+            strict.writeRegister(
+                GS_REG_XYZ2, packXyz2(14u * 16u, 12u * 16u));
             t.IsTrue(strictVram == rejectionSentinel,
-                     "strict empty rejection must preserve all canonical VRAM");
+                     "strict empty no-op must preserve all canonical VRAM");
 
             strict.reset();
             software.reset();
@@ -15128,8 +15117,10 @@ void register_ps2_gs_vulkan_tests()
                      "all eligible strict draws should reach Vulkan");
             t.Equals(counters.softwareCommands, 0ull,
                      "strict must never hide rejection behind software");
-            t.Equals(counters.strictFailures, 2ull,
-                     "both pre-mutation rejections should be explicit");
+            t.Equals(counters.noopCommands, 1ull,
+                     "the exact empty draw should be accounted without entering a backend");
+            t.Equals(counters.strictFailures, 1ull,
+                     "only the unsupported point should be rejected");
             t.Equals(
                 counters.flushReasons[static_cast<size_t>(
                     GsFlushReason::Reset)],

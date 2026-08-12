@@ -152,6 +152,7 @@ namespace
         const GsBackendCounters &counters)
     {
         output << "{\"commands\":" << counters.commands
+               << ",\"noop_commands\":" << counters.noopCommands
                << ",\"software_commands\":" << counters.softwareCommands
                << ",\"accelerated_commands\":" << counters.acceleratedCommands
                << ",\"verified_commands\":" << counters.verifiedCommands
