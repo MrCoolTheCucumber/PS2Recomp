@@ -1307,9 +1307,11 @@ public:
 
     // Copies only the selected 8 KiB physical pages between canonical CPU
     // storage and the persistent device-local VRAM allocation. The source and
-    // destination still describe the exact 4 MiB GS address space; page data
-    // is compacted through the bounded worker slot. A successful download
-    // leaves every unselected destination byte untouched.
+    // destination still describe the exact 4 MiB GS address space. These
+    // synchronous calls borrow that storage until the worker has copied the
+    // selected pages directly through its mapped staging buffer, avoiding an
+    // intermediate page payload. A successful download leaves every
+    // unselected destination byte untouched.
     [[nodiscard]] bool uploadVramPages(
         std::span<const uint8_t> source,
         const GsVramPageMask &pages,

@@ -3598,14 +3598,14 @@ namespace
             GsVulkanServiceStatistics &statistics,
             std::string &error);
         bool uploadVramPages(
-            std::span<const uint8_t> packedInput,
+            std::span<const uint8_t> source,
             const GsVramPageMask &pages,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
         bool downloadVramPages(
+            std::span<uint8_t> destination,
             const GsVramPageMask &pages,
-            std::vector<uint8_t> &packedOutput,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
@@ -5355,7 +5355,7 @@ namespace
     }
 
     bool VulkanExecutionContext::uploadVramPages(
-        std::span<const uint8_t> packedInput,
+        std::span<const uint8_t> source,
         const GsVramPageMask &pages,
         GsVulkanCapabilityReport &report,
         GsVulkanServiceStatistics &statistics,
@@ -5368,7 +5368,7 @@ namespace
             return false;
         }
         if (plan.pageCount == 0u ||
-            packedInput.size() != plan.byteCount)
+            source.size() != GS_VULKAN_VRAM_SIZE)
         {
             error = "invalid Vulkan GS page upload request";
             return false;
@@ -5376,8 +5376,14 @@ namespace
 
         const uint32_t validationErrorsBefore =
             m_validation.errors.load(std::memory_order_relaxed);
-        std::memcpy(
-            m_stagingMap, packedInput.data(), packedInput.size());
+        for (uint32_t index = 0u; index < plan.regionCount; ++index)
+        {
+            const VkBufferCopy &region = plan.regions[index];
+            std::memcpy(
+                static_cast<uint8_t *>(m_stagingMap) + region.srcOffset,
+                source.data() + region.dstOffset,
+                static_cast<size_t>(region.size));
+        }
         if (!flushMappedAllocation(
                 m_staging, "VRAM page upload", report, error) ||
             !beginCommands(report, error))
@@ -5456,8 +5462,8 @@ namespace
     }
 
     bool VulkanExecutionContext::downloadVramPages(
+        std::span<uint8_t> destination,
         const GsVramPageMask &pages,
-        std::vector<uint8_t> &packedOutput,
         GsVulkanCapabilityReport &report,
         GsVulkanServiceStatistics &statistics,
         std::string &error)
@@ -5468,7 +5474,8 @@ namespace
             error = "Vulkan GS service is not healthy";
             return false;
         }
-        if (plan.pageCount == 0u)
+        if (plan.pageCount == 0u ||
+            destination.size() != GS_VULKAN_VRAM_SIZE)
         {
             error = "invalid Vulkan GS page download request";
             return false;
@@ -5545,9 +5552,15 @@ namespace
             return false;
         }
 
-        std::vector<uint8_t> completed(plan.byteCount);
-        std::memcpy(completed.data(), m_stagingMap, completed.size());
-        packedOutput = std::move(completed);
+        for (uint32_t index = 0u; index < plan.regionCount; ++index)
+        {
+            const VkBufferCopy &region = plan.regions[index];
+            std::memcpy(
+                destination.data() + region.srcOffset,
+                static_cast<const uint8_t *>(m_stagingMap) +
+                    region.dstOffset,
+                static_cast<size_t>(region.size));
+        }
         statistics.bytesDownloaded += plan.byteCount;
         statistics.pagesDownloaded += plan.pageCount;
         statistics.pageDownloadRegions += plan.regionCount;
@@ -7502,6 +7515,8 @@ struct GsVulkanService::Impl final
             initialized = true;
             workerFinished = true;
             requestPending = false;
+            requestPageUploadSource = {};
+            requestPageDownloadDestination = {};
             if (requestInFlight)
             {
                 if (activeRequestKind ==
@@ -7691,6 +7706,8 @@ struct GsVulkanService::Impl final
             std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle>
                 residentT8GouraudDepthCt32Triangles;
             std::vector<GsVulkanT8Palette> t8Palettes;
+            std::span<const uint8_t> pageUploadSource;
+            std::span<uint8_t> pageDownloadDestination;
             GsVramPageMask pages;
             GsVulkanRequestKind kind =
                 GsVulkanRequestKind::RoundTrip;
@@ -7725,6 +7742,11 @@ struct GsVulkanService::Impl final
                     std::move(
                         requestResidentT8GouraudDepthCt32Triangles);
                 t8Palettes = std::move(requestT8Palettes);
+                pageUploadSource = requestPageUploadSource;
+                pageDownloadDestination =
+                    requestPageDownloadDestination;
+                requestPageUploadSource = {};
+                requestPageDownloadDestination = {};
                 pages = requestPages;
                 kind = requestKind;
                 activeRequestKind = kind;
@@ -7827,13 +7849,13 @@ struct GsVulkanService::Impl final
             else if (kind == GsVulkanRequestKind::UploadPages)
             {
                 succeeded = context.uploadVramPages(
-                    input, pages, localCapabilities,
+                    pageUploadSource, pages, localCapabilities,
                     localStatistics, operationError);
             }
             else if (kind == GsVulkanRequestKind::DownloadPages)
             {
                 succeeded = context.downloadVramPages(
-                    pages, output, localCapabilities,
+                    pageDownloadDestination, pages, localCapabilities,
                     localStatistics, operationError);
             }
             else if (kind == GsVulkanRequestKind::ResidentCt32Sprites)
@@ -8452,8 +8474,32 @@ struct GsVulkanService::Impl final
         std::string *error,
         std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle>
             residentT8GouraudDepthCt32Triangles = {},
-        std::vector<GsVulkanT8Palette> t8Palettes = {})
+        std::vector<GsVulkanT8Palette> t8Palettes = {},
+        std::span<const uint8_t> pageUploadSource = {},
+        std::span<uint8_t> pageDownloadDestination = {})
     {
+        bool pageTransferValid =
+            pageUploadSource.empty() &&
+            pageDownloadDestination.empty();
+        if (kind == GsVulkanRequestKind::UploadPages)
+        {
+            pageTransferValid =
+                pageUploadSource.size() == GS_VULKAN_VRAM_SIZE &&
+                pageDownloadDestination.empty();
+        }
+        else if (kind == GsVulkanRequestKind::DownloadPages)
+        {
+            pageTransferValid =
+                pageUploadSource.empty() &&
+                pageDownloadDestination.size() == GS_VULKAN_VRAM_SIZE;
+        }
+        if (!pageTransferValid)
+        {
+            if (error)
+                *error = "invalid Vulkan GS page-transfer request storage";
+            return false;
+        }
+
         std::lock_guard callLock(callMutex);
         std::unique_lock stateLock(stateMutex);
         if (!healthy || stopping || workerFinished)
@@ -8490,6 +8536,8 @@ struct GsVulkanService::Impl final
         requestResidentT8GouraudDepthCt32Triangles =
             std::move(residentT8GouraudDepthCt32Triangles);
         requestT8Palettes = std::move(t8Palettes);
+        requestPageUploadSource = pageUploadSource;
+        requestPageDownloadDestination = pageDownloadDestination;
         requestPages = pages;
         responseOutput.clear();
         responseResults.clear();
@@ -8573,6 +8621,11 @@ struct GsVulkanService::Impl final
     std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle>
         requestResidentT8GouraudDepthCt32Triangles;
     std::vector<GsVulkanT8Palette> requestT8Palettes;
+    // Page transfer calls are synchronous: the posting thread remains blocked
+    // under callMutex until the owning Vulkan worker finishes consuming these
+    // borrowed canonical-VRAM views.
+    std::span<const uint8_t> requestPageUploadSource;
+    std::span<uint8_t> requestPageDownloadDestination;
     GsVramPageMask requestPages;
     std::vector<uint8_t> responseOutput;
     std::vector<GsVulkanMemoryResult> responseResults;
@@ -9257,26 +9310,11 @@ bool GsVulkanService::uploadVramPages(
         return false;
     }
 
-    std::vector<uint8_t> packed(
-        pages.count() * GS_VRAM_PAGE_SIZE);
-    size_t packedOffset = 0u;
-    for (size_t page = 0u; page < GS_VRAM_PAGE_COUNT; ++page)
-    {
-        if (!pages.test(page))
-            continue;
-        std::memcpy(
-            packed.data() + packedOffset,
-            source.data() + page * GS_VRAM_PAGE_SIZE,
-            GS_VRAM_PAGE_SIZE);
-        packedOffset += GS_VRAM_PAGE_SIZE;
-    }
-
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::UploadPages,
-        std::move(packed),
-        {}, {}, {}, {}, {}, {}, {}, {}, pages,
-        unusedOutput, nullptr, error);
+        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, pages,
+        unusedOutput, nullptr, error, {}, {}, source, {});
 #endif
 }
 
@@ -9305,36 +9343,11 @@ bool GsVulkanService::downloadVramPages(
         return false;
     }
 
-    std::vector<uint8_t> packed;
-    if (!m_impl->executeRequest(
-            GsVulkanRequestKind::DownloadPages,
-            {}, {}, {}, {}, {}, {}, {}, {}, {}, pages,
-            packed, nullptr, error))
-    {
-        return false;
-    }
-    const size_t expectedBytes = pages.count() * GS_VRAM_PAGE_SIZE;
-    if (packed.size() != expectedBytes)
-    {
-        if (error)
-            *error = "Vulkan page download returned an invalid payload";
-        return false;
-    }
-
-    size_t packedOffset = 0u;
-    for (size_t page = 0u; page < GS_VRAM_PAGE_COUNT; ++page)
-    {
-        if (!pages.test(page))
-            continue;
-        std::memcpy(
-            destination.data() + page * GS_VRAM_PAGE_SIZE,
-            packed.data() + packedOffset,
-            GS_VRAM_PAGE_SIZE);
-        packedOffset += GS_VRAM_PAGE_SIZE;
-    }
-    if (error)
-        error->clear();
-    return true;
+    std::vector<uint8_t> unusedOutput;
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::DownloadPages,
+        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, pages,
+        unusedOutput, nullptr, error, {}, {}, {}, destination);
 #endif
 }
 
