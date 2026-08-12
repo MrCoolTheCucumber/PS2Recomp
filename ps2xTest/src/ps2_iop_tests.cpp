@@ -842,6 +842,68 @@ void register_ps2_iop_tests()
                       "a batch truncated inside its last payload should be rejected");
         });
 
+        tc.Run("Sony 989snd pauses and continues sound groups", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+
+            constexpr uint32_t kSid = 0x00123456u;
+            constexpr uint32_t kSendAddress = 0x1000u;
+            constexpr uint32_t kReceiveAddress = 0x1100u;
+            constexpr uint32_t kGroupMask = 0x1Du;
+            constexpr std::array<uint32_t, 5> kBatch{
+                2u,
+                (sizeof(uint32_t) << 16u) | 0x16u,
+                kGroupMask,
+                (sizeof(uint32_t) << 16u) | 0x17u,
+                kGroupMask,
+            };
+            (void)host.writeGuest(kSendAddress, kBatch.data(), sizeof(kBatch));
+
+            ps2x::iop::RpcRequest batch{};
+            batch.sid = kSid;
+            batch.function = 0x4Du;
+            batch.send = {kSendAddress, sizeof(kBatch)};
+            batch.receive = {kReceiveAddress, 4u * sizeof(uint32_t)};
+            const ps2x::iop::RpcResult result = subsystem.handleRpc(batch);
+
+            t.IsTrue(result.handled,
+                     "the retail pause/continue group-mask command shapes should be handled");
+            t.Equals(host.readWord(kReceiveAddress), 0xFFFFFFFFu,
+                     "the group-control response should begin with a sentinel");
+            t.Equals(host.readWord(kReceiveAddress + sizeof(uint32_t)), 1u,
+                     "pause-groups should retain the queue success word");
+            t.Equals(host.readWord(kReceiveAddress + 2u * sizeof(uint32_t)), 1u,
+                     "continue-groups should retain the queue success word");
+            t.Equals(host.readWord(kReceiveAddress + 3u * sizeof(uint32_t)),
+                     0xFFFFFFFFu,
+                     "the group-control response should end with a sentinel");
+            t.Equals(host.audioCalls, 2u,
+                     "the audio backend should observe both group-control commands");
+            t.Equals(host.lastAudioFunction, 0x17u,
+                     "the final backend notification should identify continue-groups");
+            t.Equals(host.lastAudioSend.address,
+                     kSendAddress + 4u * sizeof(uint32_t),
+                     "the backend should receive the continue group mask");
+            t.Equals(host.lastAudioSend.size, sizeof(uint32_t),
+                     "the backend group mask should occupy one word");
+
+            std::array<uint32_t, 4> malformed{
+                1u,
+                (2u * sizeof(uint32_t) << 16u) | 0x16u,
+                kGroupMask,
+                0u,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  malformed.data(),
+                                  sizeof(malformed));
+            batch.send.size = sizeof(malformed);
+            t.IsFalse(subsystem.handleRpc(batch).handled,
+                      "pause-groups should reject a two-word payload");
+            t.Equals(host.audioCalls, 2u,
+                     "a malformed group-control command must not reach the backend");
+        });
+
         tc.Run("Sony 989snd play commands return distinct sound handles", [](TestCase &t)
         {
             FakeIopHost host;

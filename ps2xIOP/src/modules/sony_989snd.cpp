@@ -48,6 +48,8 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCommandId0D = 0x0Du;
         constexpr uint32_t kCommandIdPlaySound = 0x11u;
         constexpr uint32_t kCommandIdStopSound = 0x15u;
+        constexpr uint32_t kCommandIdPauseSoundGroups = 0x16u;
+        constexpr uint32_t kCommandIdContinueSoundGroups = 0x17u;
         constexpr uint32_t kCommandIdSoundIsStillPlaying = 0x19u;
         constexpr uint32_t kCommandIdSetSoundParams = 0x21u;
         constexpr uint32_t kCommandIdPlayVagStreamByLocation = 0x2Cu;
@@ -709,6 +711,10 @@ namespace ps2x::iop::detail
                         payloadSize == 2u * sizeof(uint32_t)) ||
                        (commandId == kCommandIdPlaySound &&
                         payloadSize == 6u * sizeof(uint32_t)) ||
+                       (commandId == kCommandIdPauseSoundGroups &&
+                        payloadSize == sizeof(uint32_t)) ||
+                       (commandId == kCommandIdContinueSoundGroups &&
+                        payloadSize == sizeof(uint32_t)) ||
                        (commandId == kCommandIdPlayVagStreamByLocation &&
                         payloadSize == 7u * sizeof(uint32_t)) ||
                        (commandId == kCommandIdPauseVagStream &&
