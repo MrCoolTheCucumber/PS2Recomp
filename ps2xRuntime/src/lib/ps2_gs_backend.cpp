@@ -1478,8 +1478,7 @@ GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
     {
         return {false, GsFallbackReason::UnsupportedPrimitive};
     }
-    if (command.vertexCount() != 3u || !primitive.iip ||
-        !primitive.tme || primitive.fst ||
+    if (command.vertexCount() != 3u || !primitive.tme ||
         primitive.aa1 || primitive.fix)
     {
         return {false, GsFallbackReason::UnsupportedPrimitiveState};
@@ -1539,7 +1538,9 @@ GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
     const bool fixedLod = (context.tex1 & 1u) != 0u;
     const bool automaticMipBase =
         ((context.tex1 >> 9u) & 1u) != 0u;
-    if (maximumMipLevel > 3u || magnificationFilter != 1u ||
+    if (maximumMipLevel > 3u ||
+        (primitive.fst && maximumMipLevel != 0u) ||
+        magnificationFilter != 1u ||
         (maximumMipLevel == 0u
              ? minificationFilter != 1u && minificationFilter != 4u
              : fixedLod || minificationFilter != 4u || automaticMipBase))
@@ -1582,9 +1583,10 @@ GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
 
     for (const GSVertex &vertex : command.vertices())
     {
-        if (!std::isfinite(vertex.s) ||
-            !std::isfinite(vertex.t) ||
-            !std::isfinite(vertex.q))
+        if (!primitive.fst &&
+            (!std::isfinite(vertex.s) ||
+             !std::isfinite(vertex.t) ||
+             !std::isfinite(vertex.q)))
         {
             return {
                 false,

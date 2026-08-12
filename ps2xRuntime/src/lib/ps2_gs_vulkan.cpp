@@ -2516,6 +2516,7 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
         : classifyGsT8GouraudSourceOverDepthCt32Triangle(command);
     if (!decision.supported)
         return decision;
+    const GSPrimReg &primitive = command.primitive();
     const GSContext &context = command.context();
     const GsDrawBounds &bounds = command.bounds();
     const auto &vertices = command.vertices();
@@ -2605,9 +2606,10 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
         maximumMipLevel != 0u &&
         minificationFilter >= 2u && minificationFilter <= 5u;
     const bool constantQFixed =
-        !mipmapsEnabled &&
-        vertices[0].q == vertices[1].q &&
-        vertices[1].q == vertices[2].q;
+        primitive.fst ||
+        (!mipmapsEnabled &&
+         vertices[0].q == vertices[1].q &&
+         vertices[1].q == vertices[2].q);
     const auto finiteQ = [](float q)
     {
         return std::fabs(q) > 1.0e-8f ? q : 1.0f;
@@ -2631,10 +2633,21 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
         prepared.vertexX12_4[index] = fixedVertices[index].x;
         prepared.vertexY12_4[index] = fixedVertices[index].y;
         prepared.vertexZ[index] = vertices[index].zInteger;
-        prepared.rgba[index] = packRgba(vertices[index]);
+        prepared.rgba[index] = packRgba(
+            primitive.iip ? vertices[index] : vertices[2]);
         // The scanline setup consumes already texture-scaled S/T. Preserve
         // those exact host products rather than repeating them on the device.
-        if (constantQFixed)
+        if (primitive.fst)
+        {
+            prepared.sBits[index] = std::bit_cast<uint32_t>(
+                static_cast<float>(vertices[index].u) * 4096.0f -
+                32768.0f);
+            prepared.tBits[index] = std::bit_cast<uint32_t>(
+                static_cast<float>(vertices[index].v) * 4096.0f -
+                32768.0f);
+            prepared.qBits[index] = std::bit_cast<uint32_t>(1.0f);
+        }
+        else if (constantQFixed)
         {
             const float q = finiteQ(vertices[index].q);
             prepared.sBits[index] = std::bit_cast<uint32_t>(

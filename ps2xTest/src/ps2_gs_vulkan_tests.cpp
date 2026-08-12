@@ -2091,6 +2091,9 @@ namespace
                     std::bit_cast<uint32_t>(vertex.s)) |
                 (static_cast<uint64_t>(
                     std::bit_cast<uint32_t>(vertex.t)) << 32u);
+            const uint64_t uv =
+                static_cast<uint64_t>(vertex.u) |
+                (static_cast<uint64_t>(vertex.v) << 16u);
             const uint64_t xyzf =
                 static_cast<uint64_t>(vertex.x12_4) |
                 (static_cast<uint64_t>(vertex.y12_4) << 16u) |
@@ -2098,7 +2101,9 @@ namespace
                     vertex.zInteger & 0x00FFFFFFu) << 32u) |
                 (static_cast<uint64_t>(vertex.fog) << 56u);
             gs.writeRegister(GS_REG_RGBAQ, rgbaq);
-            gs.writeRegister(GS_REG_ST, st);
+            gs.writeRegister(
+                command.primitive().fst ? GS_REG_UV : GS_REG_ST,
+                command.primitive().fst ? uv : st);
             gs.writeRegister(GS_REG_XYZF2, xyzf);
         }
     }
@@ -5817,22 +5822,87 @@ void register_ps2_gs_vulkan_tests()
                      "decoded-CLUT rejection must leave the prior record untouched");
 
             GSPrimReg fixedCoordinates = command.primitive();
+            fixedCoordinates.iip = false;
+            fixedCoordinates.fge = false;
             fixedCoordinates.fst = true;
-            const GsDrawCommand rejectedCoordinates = buildGsDrawCommand(
-                35u, fixedCoordinates, command.context(),
-                std::span<const GSVertex>(command.vertices()),
+            GSContext fixedContext = command.context();
+            fixedContext.tex1 =
+                (1ull << 5u) | (1ull << 6u) | (1ull << 9u);
+            std::array<GSVertex, 3> fixedVertices = command.vertices();
+            constexpr std::array<uint16_t, 3> fixedU{{64u, 400u, 128u}};
+            constexpr std::array<uint16_t, 3> fixedV{{64u, 96u, 368u}};
+            constexpr std::array<uint32_t, 3> fixedRgba{{
+                0x10203040u, 0x50607080u, 0x90A0B0C0u}};
+            for (size_t index = 0u; index < fixedVertices.size(); ++index)
+            {
+                GSVertex &vertex = fixedVertices[index];
+                vertex.u = fixedU[index];
+                vertex.v = fixedV[index];
+                vertex.s = std::numeric_limits<float>::quiet_NaN();
+                vertex.t = std::numeric_limits<float>::quiet_NaN();
+                vertex.q = std::numeric_limits<float>::quiet_NaN();
+                vertex.r = static_cast<uint8_t>(fixedRgba[index]);
+                vertex.g = static_cast<uint8_t>(fixedRgba[index] >> 8u);
+                vertex.b = static_cast<uint8_t>(fixedRgba[index] >> 16u);
+                vertex.a = static_cast<uint8_t>(fixedRgba[index] >> 24u);
+            }
+            const GsDrawCommand fixedUvFlat = buildGsDrawCommand(
+                35u, fixedCoordinates, fixedContext,
+                std::span<const GSVertex>(fixedVertices),
+                command.globalState());
+            GsVulkanT8GouraudDepthCt32Triangle fixedUvFlatRecord{};
+            const GsBackendDecision fixedUvFlatDecision =
+                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                    fixedUvFlat, palette, fixedUvFlatRecord);
+            t.IsTrue(
+                fixedUvFlatDecision.supported,
+                "flat fixed-UV T8 triangles should ignore irrelevant STQ state");
+            t.Equals(
+                fixedUvFlatRecord.rasterFlags,
+                GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
+                    GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE |
+                    GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY |
+                    GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED,
+                "fixed UV should reuse the exact constant-Q fixed DDA path");
+            for (size_t index = 0u; index < fixedVertices.size(); ++index)
+            {
+                t.Equals(
+                    fixedUvFlatRecord.sBits[index],
+                    std::bit_cast<uint32_t>(
+                        static_cast<float>(fixedU[index]) * 4096.0f -
+                        32768.0f),
+                    "fixed U should become the pre-biased 16.16 seed");
+                t.Equals(
+                    fixedUvFlatRecord.tBits[index],
+                    std::bit_cast<uint32_t>(
+                        static_cast<float>(fixedV[index]) * 4096.0f -
+                        32768.0f),
+                    "fixed V should become the pre-biased 16.16 seed");
+                t.Equals(
+                    fixedUvFlatRecord.qBits[index],
+                    std::bit_cast<uint32_t>(1.0f),
+                    "fixed UV should use unit Q");
+                t.Equals(
+                    fixedUvFlatRecord.rgba[index],
+                    fixedRgba[2],
+                    "flat shading should use the provoking vertex color");
+            }
+
+            const GsDrawCommand rejectedFixedMip = buildGsDrawCommand(
+                36u, fixedCoordinates, command.context(),
+                std::span<const GSVertex>(fixedVertices),
                 command.globalState());
             t.Equals(
                 classifyGsT8GouraudSourceOverDepthCt32Triangle(
-                    rejectedCoordinates).reason,
-                GsFallbackReason::UnsupportedPrimitiveState,
-                "the perspective contract must reject fixed UV coordinates");
+                    rejectedFixedMip).reason,
+                GsFallbackReason::UnsupportedTextureFilter,
+                "fixed UV with mipmaps must remain in software fallback");
 
             GSContext nearestMip = command.context();
             nearestMip.tex1 &= ~(0x7ull << 6u);
             nearestMip.tex1 |= 1ull << 6u;
             const GsDrawCommand rejectedFilter = buildGsDrawCommand(
-                36u, command.primitive(), nearestMip,
+                37u, command.primitive(), nearestMip,
                 std::span<const GSVertex>(command.vertices()),
                 command.globalState());
             t.Equals(
@@ -19548,7 +19618,43 @@ void register_ps2_gs_vulkan_tests()
                 thirdContext,
                 std::span<const GSVertex>(thirdVertices),
                 first.globalState());
-            const std::array<GsDrawCommand, 2> commands{{first, second}};
+            GSPrimReg fixedPrimitive = first.primitive();
+            fixedPrimitive.type = GS_PRIM_TRIANGLE;
+            fixedPrimitive.iip = false;
+            fixedPrimitive.fge = false;
+            fixedPrimitive.fst = true;
+            GSContext fixedContext = first.context();
+            fixedContext.tex1 =
+                (1ull << 5u) | (1ull << 6u) | (1ull << 9u);
+            // ATE=1, ATST=GEQUAL, AREF=128, AFAIL=RGB_ONLY,
+            // DATE=0, ZTE=1, ZTST=GEQUAL.
+            fixedContext.test = 0x5380Bull;
+            std::array<GSVertex, 3> fixedVertices = first.vertices();
+            constexpr std::array<uint16_t, 3> fixedU{{64u, 400u, 128u}};
+            constexpr std::array<uint16_t, 3> fixedV{{64u, 96u, 368u}};
+            constexpr std::array<uint32_t, 3> fixedRgba{{
+                0x20406080u, 0x60A0C0E0u, 0x80FFA888u}};
+            for (size_t index = 0u; index < fixedVertices.size(); ++index)
+            {
+                GSVertex &vertex = fixedVertices[index];
+                vertex.u = fixedU[index];
+                vertex.v = fixedV[index];
+                vertex.s = std::numeric_limits<float>::quiet_NaN();
+                vertex.t = std::numeric_limits<float>::quiet_NaN();
+                vertex.q = std::numeric_limits<float>::quiet_NaN();
+                vertex.r = static_cast<uint8_t>(fixedRgba[index]);
+                vertex.g = static_cast<uint8_t>(fixedRgba[index] >> 8u);
+                vertex.b = static_cast<uint8_t>(fixedRgba[index] >> 16u);
+                vertex.a = static_cast<uint8_t>(fixedRgba[index] >> 24u);
+            }
+            const GsDrawCommand fixed = buildGsDrawCommand(
+                30'103u,
+                fixedPrimitive,
+                fixedContext,
+                std::span<const GSVertex>(fixedVertices),
+                first.globalState());
+            const std::array<GsDrawCommand, 3> commands{{
+                first, second, fixed}};
 
             std::array<uint32_t, 256> palette{};
             std::vector<uint8_t> initial =
@@ -19596,7 +19702,7 @@ void register_ps2_gs_vulkan_tests()
                 }
             }
 
-            std::array<GsVulkanT8GouraudDepthCt32Triangle, 2> prepared{};
+            std::array<GsVulkanT8GouraudDepthCt32Triangle, 3> prepared{};
             for (size_t index = 0u; index < commands.size(); ++index)
             {
                 const GsBackendDecision decision =
@@ -19640,8 +19746,8 @@ void register_ps2_gs_vulkan_tests()
                 return output;
             };
             const std::vector<uint8_t> expectedSingle = renderSoftware(1u);
-            const std::vector<uint8_t> expectedResident = renderSoftware(2u);
-            const auto renderThirdSoftware = [&]()
+            const std::vector<uint8_t> expectedResident = renderSoftware(3u);
+            const auto renderOneSoftware = [&](const GsDrawCommand &command)
             {
                 std::vector<uint8_t> output = initial;
                 GS gs;
@@ -19650,12 +19756,14 @@ void register_ps2_gs_vulkan_tests()
                     static_cast<uint32_t>(output.size()),
                     nullptr);
                 gs.setDebugHistoryPaused(true);
-                drawT8GouraudDepthCt32TriangleCommand(gs, third);
+                drawT8GouraudDepthCt32TriangleCommand(gs, command);
                 gs.flushRenderBatch();
                 return output;
             };
             const std::vector<uint8_t> expectedThird =
-                renderThirdSoftware();
+                renderOneSoftware(third);
+            const std::vector<uint8_t> expectedFixed =
+                renderOneSoftware(fixed);
 
             GsVulkanCapabilityReport preflight{};
             const GsVulkanServiceConfig config =
@@ -19743,6 +19851,27 @@ void register_ps2_gs_vulkan_tests()
                         mismatch.first - actualThird.begin())));
                 return;
             }
+            std::vector<uint8_t> actualFixed = {0xA5u};
+            if (!service->executeT8GouraudDepthCt32Triangle(
+                    initial, prepared[2], actualFixed,
+                    &operationError))
+            {
+                t.Fail(
+                    "flat fixed-UV T8 Vulkan execution failed: " +
+                    operationError);
+                return;
+            }
+            if (actualFixed != expectedFixed)
+            {
+                const auto mismatch = std::mismatch(
+                    actualFixed.begin(), actualFixed.end(),
+                    expectedFixed.begin());
+                t.Fail(
+                    "flat fixed-UV T8 Vulkan execution first disagreed with software at byte " +
+                    std::to_string(static_cast<size_t>(
+                        mismatch.first - actualFixed.begin())));
+                return;
+            }
 
             GsVramPageMask allPages;
             allPages.setAll();
@@ -19814,8 +19943,8 @@ void register_ps2_gs_vulkan_tests()
                 service->statistics();
             t.Equals(
                 statistics.t8GouraudDepthCt32TriangleDrawsCompleted,
-                4ull,
-                "two single and two resident T8 draws should complete");
+                6ull,
+                "three single and three resident T8 draws should complete");
             t.Equals(
                 statistics.t8GouraudDepthCt32TriangleDrawsFailed,
                 0ull,
@@ -19827,10 +19956,10 @@ void register_ps2_gs_vulkan_tests()
                 "the dependent resident pair should use one batch");
             t.Equals(
                 statistics.largestResidentT8GouraudDepthCt32TriangleBatch,
-                2ull,
-                "the resident batch high water should retain both draws");
-            t.Equals(statistics.shaderDispatches, 3ull,
-                     "two single plus ordered resident T8 execution should use three dispatches");
+                3ull,
+                "the resident batch high water should retain all three draws");
+            t.Equals(statistics.shaderDispatches, 4ull,
+                     "three single plus ordered resident T8 execution should use four dispatches");
             t.Equals(statistics.validationErrors, 0u,
                      "T8 execution must remain validation-clean");
             t.Equals(statistics.validationWarnings, 0u,
