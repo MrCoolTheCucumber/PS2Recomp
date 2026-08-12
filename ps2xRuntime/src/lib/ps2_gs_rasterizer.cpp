@@ -3324,7 +3324,9 @@ void GSRasterizer::renderSoftwarePrimitive(
         const GsDrawBounds &bounds = command.bounds();
         const GsDrawResources resources = command.resources();
         const GsBackendDecision decision =
-            classifyGsInitialCt32Sprite(command);
+            m_backendState && m_backendState->accelerated
+                ? m_backendState->accelerated->classify(command)
+                : classifyGsInitialCt32Sprite(command);
         trace.output
             << trace.index << ','
             << static_cast<uint32_t>(primitive.type) << ','
