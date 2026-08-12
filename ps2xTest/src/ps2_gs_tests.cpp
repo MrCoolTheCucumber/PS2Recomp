@@ -17,8 +17,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -28,6 +31,35 @@ namespace
 {
     std::atomic<uint32_t> g_gsSyncCallbackHits{0u};
     std::atomic<uint32_t> g_gsSyncCallbackLastTick{0u};
+
+    class ScopedEnvironmentVariable
+    {
+    public:
+        ScopedEnvironmentVariable(const char *name, const char *value)
+            : m_name(name)
+        {
+            if (const char *original = std::getenv(name))
+                m_original = original;
+            setenv(name, value, 1);
+        }
+
+        ~ScopedEnvironmentVariable()
+        {
+            if (m_original)
+                setenv(m_name.c_str(), m_original->c_str(), 1);
+            else
+                unsetenv(m_name.c_str());
+        }
+
+        ScopedEnvironmentVariable(
+            const ScopedEnvironmentVariable &) = delete;
+        ScopedEnvironmentVariable &operator=(
+            const ScopedEnvironmentVariable &) = delete;
+
+    private:
+        std::string m_name;
+        std::optional<std::string> m_original;
+    };
 
     static_assert(sizeof(GsImageMem) == 12, "GsImageMem size mismatch");
 
@@ -1542,6 +1574,63 @@ void register_ps2_gs_tests()
                 gs.backendCounters().softwareRasterHostNanoseconds,
                 0ull,
                 "resetting backend counters should clear software raster time");
+        });
+
+        tc.Run("GS parallel raster progress counts frontend draws once", [](TestCase &t)
+        {
+            ScopedEnvironmentVariable rasterThreads(
+                "PS2X_GS_RASTER_THREADS", "4");
+            ScopedEnvironmentVariable parallelEnabled(
+                "PS2X_GS_DISABLE_PARALLEL_RASTERIZER", "0");
+
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(
+                vram.data(),
+                static_cast<uint32_t>(vram.size()),
+                nullptr);
+            gs.setProgressTrackingEnabled(true);
+
+            constexpr uint64_t kScissor =
+                (63ull << 16u) |
+                (63ull << 48u);
+            constexpr uint64_t kXy64 =
+                (64ull * 16ull) |
+                ((64ull * 16ull) << 16u);
+            gs.writeRegister(GS_REG_FRAME_1, 1ull << 16u);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32u);
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0ull);
+            gs.writeRegister(
+                GS_REG_PRIM,
+                static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80804020ull);
+
+            constexpr uint64_t kDrawCount = 8u;
+            gs.beginRenderBatch();
+            for (uint64_t draw = 0u; draw < kDrawCount; ++draw)
+            {
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, kXy64);
+            }
+
+            const GSProgressSnapshot queued =
+                gs.getProgressSnapshot();
+            t.Equals(queued.drawsStarted, 0ull,
+                     "queued commands should not start before the batch flush");
+            gs.endRenderBatch();
+
+            const GSProgressSnapshot completed =
+                gs.getProgressSnapshot();
+            t.Equals(completed.drawsStarted, kDrawCount,
+                     "each frontend command should start once regardless of worker ownership");
+            t.Equals(completed.drawsCompleted, kDrawCount,
+                     "each frontend command should complete once regardless of worker ownership");
+            t.Equals(completed.activeDraws, 0u,
+                     "a completed parallel batch should leave no active draws");
+            t.Equals(completed.candidatePixels, 8ull * 64ull * 64ull,
+                     "worker-local scopes should retain exact candidate-pixel accounting");
         });
 
         tc.Run("GS draw command limit pauses within a GIF packet", [](TestCase &t)

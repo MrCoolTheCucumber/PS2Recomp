@@ -2024,10 +2024,10 @@ GSRasterizer::GSRasterizer(GS *owner)
 GSRasterizer::~GSRasterizer() = default;
 
 GSRasterizer::DebugProgressScope::DebugProgressScope(
-    GSRasterizer &rasterizer, GS *owner)
+    GSRasterizer &rasterizer, GS *owner, uint64_t drawCount)
     : m_rasterizer(rasterizer)
 {
-    m_rasterizer.beginDebugProgress(owner);
+    m_rasterizer.beginDebugProgress(owner, drawCount);
 }
 
 GSRasterizer::DebugProgressScope::~DebugProgressScope()
@@ -2035,10 +2035,14 @@ GSRasterizer::DebugProgressScope::~DebugProgressScope()
     m_rasterizer.endDebugProgress();
 }
 
-void GSRasterizer::beginDebugProgress(GS *owner)
+void GSRasterizer::beginDebugProgress(
+    GS *owner, uint64_t drawCount)
 {
     m_debugProgressOwner = owner;
     m_debugCandidatePixelBatch = 0u;
+    m_debugDrawCount = drawCount;
+    m_debugActiveDrawCount = static_cast<uint32_t>(
+        std::min<uint64_t>(drawCount, UINT32_MAX));
     m_trackDebugProgress =
         owner &&
         owner->m_progressTrackingEnabled.load(std::memory_order_relaxed);
@@ -2047,10 +2051,16 @@ void GSRasterizer::beginDebugProgress(GS *owner)
         return;
     }
 
-    owner->m_progressDrawsStarted.fetch_add(1u, std::memory_order_relaxed);
-    owner->m_progressActiveDraws.fetch_add(1u, std::memory_order_relaxed);
-    owner->m_progressActivePrimitive.store(
-        static_cast<uint32_t>(owner->m_prim.type), std::memory_order_relaxed);
+    if (m_debugDrawCount != 0u)
+    {
+        owner->m_progressDrawsStarted.fetch_add(
+            m_debugDrawCount, std::memory_order_relaxed);
+        owner->m_progressActiveDraws.fetch_add(
+            m_debugActiveDrawCount, std::memory_order_relaxed);
+        owner->m_progressActivePrimitive.store(
+            static_cast<uint32_t>(owner->m_prim.type),
+            std::memory_order_relaxed);
+    }
 }
 
 void GSRasterizer::endDebugProgress()
@@ -2063,11 +2073,18 @@ void GSRasterizer::endDebugProgress()
             owner->m_progressCandidatePixels.fetch_add(
                 m_debugCandidatePixelBatch, std::memory_order_relaxed);
         }
-        owner->m_progressDrawsCompleted.fetch_add(1u, std::memory_order_relaxed);
-        owner->m_progressActiveDraws.fetch_sub(1u, std::memory_order_relaxed);
+        if (m_debugDrawCount != 0u)
+        {
+            owner->m_progressDrawsCompleted.fetch_add(
+                m_debugDrawCount, std::memory_order_relaxed);
+            owner->m_progressActiveDraws.fetch_sub(
+                m_debugActiveDrawCount, std::memory_order_relaxed);
+        }
     }
     m_debugProgressOwner = nullptr;
     m_debugCandidatePixelBatch = 0u;
+    m_debugDrawCount = 0u;
+    m_debugActiveDrawCount = 0u;
     m_trackDebugProgress = false;
 }
 
@@ -2113,6 +2130,15 @@ void GSRasterizer::flushSoftwareDrawBatch(GS *gs)
     state->queuedDraws += state->commands.size();
     state->maximumBatchDraws =
         std::max(state->maximumBatchDraws, state->commands.size());
+
+    // A queued software command is one frontend draw even when its scanlines
+    // are distributed to several raster workers. Worker-local scopes below
+    // retain candidate-pixel accounting but use a zero draw count so this
+    // batch scope is the sole owner of started/completed draw progress.
+    DebugProgressScope progress(
+        *this,
+        state->primaryGs,
+        static_cast<uint64_t>(state->commands.size()));
 
     uint32_t populatedWorkers = 0u;
     for (const auto &commands : state->workerCommands)
@@ -2450,7 +2476,7 @@ void GSRasterizer::renderQueuedPrimitive(GS *renderGs,
 
     GSRasterizer &rasterizer = renderGs->m_rasterizer;
     DebugProgressScope progress(
-        rasterizer, m_parallelState->primaryGs);
+        rasterizer, m_parallelState->primaryGs, 0u);
     rasterizer.m_scanlineWorkerIndex = workerIndex;
     rasterizer.m_scanlineWorkerCount = workerCount;
     std::copy_n(draw.fixedX().data(), 3u, rasterizer.m_queuedFixedX);

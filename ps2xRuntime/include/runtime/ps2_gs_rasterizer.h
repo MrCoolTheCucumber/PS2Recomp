@@ -80,7 +80,9 @@ private:
     class DebugProgressScope
     {
     public:
-        DebugProgressScope(GSRasterizer &rasterizer, GS *owner);
+        DebugProgressScope(GSRasterizer &rasterizer,
+                           GS *owner,
+                           uint64_t drawCount = 1u);
         ~DebugProgressScope();
 
         DebugProgressScope(const DebugProgressScope &) = delete;
@@ -101,7 +103,7 @@ private:
     void flushSoftwareDrawBatch(GS *gs);
     [[nodiscard]] size_t softwarePendingCommandCount() const noexcept;
     void renderSoftwarePrimitive(GS *gs, const GsDrawCommand &command);
-    void beginDebugProgress(GS *owner);
+    void beginDebugProgress(GS *owner, uint64_t drawCount);
     void endDebugProgress();
     void renderQueuedPrimitive(GS *renderGs,
                                size_t commandIndex,
@@ -150,6 +152,8 @@ private:
     uint32_t m_scanlineWorkerCount = 1u;
     GS *m_debugProgressOwner = nullptr;
     uint64_t m_debugCandidatePixelBatch = 0u;
+    uint64_t m_debugDrawCount = 0u;
+    uint32_t m_debugActiveDrawCount = 0u;
     bool m_trackDebugProgress = false;
     std::atomic<bool> m_backendTimingEnabled{false};
     std::atomic<uint64_t> m_softwareRasterHostNanoseconds{0u};
