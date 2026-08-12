@@ -1169,6 +1169,7 @@ public:
         bool triggered = false;
         bool stopOnFull = false;
         std::optional<uint32_t> triggerEePc;
+        std::optional<uint64_t> triggerInvocation;
         bool hasTriggerSchedulerSnapshot = false;
         uint64_t triggerVsyncTick = 0u;
         DebugEeScheduler triggerScheduler{};
@@ -1182,6 +1183,8 @@ public:
         uint64_t sequence = 0u;
         uint64_t invocation = 0u;
         uint64_t invocationInstruction = 0u;
+        uint64_t codeHashFnv1a64 = 0u;
+        uint64_t dataHashFnv1a64 = 0u;
         uint32_t pc = 0u;
         uint32_t lower = 0u;
         uint32_t upper = 0u;
@@ -1202,6 +1205,7 @@ public:
         uint8_t viBackupCycles = 0u;
         uint8_t viBackupRegister = 0u;
         bool branchPending = false;
+        bool invocationStart = false;
     };
 
     struct DebugVu0InstructionTrace
@@ -1210,6 +1214,7 @@ public:
         bool triggered = false;
         bool stopOnFull = false;
         std::optional<uint32_t> triggerEePc;
+        std::optional<uint64_t> triggerInvocation;
         uint64_t totalEntries = 0u;
         uint64_t droppedEntries = 0u;
         std::vector<DebugVu0InstructionEntry> entries;
@@ -1806,6 +1811,7 @@ public:
         uint64_t count, std::chrono::milliseconds timeout);
     DebugStopInfo debugStepDispatches(uint64_t count, std::chrono::milliseconds timeout);
     R5900Context debugCpuSnapshot();
+    VuExecutionState debugVu0ArchitecturalSnapshot();
     DebugEeTiming debugEeTimingSnapshot();
     DebugEeScheduler debugEeSchedulerSnapshot();
     bool debugReadRdram(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
@@ -1823,12 +1829,14 @@ public:
     void debugStartVu0SyncTrace(
         size_t maximumEntries,
         std::optional<uint32_t> triggerEePc = std::nullopt,
-        bool stopOnFull = false);
+        bool stopOnFull = false,
+        std::optional<uint64_t> triggerInvocation = std::nullopt);
     DebugVu0SyncTrace debugVu0SyncTraceSnapshot(bool stop);
     void debugStartVu0InstructionTrace(
         size_t maximumEntries,
         std::optional<uint32_t> triggerEePc = std::nullopt,
-        bool stopOnFull = false);
+        bool stopOnFull = false,
+        std::optional<uint64_t> triggerInvocation = std::nullopt);
     DebugVu0InstructionTrace debugVu0InstructionTraceSnapshot(bool stop);
     void debugStartEeEventTrace(
         size_t maximumEntries,
@@ -2666,6 +2674,10 @@ private:
     std::atomic<bool> m_debugVu0SyncTraceTriggered{false};
     std::atomic<bool> m_debugVu0SyncTraceHasTrigger{false};
     std::atomic<uint32_t> m_debugVu0SyncTraceTriggerEePc{0u};
+    std::atomic<bool>
+        m_debugVu0SyncTraceHasInvocationTrigger{false};
+    std::atomic<uint64_t>
+        m_debugVu0SyncTraceTriggerInvocation{0u};
     mutable std::mutex m_debugVu0SyncTraceMutex;
     std::vector<DebugVu0SyncEntry> m_debugVu0SyncTrace;
     size_t m_debugVu0SyncTraceCapacity = 0u;
@@ -2679,6 +2691,10 @@ private:
     std::atomic<bool> m_debugVu0InstructionTraceTriggered{false};
     std::atomic<bool> m_debugVu0InstructionTraceHasTrigger{false};
     std::atomic<uint32_t> m_debugVu0InstructionTraceTriggerEePc{0u};
+    std::atomic<bool>
+        m_debugVu0InstructionTraceHasInvocationTrigger{false};
+    std::atomic<uint64_t>
+        m_debugVu0InstructionTraceTriggerInvocation{0u};
     mutable std::mutex m_debugVu0InstructionTraceMutex;
     std::vector<DebugVu0InstructionEntry> m_debugVu0InstructionTrace;
     size_t m_debugVu0InstructionTraceCapacity = 0u;

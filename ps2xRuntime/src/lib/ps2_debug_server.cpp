@@ -2332,7 +2332,8 @@ struct PS2DebugServer::Impl
     {
         QuiesceGuard guard(runtime);
         const VuExecutionState state =
-            vu1 ? runtime.vu1().state() : runtime.vu0().state();
+            vu1 ? runtime.vu1().state()
+                : runtime.debugVu0ArchitecturalSnapshot();
         const auto floatValue = [](float value)
         {
             Value result;
@@ -2473,6 +2474,16 @@ struct PS2DebugServer::Impl
         {
             result.AddMember(
                 "trigger_ee_pc", Value(rapidjson::kNullType), allocator);
+        }
+        if (trace.triggerInvocation.has_value())
+        {
+            result.AddMember(
+                "trigger_invocation", *trace.triggerInvocation, allocator);
+        }
+        else
+        {
+            result.AddMember(
+                "trigger_invocation", Value(rapidjson::kNullType), allocator);
         }
         if (trace.hasTriggerSchedulerSnapshot)
         {
@@ -2675,6 +2686,7 @@ struct PS2DebugServer::Impl
                 -32602, "maximum_entries must be between 1 and 16384");
         }
         std::optional<uint32_t> triggerEePc;
+        std::optional<uint64_t> triggerInvocation;
         bool stopOnFull = false;
         if (params)
         {
@@ -2690,6 +2702,24 @@ struct PS2DebugServer::Impl
                     trigger->value.GetString(),
                     trigger->value.GetStringLength()));
             }
+            const auto invocation = params->FindMember("trigger_invocation");
+            if (invocation != params->MemberEnd())
+            {
+                if (!invocation->value.IsUint64() ||
+                    invocation->value.GetUint64() == 0u)
+                {
+                    throw RequestError(
+                        -32602,
+                        "trigger_invocation must be a positive unsigned integer");
+                }
+                triggerInvocation = invocation->value.GetUint64();
+            }
+            if (triggerEePc.has_value() && triggerInvocation.has_value())
+            {
+                throw RequestError(
+                    -32602,
+                    "trigger_ee_pc and trigger_invocation are mutually exclusive");
+            }
             const auto stop = params->FindMember("stop_on_full");
             if (stop != params->MemberEnd())
             {
@@ -2702,7 +2732,8 @@ struct PS2DebugServer::Impl
             }
         }
         runtime.debugStartVu0SyncTrace(
-            static_cast<size_t>(maximumEntries), triggerEePc, stopOnFull);
+            static_cast<size_t>(maximumEntries), triggerEePc, stopOnFull,
+            triggerInvocation);
         return vu0SyncTraceValue(false, allocator);
     }
 
@@ -2725,6 +2756,16 @@ struct PS2DebugServer::Impl
             result.AddMember(
                 "trigger_ee_pc", Value(rapidjson::kNullType), allocator);
         }
+        if (trace.triggerInvocation.has_value())
+        {
+            result.AddMember(
+                "trigger_invocation", *trace.triggerInvocation, allocator);
+        }
+        else
+        {
+            result.AddMember(
+                "trigger_invocation", Value(rapidjson::kNullType), allocator);
+        }
         result.AddMember("total_entries", trace.totalEntries, allocator);
         result.AddMember("dropped_entries", trace.droppedEntries, allocator);
         Value entries(rapidjson::kArrayType);
@@ -2737,6 +2778,17 @@ struct PS2DebugServer::Impl
             entry.AddMember(
                 "invocation_instruction",
                 source.invocationInstruction, allocator);
+            entry.AddMember(
+                "invocation_start", source.invocationStart, allocator);
+            if (source.invocationStart)
+            {
+                addString(
+                    entry, "code_hash_fnv1a64",
+                    hostAddressString(source.codeHashFnv1a64), allocator);
+                addString(
+                    entry, "data_hash_fnv1a64",
+                    hostAddressString(source.dataHashFnv1a64), allocator);
+            }
             addString(entry, "pc", addressString(source.pc), allocator);
             addString(entry, "lower", addressString(source.lower), allocator);
             addString(entry, "upper", addressString(source.upper), allocator);
@@ -2799,6 +2851,7 @@ struct PS2DebugServer::Impl
                 -32602, "maximum_entries must be between 1 and 8192");
         }
         std::optional<uint32_t> triggerEePc;
+        std::optional<uint64_t> triggerInvocation;
         bool stopOnFull = false;
         if (params)
         {
@@ -2814,6 +2867,24 @@ struct PS2DebugServer::Impl
                     trigger->value.GetString(),
                     trigger->value.GetStringLength()));
             }
+            const auto invocation = params->FindMember("trigger_invocation");
+            if (invocation != params->MemberEnd())
+            {
+                if (!invocation->value.IsUint64() ||
+                    invocation->value.GetUint64() == 0u)
+                {
+                    throw RequestError(
+                        -32602,
+                        "trigger_invocation must be a positive unsigned integer");
+                }
+                triggerInvocation = invocation->value.GetUint64();
+            }
+            if (triggerEePc.has_value() && triggerInvocation.has_value())
+            {
+                throw RequestError(
+                    -32602,
+                    "trigger_ee_pc and trigger_invocation are mutually exclusive");
+            }
             const auto stop = params->FindMember("stop_on_full");
             if (stop != params->MemberEnd())
             {
@@ -2826,7 +2897,8 @@ struct PS2DebugServer::Impl
             }
         }
         runtime.debugStartVu0InstructionTrace(
-            static_cast<size_t>(maximumEntries), triggerEePc, stopOnFull);
+            static_cast<size_t>(maximumEntries), triggerEePc, stopOnFull,
+            triggerInvocation);
         return vu0InstructionTraceValue(false, allocator);
     }
 
@@ -3680,6 +3752,7 @@ struct PS2DebugServer::Impl
             item.AddMember("tex0_psm",
                            static_cast<uint32_t>(context.tex0.psm),
                            stateAllocator);
+            item.AddMember("clamp", context.clamp, stateAllocator);
             item.AddMember("test", context.test, stateAllocator);
             item.AddMember("alpha", context.alpha, stateAllocator);
             contexts.PushBack(item, stateAllocator);

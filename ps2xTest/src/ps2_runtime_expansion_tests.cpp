@@ -8341,6 +8341,46 @@ void register_ps2_runtime_expansion_tests()
                 "runtime initialization should preserve the post-BIOS configuration");
         });
 
+        tc.Run("idle VU0 debug snapshots expose live macro-mode registers", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.cpu().vu0_vf[7] = _mm_castsi128_ps(
+                _mm_set_epi32(
+                    static_cast<int32_t>(0x44444444u),
+                    static_cast<int32_t>(0x33333333u),
+                    static_cast<int32_t>(0x22222222u),
+                    static_cast<int32_t>(0x11111111u)));
+            runtime.cpu().vu0_acc = _mm_castsi128_ps(
+                _mm_set_epi32(
+                    static_cast<int32_t>(0x88888888u),
+                    static_cast<int32_t>(0x77777777u),
+                    static_cast<int32_t>(0x66666666u),
+                    static_cast<int32_t>(0x55555555u)));
+            runtime.cpu().vi[9] = 0x1234u;
+            runtime.cpu().vu0_clip_flags = 0x2A1555u;
+            runtime.cpu().vu0_q = 3.25f;
+
+            const VuExecutionState state =
+                runtime.debugVu0ArchitecturalSnapshot();
+            std::array<uint32_t, 4> vfBits{};
+            std::array<uint32_t, 4> accBits{};
+            std::memcpy(vfBits.data(), state.vf[7], sizeof(vfBits));
+            std::memcpy(accBits.data(), state.acc, sizeof(accBits));
+
+            t.Equals(vfBits[0], uint32_t{0x11111111u},
+                     "idle VU0 snapshots should read the EE macro VF file");
+            t.Equals(vfBits[3], uint32_t{0x44444444u},
+                     "idle VU0 snapshots should preserve every VF lane");
+            t.Equals(accBits[0], uint32_t{0x55555555u},
+                     "idle VU0 snapshots should read the macro accumulator");
+            t.Equals(state.vi[9], int32_t{0x1234},
+                     "idle VU0 snapshots should read macro VI registers");
+            t.Equals(state.clip, uint32_t{0x2A1555u},
+                     "idle VU0 snapshots should read macro clip flags");
+            t.Equals(state.q, 3.25f,
+                     "idle VU0 snapshots should read the macro Q register");
+        });
+
         tc.Run("EE timing conversions are explicit and saturating", [](TestCase &t)
         {
             using namespace ps2x::timing;
@@ -9213,6 +9253,64 @@ void register_ps2_runtime_expansion_tests()
             }
         });
 
+        tc.Run("VU0 sync trace may wait for an invocation trigger", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration{};
+            configuration.vu0Backend = VuBackendKind::Interpreter;
+            configuration.vu1Backend = VuBackendKind::Interpreter;
+            configuration.useVuBackendEnvironment = false;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
+
+            uint8_t *const code = runtime.memory().getVU0Code();
+            std::memset(code, 0, PS2_VU0_CODE_SIZE);
+
+            constexpr uint32_t kVuNop = 0x0000003Fu;
+            writeVuInstructionPair(
+                code, 0u, makeVuIaddiu(1u, 0u, 1u), kVuNop);
+            writeVuInstructionPair(
+                code, 8u, makeVuIbeq(1u, 0u, 3), kVuNop);
+            writeVuInstructionPair(code, 16u, 0u, kVuNop);
+            writeVuInstructionPair(
+                code, 24u, makeVuBranch(-3), kVuNop);
+            writeVuInstructionPair(code, 32u, 0u, kVuNop);
+
+            runtime.debugStartVu0SyncTrace(
+                2u, std::nullopt, true, 1u);
+            R5900Context ctx{};
+            runtime.vu0StartMicroProgram(
+                runtime.memory().getRDRAM(), &ctx, 0u);
+            PS2Runtime::DebugVu0SyncTrace trace =
+                runtime.debugVu0SyncTraceSnapshot(false);
+            t.IsTrue(
+                trace.triggered,
+                "the selected VU0 invocation should arm the sync trace");
+            t.IsTrue(
+                trace.triggerInvocation.has_value() &&
+                    *trace.triggerInvocation == 1u,
+                "the sync trace should report its invocation trigger");
+            t.Equals(
+                trace.entries.size(), static_cast<size_t>(0u),
+                "the invocation boundary should not fabricate a synchronization");
+
+            ctx.pc = 0x00120000u;
+            ctx.advanceEeCycleTicks(128u);
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, false);
+            trace = runtime.debugVu0SyncTraceSnapshot(false);
+            t.Equals(
+                trace.entries.size(), static_cast<size_t>(1u),
+                "the first synchronization in the selected invocation should be retained");
+            if (!trace.entries.empty())
+            {
+                t.Equals(
+                    trace.entries.front().invocation,
+                    static_cast<uint64_t>(1u),
+                    "the retained synchronization should belong to the selected invocation");
+            }
+        });
+
         tc.Run("VU0 instruction trace captures raw state after an EE PC trigger", [](TestCase &t)
         {
             PS2RuntimeConfiguration configuration{};
@@ -9300,6 +9398,74 @@ void register_ps2_runtime_expansion_tests()
                 t.Equals(
                     entry.vf[4], 0x3F800000u,
                     "raw VF state should preserve exact IEEE-754 bits");
+                t.IsTrue(
+                    entry.invocationStart,
+                    "the first instruction should identify its invocation boundary");
+                t.IsTrue(
+                    entry.codeHashFnv1a64 != 0u &&
+                        entry.dataHashFnv1a64 != 0u,
+                    "the invocation boundary should identify both VU memory images");
+            }
+        });
+
+        tc.Run("VU0 instruction trace may wait for an invocation trigger", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration{};
+            configuration.vu0Backend = VuBackendKind::Interpreter;
+            configuration.vu1Backend = VuBackendKind::Interpreter;
+            configuration.useVuBackendEnvironment = false;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
+
+            uint8_t *const code = runtime.memory().getVU0Code();
+            std::memset(code, 0, PS2_VU0_CODE_SIZE);
+            constexpr uint32_t kVuNop = 0x000002FFu;
+            constexpr uint32_t kVuEnd = 0x400002FFu;
+            writeVuInstructionPair(
+                code, 0u, makeVuIaddiu(1u, 0u, 7u), kVuNop);
+            writeVuInstructionPair(code, 8u, 0u, kVuEnd);
+            writeVuInstructionPair(code, 16u, 0u, kVuNop);
+
+            runtime.debugStartVu0InstructionTrace(
+                8u, std::nullopt, true, 2u);
+            R5900Context first{};
+            runtime.executeVU0Microprogram(
+                runtime.memory().getRDRAM(), &first, 0u);
+            PS2Runtime::DebugVu0InstructionTrace trace =
+                runtime.debugVu0InstructionTraceSnapshot(false);
+            t.IsFalse(
+                trace.triggered,
+                "an earlier VU0 invocation should leave the trace dormant");
+            t.Equals(
+                trace.entries.size(), static_cast<size_t>(0u),
+                "a dormant invocation trigger should not retain instructions");
+
+            R5900Context second{};
+            runtime.executeVU0Microprogram(
+                runtime.memory().getRDRAM(), &second, 0u);
+            trace = runtime.debugVu0InstructionTraceSnapshot(false);
+            t.IsTrue(
+                trace.triggered,
+                "the selected VU0 invocation should trigger the trace");
+            t.IsTrue(
+                trace.triggerInvocation.has_value() &&
+                    *trace.triggerInvocation == 2u,
+                "the snapshot should retain the invocation trigger");
+            t.IsTrue(
+                !trace.entries.empty(),
+                "the selected invocation should retain its first instruction");
+            if (!trace.entries.empty())
+            {
+                t.Equals(
+                    trace.entries.front().invocation, 2u,
+                    "the retained instruction should belong to the selected invocation");
+                t.Equals(
+                    trace.entries.front().invocationInstruction, 0u,
+                    "the selected invocation should be captured from its first instruction");
+                t.IsTrue(
+                    trace.entries.front().invocationStart,
+                    "the selected invocation should retain its starting memory hashes");
             }
         });
 

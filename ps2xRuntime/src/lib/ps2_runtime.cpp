@@ -74,6 +74,19 @@ static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x
 static constexpr const char *GS_HISTORY_DUMP_ENV = "PS2X_GS_HISTORY_DUMP";
 static std::atomic<uint64_t> g_nextEeThreadRuntimeGeneration{1u};
 
+static uint64_t debugFnv1a64(const uint8_t *data, size_t size) noexcept
+{
+    constexpr uint64_t kOffsetBasis = 14695981039346656037ull;
+    constexpr uint64_t kPrime = 1099511628211ull;
+    uint64_t hash = kOffsetBasis;
+    for (size_t index = 0u; index < size; ++index)
+    {
+        hash ^= data[index];
+        hash *= kPrime;
+    }
+    return hash;
+}
+
 #if !defined(PS2X_DEFAULT_EE_EXECUTION_BACKEND_CPP_FIBER)
 #define PS2X_DEFAULT_EE_EXECUTION_BACKEND_CPP_FIBER 0
 #endif
@@ -1654,6 +1667,14 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
                 m_vu0CurrentInvocation.load(std::memory_order_relaxed);
             entry.invocationInstruction =
                 invocationInstruction;
+            if (invocationInstruction == 0u)
+            {
+                entry.invocationStart = true;
+                entry.codeHashFnv1a64 = debugFnv1a64(
+                    m_memory.getVU0Code(), PS2_VU0_CODE_SIZE);
+                entry.dataHashFnv1a64 = debugFnv1a64(
+                    m_memory.getVU0Data(), PS2_VU0_DATA_SIZE);
+            }
             entry.pc = pc;
             entry.lower = lower;
             entry.upper = upper;
@@ -7849,6 +7870,32 @@ void PS2Runtime::beginVu0Invocation()
         invocation, std::memory_order_relaxed);
     m_vu0CurrentInvocationInstruction.store(
         0u, std::memory_order_relaxed);
+    if (m_debugVu0SyncTraceEnabled.load(
+            std::memory_order_acquire) &&
+        !m_debugVu0SyncTraceTriggered.load(
+            std::memory_order_acquire) &&
+        m_debugVu0SyncTraceHasInvocationTrigger.load(
+            std::memory_order_relaxed) &&
+        invocation ==
+            m_debugVu0SyncTraceTriggerInvocation.load(
+                std::memory_order_relaxed))
+    {
+        m_debugVu0SyncTraceTriggered.store(
+            true, std::memory_order_release);
+    }
+    if (m_debugVu0InstructionTraceEnabled.load(
+            std::memory_order_acquire) &&
+        !m_debugVu0InstructionTraceTriggered.load(
+            std::memory_order_acquire) &&
+        m_debugVu0InstructionTraceHasInvocationTrigger.load(
+            std::memory_order_relaxed) &&
+        invocation ==
+            m_debugVu0InstructionTraceTriggerInvocation.load(
+                std::memory_order_relaxed))
+    {
+        m_debugVu0InstructionTraceTriggered.store(
+            true, std::memory_order_release);
+    }
 }
 
 void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
@@ -11430,6 +11477,35 @@ R5900Context PS2Runtime::debugCpuSnapshot()
     return result;
 }
 
+VuExecutionState PS2Runtime::debugVu0ArchitecturalSnapshot()
+{
+    VuExecutionState result{};
+    const auto capture =
+        [this, &result]()
+        {
+            if (m_vu0.isActive())
+            {
+                result = m_vu0.state();
+                return;
+            }
+
+            const R5900Context *const context =
+                m_boundEeContext
+                    ? m_boundEeContext
+                    : &m_cpuContext;
+            copyVu0ContextToState(context, result);
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return result;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
+    return result;
+}
+
 PS2Runtime::DebugEeTiming PS2Runtime::debugEeTimingSnapshot()
 {
     DebugEeTiming result{};
@@ -11936,8 +12012,13 @@ void PS2Runtime::debugClearFault()
 
 void PS2Runtime::debugStartVu0SyncTrace(
     size_t maximumEntries, std::optional<uint32_t> triggerEePc,
-    bool stopOnFull)
+    bool stopOnFull, std::optional<uint64_t> triggerInvocation)
 {
+    if (triggerEePc.has_value() && triggerInvocation.has_value())
+    {
+        throw std::invalid_argument(
+            "VU0 sync trace accepts only one trigger");
+    }
     maximumEntries = std::clamp<size_t>(maximumEntries, 1u, 16384u);
     std::lock_guard<std::mutex> lock(m_debugVu0SyncTraceMutex);
     m_debugVu0SyncTraceEnabled.store(false, std::memory_order_release);
@@ -11954,8 +12035,13 @@ void PS2Runtime::debugStartVu0SyncTrace(
         triggerEePc.value_or(0u), std::memory_order_relaxed);
     m_debugVu0SyncTraceHasTrigger.store(
         triggerEePc.has_value(), std::memory_order_relaxed);
+    m_debugVu0SyncTraceTriggerInvocation.store(
+        triggerInvocation.value_or(0u), std::memory_order_relaxed);
+    m_debugVu0SyncTraceHasInvocationTrigger.store(
+        triggerInvocation.has_value(), std::memory_order_relaxed);
     m_debugVu0SyncTraceTriggered.store(
-        !triggerEePc.has_value(), std::memory_order_release);
+        !triggerEePc.has_value() && !triggerInvocation.has_value(),
+        std::memory_order_release);
     m_debugVu0SyncTraceEnabled.store(true, std::memory_order_release);
     m_vu0.setInstructionObserverEnabled(true);
 }
@@ -12019,6 +12105,13 @@ PS2Runtime::DebugVu0SyncTrace PS2Runtime::debugVu0SyncTraceSnapshot(bool stop)
     {
         snapshot.triggerEePc =
             m_debugVu0SyncTraceTriggerEePc.load(std::memory_order_relaxed);
+    }
+    if (m_debugVu0SyncTraceHasInvocationTrigger.load(
+            std::memory_order_relaxed))
+    {
+        snapshot.triggerInvocation =
+            m_debugVu0SyncTraceTriggerInvocation.load(
+                std::memory_order_relaxed);
     }
     snapshot.totalEntries = m_debugVu0SyncTraceTotal;
     snapshot.droppedEntries =
@@ -12192,8 +12285,13 @@ PS2Runtime::debugEeEventTraceSnapshot(bool stop)
 
 void PS2Runtime::debugStartVu0InstructionTrace(
     size_t maximumEntries, std::optional<uint32_t> triggerEePc,
-    bool stopOnFull)
+    bool stopOnFull, std::optional<uint64_t> triggerInvocation)
 {
+    if (triggerEePc.has_value() && triggerInvocation.has_value())
+    {
+        throw std::invalid_argument(
+            "VU0 instruction trace accepts only one trigger");
+    }
     maximumEntries = std::clamp<size_t>(maximumEntries, 1u, 8192u);
     std::lock_guard<std::mutex> lock(m_debugVu0InstructionTraceMutex);
     m_debugVu0InstructionTraceEnabled.store(
@@ -12208,8 +12306,13 @@ void PS2Runtime::debugStartVu0InstructionTrace(
         triggerEePc.value_or(0u), std::memory_order_relaxed);
     m_debugVu0InstructionTraceHasTrigger.store(
         triggerEePc.has_value(), std::memory_order_relaxed);
+    m_debugVu0InstructionTraceTriggerInvocation.store(
+        triggerInvocation.value_or(0u), std::memory_order_relaxed);
+    m_debugVu0InstructionTraceHasInvocationTrigger.store(
+        triggerInvocation.has_value(), std::memory_order_relaxed);
     m_debugVu0InstructionTraceTriggered.store(
-        !triggerEePc.has_value(), std::memory_order_release);
+        !triggerEePc.has_value() && !triggerInvocation.has_value(),
+        std::memory_order_release);
     m_debugVu0InstructionTraceEnabled.store(
         true, std::memory_order_release);
     m_vu0.setInstructionObserverEnabled(true);
@@ -12279,6 +12382,13 @@ PS2Runtime::debugVu0InstructionTraceSnapshot(bool stop)
     {
         snapshot.triggerEePc =
             m_debugVu0InstructionTraceTriggerEePc.load(
+                std::memory_order_relaxed);
+    }
+    if (m_debugVu0InstructionTraceHasInvocationTrigger.load(
+            std::memory_order_relaxed))
+    {
+        snapshot.triggerInvocation =
+            m_debugVu0InstructionTraceTriggerInvocation.load(
                 std::memory_order_relaxed);
     }
     snapshot.totalEntries = m_debugVu0InstructionTraceTotal;
