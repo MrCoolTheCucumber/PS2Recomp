@@ -846,6 +846,7 @@ public:
         uint64_t retainedPrograms = 0u;
         uint64_t crossGenerationHits = 0u;
         uint64_t evictionFlushes = 0u;
+        uint64_t selectiveEvictions = 0u;
         uint64_t evictedPrograms = 0u;
         uint64_t manualFlushes = 0u;
         uint64_t rejectedPrograms = 0u;
@@ -858,6 +859,8 @@ public:
         uint64_t residentExecutableBytes = 0u;
         uint64_t highWaterPrograms = 0u;
         uint64_t highWaterExecutableBytes = 0u;
+        uint64_t maximumPrograms = 0u;
+        uint64_t maximumExecutableBytes = 0u;
     };
 
     struct DebugVuRecompilerDiagnostics

@@ -10449,6 +10449,8 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                     .crossGenerationHits =
                         source.crossGenerationHits,
                     .evictionFlushes = source.evictionFlushes,
+                    .selectiveEvictions =
+                        source.selectiveEvictions,
                     .evictedPrograms = source.evictedPrograms,
                     .manualFlushes = source.manualFlushes,
                     .rejectedPrograms = source.rejectedPrograms,
@@ -10471,6 +10473,11 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                     .highWaterExecutableBytes =
                         static_cast<uint64_t>(
                             source.highWaterExecutableBytes),
+                    .maximumPrograms = static_cast<uint64_t>(
+                        source.maximumPrograms),
+                    .maximumExecutableBytes =
+                        static_cast<uint64_t>(
+                            source.maximumExecutableBytes),
                 };
             }
 

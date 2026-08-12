@@ -1079,6 +1079,9 @@ struct PS2DebugServer::Impl
                     "eviction_flushes",
                     source.evictionFlushes, allocator);
                 cache.AddMember(
+                    "selective_evictions",
+                    source.selectiveEvictions, allocator);
+                cache.AddMember(
                     "evicted_programs",
                     source.evictedPrograms, allocator);
                 cache.AddMember(
@@ -1115,6 +1118,12 @@ struct PS2DebugServer::Impl
                 cache.AddMember(
                     "high_water_executable_bytes",
                     source.highWaterExecutableBytes, allocator);
+                cache.AddMember(
+                    "maximum_programs",
+                    source.maximumPrograms, allocator);
+                cache.AddMember(
+                    "maximum_executable_bytes",
+                    source.maximumExecutableBytes, allocator);
                 value.AddMember("cache", cache, allocator);
             }
             if (diagnostics.recompilerCreated)

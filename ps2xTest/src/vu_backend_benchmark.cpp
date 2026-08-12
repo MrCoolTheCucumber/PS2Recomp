@@ -2142,6 +2142,10 @@ namespace
                 difference(
                     after.evictionFlushes,
                     cacheBefore.evictionFlushes);
+            result.cacheDelta.selectiveEvictions =
+                difference(
+                    after.selectiveEvictions,
+                    cacheBefore.selectiveEvictions);
             result.cacheDelta.evictedPrograms =
                 difference(
                     after.evictedPrograms,
@@ -2412,6 +2416,8 @@ namespace
                        .crossGenerationHits
                 << ",\"cache_eviction_flushes\":"
                 << measurement.cacheDelta.evictionFlushes
+                << ",\"cache_selective_evictions\":"
+                << measurement.cacheDelta.selectiveEvictions
                 << ",\"cache_evicted_programs\":"
                 << measurement.cacheDelta.evictedPrograms
                 << ",\"cache_manual_flushes\":"

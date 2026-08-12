@@ -85,16 +85,22 @@ Every generation transition advances the handle epoch and immediately makes
 the old slots unusable through their generation guard. Exact-content programs
 and their slot storage remain resident, so this logical invalidation is O(1)
 and a recurring image resolves the edge again under its new generation.
-Scope invalidation, eviction, manual flush, and cache destruction physically
-clear every outgoing slot before executable storage can be released. This
-pre-reclamation all-links walk avoids an incoming-edge graph; no stale target
-can be used or outlive its executable allocation.
+Scope invalidation, manual flush, and cache destruction physically clear every
+outgoing slot before executable storage can be released. Selective eviction
+clears every link whose entry points at the victim, then clears and unbinds the
+victim's own outgoing links. Native slow-link return metadata is pinned in C++
+before target lookup or compilation, so eviction cannot invalidate the raw
+source pointer during that operation. No stale target can be used or outlive
+its executable allocation.
 
-The default bounds are 3,072 programs and 96 MiB of executable mappings per VU.
-Crossing either bound performs a deterministic full flush, then inserts the new
-program. A program larger than the byte limit is rejected without disturbing
-resident entries. Full flushes keep ownership simple and make dangling native
-entries impossible; finer eviction is a later measured optimization.
+The default bounds are 6,144 programs and 96 MiB of executable mappings per VU.
+Crossing either bound reclaims least-recently-used programs until the new
+program fits. Lookup, current-handle resolution, insertion reuse, and link
+population update recency; equal timestamps resolve by the lowest stable slot
+index. Selective reclamation advances the global handle epoch, so every old
+direct handle becomes stale while surviving programs remain discoverable by
+key. A program larger than the byte limit is rejected without disturbing
+resident entries.
 
 ## Executable memory
 
@@ -136,15 +142,17 @@ debugger exception.
 - generation/scope invalidations, retained residents, and programs actually
   discarded;
 - exact cross-generation reuse hits;
-- eviction flushes, evicted programs, and manual flushes;
+- legacy eviction flushes, selective evictions, evicted programs, and manual
+  flushes;
 - rejected programs;
 - successful/failed link resolutions and invalidated live slots;
 - emitted bytes and compilation nanoseconds;
-- current and high-water program/allocated-byte residency.
+- current, high-water, and configured program/allocated-byte residency.
 
 Focused tests cover VU0/VU1 separation, every key dimension, direct and wrapped
 `MPG` writes, byte-identical uploads, data-only writes, reset, generation
-rollover, deterministic bounds, stale handles, W^X permissions, instruction
-cache visibility, compatible and incompatible compilation modes, dynamic
-targets, pre-reclamation link invalidation, move ownership, malformed
-programs, and the thread contract.
+rollover, deterministic program/byte bounds, hot-working-set retention, stale
+handles, W^X permissions, instruction-cache visibility, compatible and
+incompatible compilation modes, dynamic targets, pinned slow-link sources,
+pre-reclamation link invalidation, move ownership, malformed programs, and the
+thread contract.

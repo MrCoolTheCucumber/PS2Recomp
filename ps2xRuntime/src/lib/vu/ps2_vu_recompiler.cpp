@@ -6017,6 +6017,12 @@ VuRunResult VuRecompilerBackend::run(
                             VuExitReason::Fault);
                     }
 
+                    const std::shared_ptr<
+                        VuNativeLinkState>
+                        pinnedLinkSource =
+                            cache.pinLinkSource(
+                                slowLinkSource);
+
                     VuProgramKey targetKey = key;
                     targetKey.entryPc =
                         slowLinkTargetPc;
@@ -6040,7 +6046,7 @@ VuRunResult VuRecompilerBackend::run(
                             targetHandle;
                     const VuProgramLinkResult linked =
                         cache.populateLink(
-                            slowLinkSource,
+                            pinnedLinkSource.get(),
                             targetHandle, targetKey);
                     switch (linked)
                     {

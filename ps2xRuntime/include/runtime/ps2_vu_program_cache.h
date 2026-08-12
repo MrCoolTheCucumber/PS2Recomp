@@ -64,6 +64,8 @@ struct VuNativeLinkState
         kVuNativeDynamicLinkSlotCount> dynamicTargets{};
 
     [[nodiscard]] uint64_t invalidateTargets() noexcept;
+    [[nodiscard]] uint64_t invalidateTarget(
+        uintptr_t targetEntry) noexcept;
 };
 
 enum class VuProgramLinkResult : uint8_t
@@ -146,7 +148,7 @@ struct VuProgramHandle
 
 struct VuProgramCacheLimits
 {
-    size_t maximumPrograms = 3072u;
+    size_t maximumPrograms = 6144u;
     size_t maximumExecutableBytes = 96u * 1024u * 1024u;
 };
 
@@ -161,6 +163,7 @@ struct VuProgramCacheDiagnostics
     uint64_t retainedPrograms = 0u;
     uint64_t crossGenerationHits = 0u;
     uint64_t evictionFlushes = 0u;
+    uint64_t selectiveEvictions = 0u;
     uint64_t evictedPrograms = 0u;
     uint64_t manualFlushes = 0u;
     uint64_t rejectedPrograms = 0u;
@@ -173,6 +176,8 @@ struct VuProgramCacheDiagnostics
     size_t residentExecutableBytes = 0u;
     size_t highWaterPrograms = 0u;
     size_t highWaterExecutableBytes = 0u;
+    size_t maximumPrograms = 0u;
+    size_t maximumExecutableBytes = 0u;
 };
 
 // One cache belongs to one VU. All non-destructor calls must come from one
@@ -203,6 +208,11 @@ public:
         const VuProgramKey &expectedKey);
     [[nodiscard]] const VuCompiledProgram *resolve(
         VuProgramHandle handle) const;
+    // Pins a native slow-link source across a target lookup or compilation,
+    // which may evict the source program. Call immediately after native code
+    // returns and before any other non-const cache operation.
+    [[nodiscard]] std::shared_ptr<VuNativeLinkState>
+    pinLinkSource(const VuNativeLinkState *source);
     [[nodiscard]] VuProgramLinkResult populateLink(
         const VuNativeLinkState *source,
         VuProgramHandle targetHandle,
@@ -238,6 +248,12 @@ private:
             const VuProgramKey &right) const;
     };
 
+    struct ProgramSlot
+    {
+        std::unique_ptr<VuCompiledProgram> program;
+        uint64_t lastUse = 0u;
+    };
+
     struct Scope
     {
         uintptr_t memoryIdentity = 0u;
@@ -251,7 +267,6 @@ private:
     enum class FlushReason : uint8_t
     {
         Invalidation,
-        Eviction,
         Manual,
     };
 
@@ -262,6 +277,8 @@ private:
     void retainProgramsForGeneration();
     void discardPrograms(FlushReason reason);
     void invalidateAllLinks();
+    void touchProgram(uint32_t index);
+    [[nodiscard]] bool evictLeastRecentlyUsed();
     [[nodiscard]] static bool sameProgramIdentity(
         const VuProgramKey &left,
         const VuProgramKey &right);
@@ -278,7 +295,9 @@ private:
     Scope m_scope{};
     uint64_t m_codeGeneration = 0u;
     uint64_t m_epoch = 1u;
-    std::vector<VuCompiledProgram> m_programs;
+    uint64_t m_accessClock = 0u;
+    std::vector<ProgramSlot> m_programs;
+    std::vector<uint32_t> m_freeProgramIndices;
     std::unordered_map<
         VuProgramKey, uint32_t, KeyHash, KeyEqual> m_lookup;
     VuProgramCacheDiagnostics m_diagnostics{};

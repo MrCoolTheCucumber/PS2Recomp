@@ -568,7 +568,7 @@ void register_ps2_vu_program_cache_tests()
             });
 
         tc.Run(
-            "generation and eviction clear links before native storage",
+            "generation and selective eviction clear links before native storage",
             [](TestCase &t)
             {
                 int memoryIdentity = 0;
@@ -682,6 +682,15 @@ void register_ps2_vu_program_cache_tests()
                         reboundTarget, nextTarget) ==
                         VuProgramLinkResult::Linked,
                     "the current generation should relink");
+                const std::shared_ptr<VuNativeLinkState>
+                    pinnedSource = cache.pinLinkSource(
+                        retainedLinks.get());
+                t.IsTrue(
+                    pinnedSource.get() == retainedLinks.get(),
+                    "a returned native link source should pin its storage");
+                t.IsTrue(
+                    cache.lookup(nextTarget).valid(),
+                    "a later target touch should leave the source as LRU");
 
                 VuProgramKey evictionKey = nextSource;
                 evictionKey.hostFeatures ^= 1u;
@@ -710,7 +719,7 @@ void register_ps2_vu_program_cache_tests()
                     "eviction should invalidate the retained source index");
                 t.IsTrue(
                     cache.populateLink(
-                        retainedLinks.get(),
+                        pinnedSource.get(),
                         afterEviction, evictionKey) ==
                         VuProgramLinkResult::
                             SourceUnavailable,
@@ -723,8 +732,139 @@ void register_ps2_vu_program_cache_tests()
                     "only reclamation should physically clear a live link");
                 t.Equals(
                     diagnostics.evictionFlushes,
+                    uint64_t{0u},
+                    "selective reclamation must not report a full flush");
+                t.Equals(
+                    diagnostics.selectiveEvictions,
                     uint64_t{1u},
-                    "the forced cache churn should flush once");
+                    "the least-recent source should be reclaimed once");
+                t.Equals(
+                    diagnostics.evictedPrograms,
+                    uint64_t{1u},
+                    "selective reclamation should discard only the victim");
+            });
+
+        tc.Run(
+            "selective eviction clears only links into the victim",
+            [](TestCase &t)
+            {
+                int memoryIdentity = 0;
+                int codeIdentity = 0;
+                constexpr uintptr_t backendIdentity =
+                    0xabcdef01u;
+                VuProgramKey victimKey =
+                    syntheticKey(
+                        VuUnitId::Vu1,
+                        &memoryIdentity, &codeIdentity);
+                victimKey.codeSize = 64u;
+                victimKey.addressMask = 63u;
+                victimKey.codeContentIdentity = 0x91u;
+                VuProgramKey survivorTargetKey = victimKey;
+                survivorTargetKey.entryPc = 8u;
+                VuProgramKey incomingSourceKey = victimKey;
+                incomingSourceKey.entryPc = 16u;
+                VuProgramKey unrelatedSourceKey = victimKey;
+                unrelatedSourceKey.entryPc = 24u;
+                VuProgramKey replacementKey = victimKey;
+                replacementKey.entryPc = 32u;
+                VuProgramCache cache(
+                    VuUnitId::Vu1,
+                    {
+                        .maximumPrograms = 4u,
+                        .maximumExecutableBytes =
+                            VuExecutableMemory::pageSize() * 4u,
+                    });
+
+                const VuProgramHandle victim = cache.insert(
+                    makeLinkedProgram(victimKey, backendIdentity));
+                const VuProgramHandle survivorTarget = cache.insert(
+                    makeLinkedProgram(
+                        survivorTargetKey, backendIdentity));
+                const VuProgramHandle incomingSource = cache.insert(
+                    makeLinkedProgram(
+                        incomingSourceKey, backendIdentity));
+                const VuProgramHandle unrelatedSource = cache.insert(
+                    makeLinkedProgram(
+                        unrelatedSourceKey, backendIdentity));
+                const VuCompiledProgram *incomingProgram =
+                    cache.resolve(incomingSource);
+                const VuCompiledProgram *unrelatedProgram =
+                    cache.resolve(unrelatedSource);
+                const VuCompiledProgram *victimProgram =
+                    cache.resolve(victim);
+                t.IsNotNull(
+                    incomingProgram,
+                    "the incoming-link source should be resident");
+                t.IsNotNull(
+                    unrelatedProgram,
+                    "the unrelated-link source should be resident");
+                t.IsNotNull(
+                    victimProgram,
+                    "the eventual victim should initially be resident");
+                if (!incomingProgram || !unrelatedProgram ||
+                    !victimProgram)
+                    return;
+                const std::shared_ptr<VuNativeLinkState>
+                    victimLinks =
+                        victimProgram->outgoingLinks;
+                const std::shared_ptr<VuNativeLinkState>
+                    incomingLinks = incomingProgram->outgoingLinks;
+                const std::shared_ptr<VuNativeLinkState>
+                    unrelatedLinks = unrelatedProgram->outgoingLinks;
+                t.IsTrue(
+                    cache.populateLink(
+                        incomingLinks.get(), victim, victimKey) ==
+                        VuProgramLinkResult::Linked,
+                    "the victim should receive an incoming link");
+                t.IsTrue(
+                    cache.populateLink(
+                        unrelatedLinks.get(), survivorTarget,
+                        survivorTargetKey) ==
+                        VuProgramLinkResult::Linked,
+                    "the survivor should receive an unrelated link");
+                const uintptr_t unrelatedEntry =
+                    unrelatedLinks->dynamicTargets.front().targetEntry;
+                t.IsTrue(
+                    cache.lookup(incomingSourceKey).valid(),
+                    "the incoming source should be newer than the victim");
+                t.IsTrue(
+                    cache.lookup(unrelatedSourceKey).valid(),
+                    "the unrelated source should be newer than the victim");
+                t.IsTrue(
+                    cache.lookup(survivorTargetKey).valid(),
+                    "the unrelated target should be newer than the victim");
+
+                const VuProgramHandle replacement = cache.insert(
+                    makeLinkedProgram(
+                        replacementKey, backendIdentity));
+                t.IsTrue(
+                    replacement.valid(),
+                    "replacement should reuse the reclaimed slot");
+                t.IsFalse(
+                    cache.lookup(victimKey).valid(),
+                    "the least-recent target should be evicted");
+                t.Equals(
+                    incomingLinks->dynamicTargets.front().targetEntry,
+                    uintptr_t{0u},
+                    "an incoming link must clear before target reclamation");
+                t.Equals(
+                    unrelatedLinks->dynamicTargets.front().targetEntry,
+                    unrelatedEntry,
+                    "a link to a survivor should remain populated");
+                t.Equals(
+                    victimLinks->ownerCacheIdentity,
+                    uintptr_t{0u},
+                    "the reclaimed victim's link owner should be unbound");
+                const VuProgramCacheDiagnostics diagnostics =
+                    cache.diagnostics();
+                t.Equals(
+                    diagnostics.linkInvalidations,
+                    uint64_t{1u},
+                    "only the incoming victim link should be invalidated");
+                t.Equals(
+                    diagnostics.selectiveEvictions,
+                    uint64_t{1u},
+                    "the target should be reclaimed exactly once");
             });
 
         tc.Run(
@@ -1271,7 +1411,7 @@ void register_ps2_vu_program_cache_tests()
             });
 
         tc.Run(
-            "bounded eviction flushes deterministically without dangling handles",
+            "bounded eviction retains the recently used working set",
             [](TestCase &t)
             {
                 int memoryIdentity = 0;
@@ -1303,6 +1443,9 @@ void register_ps2_vu_program_cache_tests()
                 t.IsNotNull(
                     cache.resolve(second),
                     "second resident should resolve before eviction");
+                t.IsTrue(
+                    cache.lookup(firstKey).valid(),
+                    "touching the first resident should make it most recent");
 
                 const VuProgramHandle third =
                     cache.insert(makeProgram(thirdKey));
@@ -1318,6 +1461,15 @@ void register_ps2_vu_program_cache_tests()
                 t.IsNotNull(
                     cache.resolve(third),
                     "the new epoch's program should resolve");
+                t.IsTrue(
+                    cache.lookup(firstKey).valid(),
+                    "the recently used first program should survive");
+                t.IsFalse(
+                    cache.lookup(secondKey).valid(),
+                    "the least-recent second program should be reclaimed");
+                t.IsTrue(
+                    cache.lookup(thirdKey).valid(),
+                    "the inserted third program should remain resident");
 
                 std::string diagnostic;
                 VuProgramKey oversizedKey = thirdKey;
@@ -1340,17 +1492,26 @@ void register_ps2_vu_program_cache_tests()
                     stats.compilations, uint64_t{3u},
                     "three accepted programs should be counted");
                 t.Equals(
-                    stats.evictionFlushes, uint64_t{1u},
-                    "the third program should cause one full flush");
+                    stats.evictionFlushes, uint64_t{0u},
+                    "bounded replacement should not flush the cache");
                 t.Equals(
-                    stats.evictedPrograms, uint64_t{2u},
-                    "the deterministic flush should evict two programs");
+                    stats.selectiveEvictions, uint64_t{1u},
+                    "the third program should replace one LRU resident");
                 t.Equals(
-                    stats.residentPrograms, size_t{1u},
-                    "only the post-flush program should remain");
+                    stats.evictedPrograms, uint64_t{1u},
+                    "only the least-recent resident should be evicted");
+                t.Equals(
+                    stats.residentPrograms, size_t{2u},
+                    "the hot survivor and new program should remain");
                 t.Equals(
                     stats.highWaterPrograms, size_t{2u},
                     "the resident high-water mark should be bounded");
+                t.Equals(
+                    stats.maximumPrograms, size_t{2u},
+                    "diagnostics should expose the configured count bound");
+                t.Equals(
+                    stats.maximumExecutableBytes, page * 2u,
+                    "diagnostics should expose the configured byte bound");
                 t.Equals(
                     stats.rejectedPrograms, uint64_t{1u},
                     "the oversized program should be diagnosed");
@@ -1363,6 +1524,116 @@ void register_ps2_vu_program_cache_tests()
                     cache.diagnostics().manualFlushes,
                     uint64_t{1u},
                     "manual flush should be observable");
+            });
+
+        tc.Run(
+            "byte pressure reclaims only enough least-recent programs",
+            [](TestCase &t)
+            {
+                int memoryIdentity = 0;
+                int codeIdentity = 0;
+                VuProgramKey firstKey =
+                    syntheticKey(
+                        VuUnitId::Vu1,
+                        &memoryIdentity, &codeIdentity);
+                VuProgramKey secondKey = firstKey;
+                secondKey.entryPc = 8u;
+                VuProgramKey thirdKey = firstKey;
+                thirdKey.hostFeatures ^= 1u;
+                const size_t page =
+                    VuExecutableMemory::pageSize();
+                VuProgramCache cache(
+                    VuUnitId::Vu1,
+                    {
+                        .maximumPrograms = 4u,
+                        .maximumExecutableBytes = page * 3u,
+                    });
+
+                (void)cache.insert(makeProgram(firstKey));
+                (void)cache.insert(makeProgram(secondKey));
+                t.IsTrue(
+                    cache.lookup(secondKey).valid(),
+                    "the second program should be the hot survivor");
+                const VuProgramHandle third = cache.insert(
+                    makeProgram(thirdKey, page + 1u));
+
+                t.IsTrue(
+                    third.valid(),
+                    "the two-page program should fit after one reclaim");
+                t.IsFalse(
+                    cache.lookup(firstKey).valid(),
+                    "byte pressure should reclaim the cold first program");
+                t.IsTrue(
+                    cache.lookup(secondKey).valid(),
+                    "byte pressure should retain the hot second program");
+                const VuProgramCacheDiagnostics stats =
+                    cache.diagnostics();
+                t.Equals(
+                    stats.selectiveEvictions, uint64_t{1u},
+                    "byte pressure should reclaim exactly one program");
+                t.Equals(
+                    stats.residentPrograms, size_t{2u},
+                    "two programs should remain resident");
+                t.Equals(
+                    stats.residentExecutableBytes,
+                    page * 3u,
+                    "resident executable bytes should meet the limit");
+            });
+
+        tc.Run(
+            "hot entries survive repeated bounded cache churn",
+            [](TestCase &t)
+            {
+                int memoryIdentity = 0;
+                int codeIdentity = 0;
+                VuProgramKey hotA =
+                    syntheticKey(
+                        VuUnitId::Vu1,
+                        &memoryIdentity, &codeIdentity);
+                VuProgramKey hotB = hotA;
+                hotB.entryPc = 8u;
+                VuProgramKey cold = hotA;
+                cold.hostFeatures = 0x2000u;
+                VuProgramCache cache(
+                    VuUnitId::Vu1,
+                    {
+                        .maximumPrograms = 3u,
+                        .maximumExecutableBytes =
+                            VuExecutableMemory::pageSize() * 3u,
+                    });
+
+                (void)cache.insert(makeProgram(hotA));
+                (void)cache.insert(makeProgram(hotB));
+                for (uint64_t iteration = 0u;
+                     iteration < 16u; ++iteration)
+                {
+                    t.IsTrue(
+                        cache.lookup(hotA).valid(),
+                        "hot entry A should remain resident");
+                    t.IsTrue(
+                        cache.lookup(hotB).valid(),
+                        "hot entry B should remain resident");
+                    cold.hostFeatures = 0x2000u + iteration;
+                    (void)cache.insert(makeProgram(cold));
+                }
+
+                const VuProgramCacheDiagnostics stats =
+                    cache.diagnostics();
+                t.Equals(
+                    stats.compilations, uint64_t{18u},
+                    "only the distinct cold entries should compile");
+                t.Equals(
+                    stats.selectiveEvictions, uint64_t{15u},
+                    "each cold replacement after the first should evict once");
+                t.Equals(
+                    stats.evictedPrograms, uint64_t{15u},
+                    "churn should discard one cold entry at a time");
+                t.Equals(
+                    stats.evictionFlushes, uint64_t{0u},
+                    "working-set churn should never flush all residents");
+                t.Equals(
+                    stats.residentPrograms, size_t{3u},
+                    "both hot entries and the last cold entry should remain");
             });
 
         tc.Run(
