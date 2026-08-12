@@ -905,6 +905,12 @@ namespace ps2recomp
             const uint8_t vuFunc = isSpecial2 ? special2Func : special1Func;
 
             inst.vectorInfo.vectorField = static_cast<uint8_t>((inst.raw >> 21) & 0xF);
+            inst.vectorInfo.modifiesMAC =
+                vuFunc <= 0x0fu ||
+                (vuFunc >= 0x18u && vuFunc <= 0x1cu) ||
+                vuFunc == 0x1eu ||
+                (vuFunc >= 0x20u && vuFunc <= 0x2au) ||
+                (vuFunc >= 0x2cu && vuFunc <= 0x2eu);
 
             // Component selectors are encoded in bits 21-24 as L/M for these macro ops.
             if (vuFunc == VU0_S2_VDIV || vuFunc == VU0_S2_VRSQRT ||

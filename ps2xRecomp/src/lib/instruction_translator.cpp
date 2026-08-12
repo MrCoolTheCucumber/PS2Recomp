@@ -252,18 +252,33 @@ namespace ps2recomp
                 inst.vu0SyncMode == Vu0SyncMode::Finish;
             const std::string operation =
                 m_codeGenerator.translateVUInstruction(inst);
+            std::string publication;
+            if (inst.rs == COP2_QMTC2)
+            {
+                publication = fmt::format(
+                    "runtime->publishVU0VectorRegisterWrite(ctx, {});",
+                    inst.rd);
+            }
+            else if (inst.rs == COP2_CTC2)
+            {
+                publication = fmt::format(
+                    "runtime->publishVU0ControlRegisterWrite(ctx, {});",
+                    inst.rd);
+            }
             if (!finish &&
                 inst.vu0SyncMode == Vu0SyncMode::Skip)
             {
                 return fmt::format(
-                    "{{ {}\nctx->enforceVu0RegisterInvariants(); }}",
-                    operation);
+                    "{{ {}\nctx->enforceVu0RegisterInvariants();\n{} }}",
+                    operation,
+                    publication);
             }
             return fmt::format(
                 "{{ runtime->synchronizeVU0Microprogram(rdram, ctx, {}); "
-                "{}\nctx->enforceVu0RegisterInvariants(); }}",
+                "{}\nctx->enforceVu0RegisterInvariants();\n{} }}",
                 finish ? "true" : "false",
-                operation);
+                operation,
+                publication);
         }
         case OPCODE_ADDI:
             return fmt::format(
@@ -327,19 +342,23 @@ namespace ps2recomp
             {
                 return fmt::format(
                     "{{ ctx->vu0_vf[{}] = _mm_castsi128_ps({}); "
-                    "ctx->enforceVu0RegisterInvariants(); }}",
+                    "ctx->enforceVu0RegisterInvariants(); "
+                    "runtime->publishVU0VectorRegisterWrite(ctx, {}); }}",
                     inst.rt,
-                    genCheckedRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)Ps2ExtractEpi32(eeBreakpointValue, 0)"));
+                    genCheckedRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)Ps2ExtractEpi32(eeBreakpointValue, 0)"),
+                    inst.rt);
             }
             return fmt::format(
                 "{{ runtime->synchronizeVU0Microprogram(rdram, ctx, {}); "
                 "ctx->vu0_vf[{}] = _mm_castsi128_ps({}); "
-                "ctx->enforceVu0RegisterInvariants(); }}",
+                "ctx->enforceVu0RegisterInvariants(); "
+                "runtime->publishVU0VectorRegisterWrite(ctx, {}); }}",
                 inst.vu0SyncMode == Vu0SyncMode::Finish
                     ? "true"
                     : "false",
                 inst.rt,
-                genCheckedRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)Ps2ExtractEpi32(eeBreakpointValue, 0)"));
+                genCheckedRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)Ps2ExtractEpi32(eeBreakpointValue, 0)"),
+                inst.rt);
         case OPCODE_SDC2:
             if (inst.vu0SyncMode == Vu0SyncMode::Skip)
             {

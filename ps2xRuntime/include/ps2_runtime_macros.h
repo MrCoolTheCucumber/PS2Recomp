@@ -481,6 +481,135 @@ static inline uint64_t Ps2Sub64Overflow(uint64_t lhs, uint64_t rhs, bool &overfl
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
 
+static inline float Ps2VuCanonicalizeFloat(float value)
+{
+    uint32_t bits = std::bit_cast<uint32_t>(value);
+    switch (bits & 0x7f800000u)
+    {
+    case 0u:
+        // VU arithmetic flushes denormals to signed zero.
+        bits &= 0x80000000u;
+        break;
+    case 0x7f800000u:
+        // The VU has no infinities or NaNs; overflowing values saturate.
+        bits = (bits & 0x80000000u) | 0x7f7fffffu;
+        break;
+    default:
+        break;
+    }
+    return std::bit_cast<float>(bits);
+}
+
+static inline float Ps2VuRsqrt(float fsValue, float ftValue, uint16_t &status)
+{
+    const uint32_t fsBits = std::bit_cast<uint32_t>(fsValue);
+    const uint32_t ftBits = std::bit_cast<uint32_t>(ftValue);
+    const bool negative = ((fsBits ^ ftBits) & 0x80000000u) != 0u;
+    const float fs = Ps2VuCanonicalizeFloat(fsValue);
+    const float ft = Ps2VuCanonicalizeFloat(ftValue);
+
+    // VRSQRT replaces the current invalid/divide flags while preserving all
+    // other current and sticky STATUS state.
+    status = static_cast<uint16_t>(status & ~0x0030u);
+    if (ft == 0.0f)
+    {
+        status = static_cast<uint16_t>(status | 0x0020u);
+        if (fs != 0.0f)
+        {
+            return std::bit_cast<float>(
+                (negative ? 0x80000000u : 0u) | 0x7f7fffffu);
+        }
+
+        status = static_cast<uint16_t>(status | 0x0010u);
+        return std::bit_cast<float>(negative ? 0x80000000u : 0u);
+    }
+
+    if (ft < 0.0f)
+    {
+        status = static_cast<uint16_t>(status | 0x0010u);
+    }
+    return Ps2VuCanonicalizeFloat(fs / std::sqrt(std::fabs(ft)));
+}
+
+static inline void Ps2VuUpdateFmacFlags(
+    R5900Context *ctx, __m128 result, uint8_t dest,
+    bool preserveUnselected = false)
+{
+    uint32_t words[4];
+    std::memcpy(words, &result, sizeof(words));
+
+    uint32_t mac = preserveUnselected ? ctx->vu0_mac_flags : 0u;
+    for (uint32_t lane = 0u; lane < 4u; ++lane)
+    {
+        const uint32_t laneMask = 0x8u >> lane;
+        if ((dest & laneMask) == 0u)
+        {
+            continue;
+        }
+
+        const uint32_t shift = 3u - lane;
+        mac &= ~(0x1111u << shift);
+
+        const uint32_t bits = words[lane];
+        if ((bits & 0x80000000u) != 0u)
+        {
+            mac |= 0x0010u << shift;
+        }
+
+        const uint32_t exponent = (bits >> 23u) & 0xffu;
+        if ((bits & 0x7fffffffu) == 0u)
+        {
+            mac |= 0x0001u << shift;
+        }
+        else if (exponent == 0u)
+        {
+            mac |= 0x0101u << shift;
+        }
+        else if (exponent == 0xffu)
+        {
+            mac |= 0x1000u << shift;
+        }
+    }
+
+    uint32_t status = 0u;
+    if ((mac & 0x000fu) != 0u)
+    {
+        status |= 0x1u;
+    }
+    if ((mac & 0x00f0u) != 0u)
+    {
+        status |= 0x2u;
+    }
+    if ((mac & 0x0f00u) != 0u)
+    {
+        status |= 0x4u;
+    }
+    if ((mac & 0xf000u) != 0u)
+    {
+        status |= 0x8u;
+    }
+
+    ctx->vu0_mac_flags = mac;
+    ctx->vu0_status = static_cast<uint16_t>(
+        (ctx->vu0_status & 0x0ff0u) |
+        status |
+        (status << 6u));
+}
+
+static inline __m128 Ps2VuOuterProductTerms(__m128 fs, __m128 ft)
+{
+    // OPMULA/OPMSUB form the three products used by a vector cross product:
+    // (fs.y * ft.z, fs.z * ft.x, fs.x * ft.y). Their W lane is not written.
+    const __m128 fsYzxw =
+        _mm_shuffle_ps(fs, fs, _MM_SHUFFLE(3, 0, 2, 1));
+    const __m128 ftZxyw =
+        _mm_shuffle_ps(ft, ft, _MM_SHUFFLE(3, 1, 0, 2));
+    const __m128 products = PS2_VMUL(fsYzxw, ftZxyw);
+    return _mm_and_ps(
+        products,
+        _mm_castsi128_ps(_mm_set_epi32(0, -1, -1, -1)));
+}
+
 // Memory access helpers - Hybrid Fast/Slow Path
 // Callers must validate aliases, bounds, and alignment before using the direct
 // helpers. The hybrid READ/WRITE macros do that and otherwise use the runtime.

@@ -1662,6 +1662,10 @@ public:
     void synchronizeVU0Microprogram(uint8_t *rdram,
                                     R5900Context *ctx,
                                     bool interlocked);
+    void publishVU0VectorRegisterWrite(
+        const R5900Context *ctx, uint32_t index) noexcept;
+    void publishVU0ControlRegisterWrite(
+        const R5900Context *ctx, uint32_t index) noexcept;
     [[nodiscard]] bool readCop2Condition(
         const R5900Context *ctx) const noexcept;
     void serviceEeEventsAtBlockBoundary(uint8_t *rdram,

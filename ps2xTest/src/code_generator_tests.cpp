@@ -2579,6 +2579,24 @@ void register_code_generator_tests()
                     std::string::npos,
                 "generated VCALLMS should not serialize EE and VU0 execution");
 
+            Instruction vcallmsr{};
+            vcallmsr.opcode = OPCODE_COP2;
+            vcallmsr.rs = COP2_CO;
+            vcallmsr.rd = VU0_CR_CMSAR0;
+            vcallmsr.function = VU0_S1_VCALLMSR;
+            vcallmsr.raw = 0x4A00D839u;
+
+            const std::string vcallmsrCode =
+                gen.translateInstruction(vcallmsr);
+            t.IsTrue(
+                vcallmsrCode.find("ctx->vu0_cmsar0 & 0x1FFu") !=
+                    std::string::npos,
+                "VCALLMSR should start at the CMSAR0 instruction index");
+            t.IsTrue(
+                vcallmsrCode.find("ctx->vi[27]") ==
+                    std::string::npos,
+                "VCALLMSR must not index beyond the sixteen general VI registers");
+
             Instruction ctc2{};
             ctc2.opcode = OPCODE_COP2;
             ctc2.rs = COP2_CTC2;
@@ -2593,6 +2611,11 @@ void register_code_generator_tests()
                     "synchronizeVU0Microprogram(rdram, ctx, false)") !=
                     std::string::npos,
                 "CTC2.ni should advance VU0 without waiting for completion");
+            t.IsTrue(
+                nonInterlocked.find(
+                    "publishVU0ControlRegisterWrite(ctx, 1)") !=
+                    std::string::npos,
+                "CTC2.ni should publish its write into the live VU0 bank");
 
             ctc2.raw |= 1u;
             const std::string interlocked =
@@ -2614,6 +2637,11 @@ void register_code_generator_tests()
                     "synchronizeVU0Microprogram(rdram, ctx, false)") !=
                     std::string::npos,
                 "LQC2 should remain non-interlocked while advancing concurrent VU0 work");
+            t.IsTrue(
+                lqc2Code.find(
+                    "publishVU0VectorRegisterWrite(ctx, 5)") !=
+                    std::string::npos,
+                "LQC2 should publish its write into the live VU0 bank");
         });
 
         tc.Run("VU0 transfer chains synchronize only at scheduling boundaries", [](TestCase &t) {
@@ -2715,6 +2743,18 @@ void register_code_generator_tests()
                 countOccurrences(generated, "ctx->enforceVu0RegisterInvariants();"),
                 static_cast<size_t>(7u),
                 "skipped catch-ups must still execute every COP2 transfer");
+            t.Equals(
+                countOccurrences(
+                    generated,
+                    "publishVU0VectorRegisterWrite(ctx,"),
+                static_cast<size_t>(4u),
+                "QMTC2 and LQC2 writes should publish only their destination vectors");
+            t.Equals(
+                countOccurrences(
+                    generated,
+                    "publishVU0ControlRegisterWrite(ctx, 1)"),
+                static_cast<size_t>(1u),
+                "the handshake clear should publish its destination VI immediately");
         });
 
         tc.Run("an interlocked VU0 transfer keeps its whole EE block synchronized", [](TestCase &t) {
@@ -3373,6 +3413,148 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vu0_vf[13]") != std::string::npos, "S1 q/i source should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[4]") != std::string::npos, "S1 q/i destination should come from sa");
             t.IsTrue(out.find("ctx->vu0_vf[25]") == std::string::npos, "S1 q/i must not use rs(format) as register index");
+        });
+
+        tc.Run("VU0 macro FMAC operations publish flags", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction vsub{};
+            vsub.opcode = OPCODE_COP2;
+            vsub.rs = COP2_CO;
+            vsub.rt = 2;
+            vsub.rd = 3;
+            vsub.sa = 4;
+            vsub.function = VU0_S1_VSUB;
+            vsub.vectorInfo.vectorField = 0xEu;
+
+            const std::string vsubCode = gen.translateInstruction(vsub);
+            t.IsTrue(
+                vsubCode.find(
+                    "Ps2VuUpdateFmacFlags(ctx, ctx->vu0_vf[4], 0xEu, false)") !=
+                    std::string::npos,
+                "VSUB should publish selected destination lanes to MAC/STATUS");
+
+            Instruction vmini = vsub;
+            vmini.function = VU0_S1_VMINI;
+            const std::string vminiCode = gen.translateInstruction(vmini);
+            t.IsTrue(
+                vminiCode.find("Ps2VuUpdateFmacFlags") == std::string::npos,
+                "VMINI should leave MAC/STATUS unchanged");
+
+            Instruction opmsub = vsub;
+            opmsub.function = VU0_S1_VOPMSUB;
+            opmsub.vectorInfo.vectorField = 0xFu;
+            const std::string opmsubCode = gen.translateInstruction(opmsub);
+            t.IsTrue(
+                opmsubCode.find(
+                    "Ps2VuUpdateFmacFlags(ctx, ctx->vu0_vf[4], 0xEu, true)") !=
+                    std::string::npos,
+                "OPMSUB should preserve the unselected W flags");
+        });
+
+        tc.Run("VU0 VRSQRT uses both selected source lanes", [](TestCase &t) {
+            Instruction inst{};
+            inst.rd = 11;
+            inst.rt = 7;
+            inst.vectorInfo.fsf = 2;
+            inst.vectorInfo.ftf = 1;
+
+            CodeGenerator gen({}, {});
+            const std::string out = gen.translateVU_VRSQRT(inst);
+
+            t.IsTrue(
+                out.find("float fs =") != std::string::npos &&
+                    out.find("ctx->vu0_vf[11]") != std::string::npos &&
+                    out.find("_MM_SHUFFLE(0,0,0,2)") != std::string::npos,
+                "VRSQRT should read fs.fsf as its signed numerator");
+            t.IsTrue(
+                out.find("float ft =") != std::string::npos &&
+                    out.find("ctx->vu0_vf[7]") != std::string::npos &&
+                    out.find("_MM_SHUFFLE(0,0,0,1)") != std::string::npos,
+                "VRSQRT should read ft.ftf as its radicand");
+            t.IsTrue(
+                out.find("Ps2VuRsqrt(fs, ft, ctx->vu0_status)") !=
+                    std::string::npos,
+                "VRSQRT should update Q and STATUS through the architectural helper");
+        });
+
+        tc.Run("VU0 destination MADD and MSUB forms preserve ACC", [](TestCase &t) {
+            constexpr uint8_t functions[] = {
+                VU0_S1_VMADDx, VU0_S1_VMADDy, VU0_S1_VMADDz,
+                VU0_S1_VMADDw, VU0_S1_VMADDq, VU0_S1_VMADDi,
+                VU0_S1_VMADD, VU0_S1_VMSUBx, VU0_S1_VMSUBy,
+                VU0_S1_VMSUBz, VU0_S1_VMSUBw, VU0_S1_VMSUBq,
+                VU0_S1_VMSUBi, VU0_S1_VMSUB, VU0_S1_VOPMSUB,
+            };
+
+            CodeGenerator gen({}, {});
+            for (const uint8_t function : functions)
+            {
+                Instruction inst{};
+                inst.opcode = OPCODE_COP2;
+                inst.rs = COP2_CO;
+                inst.rt = 7;
+                inst.rd = 11;
+                inst.sa = 3;
+                inst.function = function;
+                inst.vectorInfo.vectorField = 0xFu;
+
+                const std::string out = gen.translateInstruction(inst);
+                std::ostringstream message;
+                message << "VU0 destination form 0x" << std::hex
+                        << static_cast<uint32_t>(function)
+                        << " must leave ACC unchanged";
+                t.IsTrue(
+                    out.find("ctx->vu0_acc =") == std::string::npos,
+                    message.str());
+            }
+        });
+
+        tc.Run("VU0 outer-product forms use cross lanes and preserve W", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction opmula{};
+            opmula.opcode = OPCODE_COP2;
+            opmula.rs = COP2_CO;
+            opmula.rt = 7;
+            opmula.rd = 11;
+            opmula.function = 0x3Cu;
+            opmula.vectorInfo.vectorField = 0xFu;
+            opmula.raw =
+                (((VU0_S2_VOPMULA >> 2u) & 0x1Fu) << 6u) |
+                (VU0_S2_VOPMULA & 0x3u);
+
+            const std::string opmulaOut = gen.translateInstruction(opmula);
+            t.IsTrue(
+                opmulaOut.find("Ps2VuOuterProductTerms") !=
+                    std::string::npos,
+                "VOPMULA should use the architectural cross-lane products");
+            t.IsTrue(
+                opmulaOut.find("ctx->vu0_acc = PS2_VBLEND") !=
+                    std::string::npos,
+                "VOPMULA should write selected products to ACC");
+            t.IsTrue(
+                opmulaOut.find("_mm_set_epi32(0, -1, -1, -1)") !=
+                    std::string::npos,
+                "VOPMULA should leave ACC.w unchanged");
+
+            Instruction opmsub = opmula;
+            opmsub.sa = 3;
+            opmsub.function = VU0_S1_VOPMSUB;
+            opmsub.raw = 0u;
+            const std::string opmsubOut = gen.translateInstruction(opmsub);
+            t.IsTrue(
+                opmsubOut.find("Ps2VuOuterProductTerms") !=
+                    std::string::npos,
+                "VOPMSUB should subtract architectural cross-lane products");
+            t.IsTrue(
+                opmsubOut.find("ctx->vu0_acc =") ==
+                    std::string::npos,
+                "VOPMSUB should leave ACC unchanged");
+            t.IsTrue(
+                opmsubOut.find("_mm_set_epi32(0, -1, -1, -1)") !=
+                    std::string::npos,
+                "VOPMSUB should leave VF[fd].w unchanged");
         });
 
         tc.Run("VU0 S2 vector ops use rd as source and rt as destination", [](TestCase &t) {

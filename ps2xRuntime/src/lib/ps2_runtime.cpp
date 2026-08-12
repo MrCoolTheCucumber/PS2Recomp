@@ -916,6 +916,57 @@ namespace
         ctx->enforceVu0RegisterInvariants();
     }
 
+    void copyEeCop2ProcessorGlobalState(
+        R5900Context &destination,
+        const R5900Context &source) noexcept
+    {
+        std::copy_n(
+            source.vu0_vf,
+            std::size(source.vu0_vf),
+            destination.vu0_vf);
+        std::copy_n(
+            source.vi,
+            std::size(source.vi),
+            destination.vi);
+        destination.vu0_q = source.vu0_q;
+        destination.vu0_p = source.vu0_p;
+        destination.vu0_i = source.vu0_i;
+        destination.vu0_r = source.vu0_r;
+        destination.vu0_acc = source.vu0_acc;
+        destination.vu0_status = source.vu0_status;
+        destination.vu0_mac_flags = source.vu0_mac_flags;
+        destination.vu0_clip_flags = source.vu0_clip_flags;
+        destination.vu0_clip_flags2 = source.vu0_clip_flags2;
+        destination.vu0_cmsar0 = source.vu0_cmsar0;
+        destination.vu0_cmsar1 = source.vu0_cmsar1;
+        destination.vu0_cmsar2 = source.vu0_cmsar2;
+        destination.vu0_cmsar3 = source.vu0_cmsar3;
+        destination.vu0_vpu_stat = source.vu0_vpu_stat;
+        destination.vu0_vpu_stat2 = source.vu0_vpu_stat2;
+        destination.vu0_vpu_stat3 = source.vu0_vpu_stat3;
+        destination.vu0_vpu_stat4 = source.vu0_vpu_stat4;
+        destination.vu0_tpc = source.vu0_tpc;
+        destination.vu0_tpc2 = source.vu0_tpc2;
+        destination.vu0_fbrst = source.vu0_fbrst;
+        destination.vu0_fbrst2 = source.vu0_fbrst2;
+        destination.vu0_fbrst3 = source.vu0_fbrst3;
+        destination.vu0_fbrst4 = source.vu0_fbrst4;
+        destination.vu0_itop = source.vu0_itop;
+        destination.vu0_top = source.vu0_top;
+        destination.vu0_info = source.vu0_info;
+        destination.vu0_xitop = source.vu0_xitop;
+        destination.vu0_pc = source.vu0_pc;
+        std::copy_n(
+            source.vu0_cf,
+            std::size(source.vu0_cf),
+            destination.vu0_cf);
+        std::copy_n(
+            source.cop2_ccr,
+            std::size(source.cop2_ccr),
+            destination.cop2_ccr);
+        destination.enforceVu0RegisterInvariants();
+    }
+
     std::filesystem::path normalizeAbsolutePath(const std::filesystem::path &path)
     {
         if (path.empty())
@@ -2254,6 +2305,35 @@ void PS2Runtime::endAsyncCallbackInvocation(
     if (m_asyncCallbackInvocationDepth != 0u)
     {
         --m_asyncCallbackInvocationDepth;
+    }
+
+    // The callback's GPR, COP0, and COP1 snapshots are private interrupt
+    // state, but COP2 belongs to the processor and may keep executing while
+    // the callback is active. Publish that shared state before the private
+    // callback context is unbound so restoring the interrupted context cannot
+    // roll VU0 back to its pre-callback snapshot.
+    R5900Context *const callbackContext =
+        scope.m_guestExecution.m_context;
+    if (callbackContext)
+    {
+        const auto publishCop2 =
+            [callbackContext](R5900Context *destination)
+            {
+                if (!destination || destination == callbackContext)
+                {
+                    return;
+                }
+                copyEeCop2ProcessorGlobalState(
+                    *destination, *callbackContext);
+            };
+
+        publishCop2(&m_cpuContext);
+        publishCop2(scope.m_guestExecution.m_previousContext);
+        if (scope.m_continuationContext !=
+            scope.m_guestExecution.m_previousContext)
+        {
+            publishCop2(scope.m_continuationContext);
+        }
     }
     scope.m_active = false;
 }
@@ -7874,6 +7954,63 @@ void PS2Runtime::synchronizeVU0Microprogram(
         eeCycleTick, nextEventTick);
 }
 
+void PS2Runtime::publishVU0VectorRegisterWrite(
+    const R5900Context *ctx, uint32_t index) noexcept
+{
+    if (!ctx || index >= 32u)
+    {
+        return;
+    }
+
+    VuExecutionState &state = m_vu0.state();
+    _mm_storeu_ps(state.vf[index], ctx->vu0_vf[index]);
+    if (index == 0u)
+    {
+        state.vf[0][0] = 0.0f;
+        state.vf[0][1] = 0.0f;
+        state.vf[0][2] = 0.0f;
+        state.vf[0][3] = 1.0f;
+    }
+}
+
+void PS2Runtime::publishVU0ControlRegisterWrite(
+    const R5900Context *ctx, uint32_t index) noexcept
+{
+    if (!ctx)
+    {
+        return;
+    }
+
+    VuExecutionState &state = m_vu0.state();
+    if (index < 16u)
+    {
+        state.vi[index] = static_cast<int16_t>(ctx->vi[index]);
+        state.vi[0] = 0;
+        return;
+    }
+
+    // These are the writable control registers represented in the live
+    // micro-mode state. CMSAR/FBRST and R are owned outside VuExecutionState;
+    // read-only or reserved control-register writes have no state to publish.
+    switch (index)
+    {
+    case 16u: // STATUS
+        state.status = ctx->vu0_status;
+        break;
+    case 18u: // CLIP
+        state.clip = ctx->vu0_clip_flags;
+        break;
+    case 21u: // I
+        state.i = ctx->vu0_i;
+        break;
+    case 22u: // Q
+        state.q = ctx->vu0_q;
+        break;
+    default:
+        break;
+    }
+}
+
 void PS2Runtime::serviceEeEventsAtBlockBoundary(
     uint8_t *rdram, R5900Context *ctx)
 {
@@ -9485,46 +9622,7 @@ static void copyEeProcessorGlobalState(
     R5900Context &destination,
     const R5900Context &source) noexcept
 {
-    std::copy_n(
-        source.vu0_vf,
-        std::size(source.vu0_vf),
-        destination.vu0_vf);
-    std::copy_n(
-        source.vi,
-        std::size(source.vi),
-        destination.vi);
-    destination.vu0_q = source.vu0_q;
-    destination.vu0_p = source.vu0_p;
-    destination.vu0_i = source.vu0_i;
-    destination.vu0_r = source.vu0_r;
-    destination.vu0_acc = source.vu0_acc;
-    destination.vu0_status = source.vu0_status;
-    destination.vu0_mac_flags = source.vu0_mac_flags;
-    destination.vu0_clip_flags = source.vu0_clip_flags;
-    destination.vu0_clip_flags2 = source.vu0_clip_flags2;
-    destination.vu0_cmsar0 = source.vu0_cmsar0;
-    destination.vu0_cmsar1 = source.vu0_cmsar1;
-    destination.vu0_cmsar2 = source.vu0_cmsar2;
-    destination.vu0_cmsar3 = source.vu0_cmsar3;
-    destination.vu0_vpu_stat = source.vu0_vpu_stat;
-    destination.vu0_vpu_stat2 = source.vu0_vpu_stat2;
-    destination.vu0_vpu_stat3 = source.vu0_vpu_stat3;
-    destination.vu0_vpu_stat4 = source.vu0_vpu_stat4;
-    destination.vu0_tpc = source.vu0_tpc;
-    destination.vu0_tpc2 = source.vu0_tpc2;
-    destination.vu0_fbrst = source.vu0_fbrst;
-    destination.vu0_fbrst2 = source.vu0_fbrst2;
-    destination.vu0_fbrst3 = source.vu0_fbrst3;
-    destination.vu0_fbrst4 = source.vu0_fbrst4;
-    destination.vu0_itop = source.vu0_itop;
-    destination.vu0_top = source.vu0_top;
-    destination.vu0_info = source.vu0_info;
-    destination.vu0_xitop = source.vu0_xitop;
-    destination.vu0_pc = source.vu0_pc;
-    std::copy_n(
-        source.vu0_cf,
-        std::size(source.vu0_cf),
-        destination.vu0_cf);
+    copyEeCop2ProcessorGlobalState(destination, source);
 
     destination.cop0_index = source.cop0_index;
     destination.cop0_random = source.cop0_random;
@@ -9557,11 +9655,6 @@ static void copyEeProcessorGlobalState(
     destination.cop0_taghi = source.cop0_taghi;
     destination.cop0_errorepc = source.cop0_errorepc;
 
-    std::copy_n(
-        source.cop2_ccr,
-        std::size(source.cop2_ccr),
-        destination.cop2_ccr);
-    destination.enforceVu0RegisterInvariants();
 }
 
 void PS2Runtime::publishEeProcessorGlobalState(

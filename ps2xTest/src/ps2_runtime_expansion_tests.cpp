@@ -1380,6 +1380,107 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(ctx.vi[0], static_cast<uint16_t>(0), "VI0 writes should be discarded");
         });
 
+        tc.Run("VU outer-product terms use architectural cross lanes", [](TestCase &t)
+        {
+            const __m128 fs = _mm_set_ps(17.0f, 5.0f, 3.0f, 2.0f);
+            const __m128 ft = _mm_set_ps(19.0f, 13.0f, 11.0f, 7.0f);
+            const __m128 products = Ps2VuOuterProductTerms(fs, ft);
+
+            alignas(16) float lanes[4]{};
+            _mm_storeu_ps(lanes, products);
+            t.Equals(lanes[0], 39.0f,
+                     "outer-product X should multiply fs.y by ft.z");
+            t.Equals(lanes[1], 35.0f,
+                     "outer-product Y should multiply fs.z by ft.x");
+            t.Equals(lanes[2], 22.0f,
+                     "outer-product Z should multiply fs.x by ft.y");
+            t.Equals(lanes[3], 0.0f,
+                     "outer-product helper should not produce a W term");
+        });
+
+        tc.Run("VU0 macro FMAC flags classify lanes and retain sticky status", [](TestCase &t)
+        {
+            R5900Context ctx{};
+
+            Ps2VuUpdateFmacFlags(
+                &ctx,
+                _mm_set_ps(-9.0f, 0.0f, 115.48f, 132.09f),
+                0xEu);
+            t.Equals(ctx.vu0_mac_flags, 0x0002u,
+                     "an XYZ result with zero Z should set only MAC.Zz");
+            t.Equals(ctx.vu0_status, static_cast<uint16_t>(0x0041u),
+                     "zero should set current and sticky STATUS.Z");
+
+            Ps2VuUpdateFmacFlags(
+                &ctx,
+                _mm_set_ps(-9.0f, -1.0f, -2.0f, -3.0f),
+                0xEu);
+            t.Equals(ctx.vu0_mac_flags, 0x00E0u,
+                     "negative XYZ lanes should set MAC.Sx/Sy/Sz and clear W");
+            t.Equals(ctx.vu0_status, static_cast<uint16_t>(0x00C2u),
+                     "STATUS should expose current sign and retain sticky zero/sign");
+
+            const __m128 exceptional = _mm_castsi128_ps(Ps2MakeU32Vector(
+                0x00000000u,
+                0xBF800000u,
+                0x00000001u,
+                0x7F800000u));
+            ctx.vu0_status = 0u;
+            Ps2VuUpdateFmacFlags(&ctx, exceptional, 0xFu);
+            t.Equals(ctx.vu0_mac_flags, 0x124Au,
+                     "MAC should classify zero, sign, underflow, and overflow per lane");
+            t.Equals(ctx.vu0_status, static_cast<uint16_t>(0x03CFu),
+                     "all current and sticky STATUS summaries should be populated");
+
+            ctx.vu0_mac_flags = 0x0010u;
+            Ps2VuUpdateFmacFlags(
+                &ctx, _mm_set1_ps(1.0f), 0xEu, true);
+            t.Equals(ctx.vu0_mac_flags, 0x0010u,
+                     "outer-product forms should preserve the unselected W flags");
+        });
+
+        tc.Run("VU VRSQRT preserves numerator sign and exceptional results", [](TestCase &t)
+        {
+            const auto bits = [](float value) {
+                return std::bit_cast<uint32_t>(value);
+            };
+
+            uint16_t status = 0x0ff0u;
+            float q = Ps2VuRsqrt(-1.0f, 1.0f, status);
+            t.Equals(bits(q), 0xbf800000u,
+                     "a negative numerator should produce a negative reciprocal root");
+            t.Equals(status, static_cast<uint16_t>(0x0fc0u),
+                     "an ordinary result should clear only current invalid/divide flags");
+
+            status = 0x0040u;
+            q = Ps2VuRsqrt(2.0f, -4.0f, status);
+            t.Equals(bits(q), 0x3f800000u,
+                     "a negative radicand should use its magnitude");
+            t.Equals(status, static_cast<uint16_t>(0x0050u),
+                     "a negative radicand should set current invalid while preserving status");
+
+            status = 0u;
+            q = Ps2VuRsqrt(-1.0f, 0.0f, status);
+            t.Equals(bits(q), 0xff7fffffu,
+                     "division by positive zero should saturate with the quotient sign");
+            t.Equals(status, static_cast<uint16_t>(0x0020u),
+                     "a nonzero numerator over zero should set current divide");
+
+            status = 0u;
+            q = Ps2VuRsqrt(-1.0f, -0.0f, status);
+            t.Equals(bits(q), 0x7f7fffffu,
+                     "signed-zero radicands should participate in the quotient sign");
+            t.Equals(status, static_cast<uint16_t>(0x0020u),
+                     "negative zero should still be classified as division by zero");
+
+            status = 0u;
+            q = Ps2VuRsqrt(0.0f, -0.0f, status);
+            t.Equals(bits(q), 0x80000000u,
+                     "zero over signed zero should retain the architectural zero sign");
+            t.Equals(status, static_cast<uint16_t>(0x0030u),
+                     "zero over zero should set current invalid and divide");
+        });
+
         tc.Run("COP2 condition follows only VPU_STAT VU1 running state", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -3328,6 +3429,73 @@ void register_ps2_runtime_expansion_tests()
                 ::getRegU32(&interruptedCtx, 20),
                 0x13579BDFu,
                 "callback GPR writes must not leak into the interrupted continuation");
+        });
+
+        tc.Run("async callback publishes VU0 execution into the interrupted context", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "PS2Memory initialize should succeed");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "runtime core subsystems should bind");
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x40000000u;
+            uint8_t *const code = runtime.memory().getVU0Code();
+            std::memset(code, 0, PS2_VU0_CODE_SIZE);
+            writeVuInstructionPair(
+                code,
+                0u,
+                makeVuIaddiu(2u, 0u, 7u),
+                makeVuAdd(0xFu, 9u, 1u, 1u) | kVuUpperEnd);
+            writeVuInstructionPair(code, 8u, 0u, kVuUpperNop);
+
+            R5900Context interruptedCtx{};
+            interruptedCtx.pc = 0x00123450u;
+            interruptedCtx.vu0_vf[1] =
+                _mm_set_ps(4.0f, 3.0f, 2.0f, 1.0f);
+            interruptedCtx.vu0_vf[9] = _mm_set1_ps(-1.0f);
+            interruptedCtx.vi[2] = 0u;
+            interruptedCtx.cop0_entryhi = 0x12345042u;
+            setRegU32(interruptedCtx, 20, 0x13579BDFu);
+
+            R5900Context callbackCtx{};
+            {
+                PS2Runtime::GuestExecutionScope interruptedExecution(
+                    &runtime, &interruptedCtx);
+                PS2Runtime::AsyncCallbackInvocationScope callbackExecution(
+                    &runtime, &callbackCtx);
+
+                runtime.executeVU0Microprogram(
+                    runtime.memory().getRDRAM(),
+                    &callbackCtx,
+                    0u);
+                callbackCtx.cop0_entryhi = 0xDEADBEEFu;
+                setRegU32(callbackCtx, 20, 0u);
+            }
+
+            alignas(16) float vf9[4]{};
+            _mm_storeu_ps(vf9, interruptedCtx.vu0_vf[9]);
+            t.Equals(
+                vf9[0], 2.0f,
+                "VU0 VF results produced during a callback should remain processor-global");
+            t.Equals(
+                vf9[1], 4.0f,
+                "the complete callback VU0 vector result should reach the interrupted context");
+            t.Equals(
+                static_cast<uint32_t>(interruptedCtx.vi[2]),
+                7u,
+                "VU0 VI results produced during a callback should reach the interrupted context");
+            t.Equals(
+                interruptedCtx.cop0_entryhi,
+                0x12345042u,
+                "callback COP0 writes should remain isolated from the interrupted context");
+            t.Equals(
+                ::getRegU32(&interruptedCtx, 20),
+                0x13579BDFu,
+                "callback GPR writes should remain isolated from the interrupted context");
         });
 
         tc.Run("ordinary guest return to zero still validates instruction fetch", [](TestCase &t)
@@ -8545,7 +8713,24 @@ void register_ps2_runtime_expansion_tests()
                 static_cast<uint32_t>(ctx.vi[2]), 0u,
                 "VU0 should not pass the handshake before the EE write");
 
+            const uint32_t waitPc = runtime.vu0().state().pc;
             ctx.vi[1] = 0u;
+            ctx.vi[2] = 0x55AAu;
+            runtime.publishVU0ControlRegisterWrite(&ctx, 1u);
+            t.Equals(
+                static_cast<uint32_t>(runtime.vu0().state().vi[1]), 0u,
+                "CTC2 should publish its VI write into the live VU0 bank immediately");
+            t.Equals(
+                static_cast<uint32_t>(runtime.vu0().state().vi[2]), 0u,
+                "publishing one VI write must not copy unrelated stale context registers");
+            t.Equals(
+                runtime.vu0().state().pc, waitPc,
+                "publishing a non-interlocked transfer must not advance VU0");
+            t.IsTrue(
+                runtime.vu0().isActive(),
+                "publishing a non-interlocked transfer must leave VU0 running");
+
+            ctx.vi[2] = 0u;
             ctx.insn_count += 5u;
             ctx.advanceEeCycleTicks(104u);
             runtime.synchronizeVU0Microprogram(

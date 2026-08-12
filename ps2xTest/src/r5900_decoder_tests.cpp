@@ -174,6 +174,28 @@ void register_r5900_decoder_tests()
         t.Equals(inst.vectorInfo.vectorField, expectedVecField, "vector field should reflect encoding");
     });
 
+    tc.Run("COP2 decoder distinguishes FMAC flag writers", [](TestCase &t) {
+        const auto makeMacro = [](uint8_t function) {
+            return (OPCODE_COP2 << 26) |
+                   ((COP2_CO | 0xEu) << 21) |
+                   (2u << 16) |
+                   (3u << 11) |
+                   (4u << 6) |
+                   function;
+        };
+
+        R5900Decoder decoder;
+        const Instruction vsub =
+            decoder.decodeInstruction(0x7100u, makeMacro(VU0_S1_VSUB));
+        const Instruction vmini =
+            decoder.decodeInstruction(0x7104u, makeMacro(VU0_S1_VMINI));
+
+        t.IsTrue(vsub.vectorInfo.modifiesMAC,
+                 "VSUB should be classified as an FMAC flag writer");
+        t.IsFalse(vmini.vectorInfo.modifiesMAC,
+                  "VMINI should be classified as flag-neutral");
+    });
+
     tc.Run("REGIMM branch and link marks call and GPR modification", [](TestCase &t) {
         uint32_t address = 0x8000;
         uint16_t offset = 0x2;
