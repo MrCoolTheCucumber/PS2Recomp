@@ -43,6 +43,10 @@ namespace ps2recomp
         static size_t ResliceEntryFunctions(
             std::vector<Function> &functions,
             std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions);
+        static size_t MaterializeAddressQualifiedFunctions(
+            std::vector<Function> &functions,
+            const std::map<uint32_t, std::string> &configuredEntries,
+            const std::vector<Section> &sections);
 
         static std::string ClampFilenameLength(const std::string& baseName, const std::string& extension, std::size_t maxLength);
 
@@ -64,6 +68,7 @@ namespace ps2recomp
         std::unordered_set<uint32_t> m_skipFunctionStarts;
         std::unordered_set<std::string> m_stubFunctions;
         std::unordered_set<uint32_t> m_stubFunctionStarts;
+        std::unordered_map<uint32_t, std::string> m_explicitFunctionNamesByStart;
         std::unordered_map<uint32_t, std::string> m_stubHandlerBindingsByStart;
         std::map<uint32_t, std::string> m_generatedStubs;
         std::unordered_map<uint32_t, std::string> m_functionRenames;

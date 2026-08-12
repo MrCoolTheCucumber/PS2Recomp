@@ -736,6 +736,129 @@ namespace ps2recomp
 
     PS2Recompiler::~PS2Recompiler() = default;
 
+    size_t PS2Recompiler::MaterializeAddressQualifiedFunctions(
+        std::vector<Function> &functions,
+        const std::map<uint32_t, std::string> &configuredEntries,
+        const std::vector<Section> &sections)
+    {
+        size_t materializedCount = 0u;
+
+        for (const auto &[address, configuredName] : configuredEntries)
+        {
+            if ((address & 3u) != 0u)
+            {
+                std::ostringstream message;
+                message << "Address-qualified function selector is unaligned: 0x"
+                        << std::hex << address;
+                throw std::runtime_error(message.str());
+            }
+
+            const bool alreadyStartsHere = std::any_of(
+                functions.begin(), functions.end(),
+                [&](const Function &function)
+                { return function.start == address; });
+            if (alreadyStartsHere)
+            {
+                continue;
+            }
+
+            auto containing = functions.end();
+            for (auto it = functions.begin(); it != functions.end(); ++it)
+            {
+                if (it->start < address && address < it->end &&
+                    (containing == functions.end() ||
+                     it->start > containing->start))
+                {
+                    containing = it;
+                }
+            }
+
+            uint32_t end = 0u;
+            if (containing != functions.end())
+            {
+                end = containing->end;
+                containing->end = address;
+            }
+            else
+            {
+                const Section *section = nullptr;
+                for (const Section &candidate : sections)
+                {
+                    const uint64_t candidateEnd =
+                        static_cast<uint64_t>(candidate.address) +
+                        static_cast<uint64_t>(candidate.size);
+                    if (candidate.isCode &&
+                        address >= candidate.address &&
+                        static_cast<uint64_t>(address) < candidateEnd)
+                    {
+                        section = &candidate;
+                        break;
+                    }
+                }
+
+                if (!section)
+                {
+                    std::ostringstream message;
+                    message << "Address-qualified function selector 0x"
+                            << std::hex << address
+                            << " is outside executable sections";
+                    throw std::runtime_error(message.str());
+                }
+
+                const uint64_t sectionEnd =
+                    static_cast<uint64_t>(section->address) +
+                    static_cast<uint64_t>(section->size);
+                end = sectionEnd > std::numeric_limits<uint32_t>::max()
+                          ? std::numeric_limits<uint32_t>::max()
+                          : static_cast<uint32_t>(sectionEnd);
+                for (const Function &function : functions)
+                {
+                    if (function.start > address && function.start < end)
+                    {
+                        end = function.start;
+                    }
+                }
+            }
+
+            if (end <= address)
+            {
+                std::ostringstream message;
+                message << "Address-qualified function selector 0x"
+                        << std::hex << address
+                        << " has no executable range";
+                throw std::runtime_error(message.str());
+            }
+
+            Function entry{};
+            if (!configuredName.empty())
+            {
+                entry.name = configuredName;
+            }
+            else
+            {
+                std::ostringstream name;
+                name << "entry_" << std::hex << address;
+                entry.name = name.str();
+            }
+            entry.start = address;
+            entry.end = end;
+            functions.push_back(std::move(entry));
+            ++materializedCount;
+        }
+
+        std::sort(
+            functions.begin(), functions.end(),
+            [](const Function &left, const Function &right)
+            {
+                if (left.start != right.start)
+                {
+                    return left.start < right.start;
+                }
+                return left.end < right.end;
+            });
+        return materializedCount;
+    }
+
     void PS2Recompiler::printReport() const
     {
         m_reporter.printSummary(std::cout);
@@ -751,6 +874,7 @@ namespace ps2recomp
             m_skipFunctionStarts.clear();
             m_stubFunctions.clear();
             m_stubFunctionStarts.clear();
+            m_explicitFunctionNamesByStart.clear();
             m_stubHandlerBindingsByStart.clear();
 
             for (const auto &name : m_config.skipFunctions)
@@ -763,6 +887,10 @@ namespace ps2recomp
                 if (selector.start.has_value())
                 {
                     m_skipFunctionStarts.insert(*selector.start);
+                    if (!selector.name.empty())
+                    {
+                        m_explicitFunctionNamesByStart[*selector.start] = selector.name;
+                    }
                 }
             }
             for (const auto &name : m_config.stubImplementations)
@@ -777,6 +905,7 @@ namespace ps2recomp
                     m_stubFunctionStarts.insert(*selector.start);
                     if (!selector.name.empty())
                     {
+                        m_explicitFunctionNamesByStart[*selector.start] = selector.name;
                         auto bindingIt = m_stubHandlerBindingsByStart.find(*selector.start);
                         if (bindingIt != m_stubHandlerBindingsByStart.end() &&
                             bindingIt->second != selector.name)
@@ -840,6 +969,26 @@ namespace ps2recomp
             m_symbols = m_elfParser->extractSymbols();
             m_sections = m_elfParser->getSections();
             m_relocations = m_elfParser->getRelocations();
+
+            std::map<uint32_t, std::string> configuredEntries;
+            for (uint32_t start : m_skipFunctionStarts)
+            {
+                configuredEntries[start] = m_explicitFunctionNamesByStart[start];
+            }
+            for (uint32_t start : m_stubFunctionStarts)
+            {
+                configuredEntries[start] = m_explicitFunctionNamesByStart[start];
+            }
+            const size_t materializedConfiguredEntries =
+                MaterializeAddressQualifiedFunctions(
+                    m_functions, configuredEntries, m_sections);
+            if (materializedConfiguredEntries > 0u)
+            {
+                std::ostringstream message;
+                message << "materialized " << materializedConfiguredEntries
+                        << " address-qualified configured function boundary/boundaries";
+                m_reporter.info("config", message.str());
+            }
 
             if (m_functions.empty())
             {

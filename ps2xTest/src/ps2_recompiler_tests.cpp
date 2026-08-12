@@ -315,6 +315,75 @@ void register_ps2_recompiler_tests()
                      "sceVibGetProfile should use the runtime Pad2 bridge");
         });
 
+        tc.Run("address-qualified selectors split coarse discovered functions", [](TestCase &t) {
+            std::vector<Section> sections = {
+                {".text", 0x1000u, 0x100u, 0u, true, false, false, true, nullptr}
+            };
+            std::vector<Function> functions = {
+                makeFunction("coarse", 0x1000u, 0x1020u),
+                makeFunction("existing", 0x1030u, 0x1040u)
+            };
+            const std::map<uint32_t, std::string> configuredEntries = {
+                {0x1008u, "stub_a"},
+                {0x1010u, "stub_b"},
+                {0x1024u, "gap_stub"},
+                {0x1030u, "existing_override"}
+            };
+
+            const size_t materialized =
+                PS2Recompiler::MaterializeAddressQualifiedFunctions(
+                    functions, configuredEntries, sections);
+            t.Equals(materialized, static_cast<size_t>(3),
+                     "two nested boundaries and one gap boundary should be materialized");
+
+            auto findByStart = [&](uint32_t start) -> const Function *
+            {
+                const auto it = std::find_if(
+                    functions.begin(), functions.end(),
+                    [&](const Function &function)
+                    { return function.start == start; });
+                return it == functions.end() ? nullptr : &(*it);
+            };
+
+            const Function *coarse = findByStart(0x1000u);
+            const Function *stubA = findByStart(0x1008u);
+            const Function *stubB = findByStart(0x1010u);
+            const Function *gapStub = findByStart(0x1024u);
+            const Function *existing = findByStart(0x1030u);
+            t.IsNotNull(coarse, "coarse owner should remain");
+            t.IsNotNull(stubA, "first configured boundary should exist");
+            t.IsNotNull(stubB, "second configured boundary should exist");
+            t.IsNotNull(gapStub, "configured gap boundary should exist");
+            t.IsNotNull(existing, "existing exact boundary should remain");
+            if (coarse)
+            {
+                t.Equals(coarse->end, 0x1008u,
+                         "coarse owner should end at the first configured boundary");
+            }
+            if (stubA)
+            {
+                t.Equals(stubA->name, std::string("stub_a"),
+                         "configured name should be retained");
+                t.Equals(stubA->end, 0x1010u,
+                         "first configured entry should end at the next entry");
+            }
+            if (stubB)
+            {
+                t.Equals(stubB->end, 0x1020u,
+                         "last configured entry in the owner should retain its tail");
+            }
+            if (gapStub)
+            {
+                t.Equals(gapStub->end, 0x1030u,
+                         "gap entry should end at the next known function");
+            }
+            if (existing)
+            {
+                t.Equals(existing->name, std::string("existing"),
+                         "an exact existing boundary should not be renamed or duplicated");
+            }
+        });
+
         tc.Run("additional entries split at nearest discovered boundary", [](TestCase &t) {
             std::vector<Section> sections = {
                 {".text", 0x1000u, 0x3000u, 0u, true, false, false, true, nullptr}
