@@ -145,6 +145,17 @@ namespace ps2x::iop::detail
         std::string imageBodyUpperName;
     };
 
+    struct StashManagerBindings
+    {
+        std::string serviceName;
+        uint32_t sid = 0u;
+        uint32_t arenaBase = 0u;
+        uint32_t arenaSize = 0u;
+        uint32_t readFunction = 1u;
+        uint32_t initializeFunction = 2u;
+        uint32_t initializeResponseBytes = 16u;
+    };
+
     std::unique_ptr<IopService> createCdvdfsvService(IopHost &host);
     std::unique_ptr<IopService> createDbcmanService(IopHost &host);
     std::unique_ptr<IopService> createLibSdService(IopHost &host);
@@ -155,4 +166,5 @@ namespace ps2x::iop::detail
     std::unique_ptr<IopService> createClFileService(IopHost &host, ClFileBindings bindings);
     std::unique_ptr<IopService> createSoundUpdateStubService(IopHost &host, SoundUpdateStubBindings bindings);
     std::unique_ptr<IopService> createSdrdrvService(IopHost &host, SdrdrvBindings bindings);
+    std::unique_ptr<IopService> createStashManagerService(IopHost &host, StashManagerBindings bindings);
 }

@@ -471,6 +471,144 @@ void register_ps2_iop_tests()
                         "Fatal Frame profile should expose SDRDRV");
         });
 
+        tc.Run("RAC1 stash manager round-trips EE DMA payloads through its IOP arena", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+
+            constexpr uint32_t kSid = 0x11u;
+            constexpr uint32_t kArenaBase = 0x000DE4D0u;
+            constexpr uint32_t kArenaSize = 0x00094000u;
+            constexpr uint32_t kInitializeReceive = 0x1000u;
+            constexpr uint32_t kUploadSource = 0x2000u;
+            constexpr uint32_t kReadRequest = 0x2100u;
+            constexpr uint32_t kReadReceive = 0x2200u;
+
+            t.IsTrue(subsystem.configure({"scus_971.99", 0u, 0u}, &error),
+                     "RAC1 profile should match its ELF basename case-insensitively");
+            ps2x::iop::DebugSnapshot snapshot = subsystem.debugSnapshot();
+            t.Equals(snapshot.activeProfile, std::string("rac1-us"),
+                     "RAC1 should select the stash-manager profile");
+            const ps2x::iop::DebugService *service = findService(snapshot, "IOP_stashmgr");
+            if (!service)
+            {
+                t.Fail("RAC1 profile should expose IOP_stashmgr");
+                return;
+            }
+            t.Equals(metricValue(*service, "arena_base"), uint64_t{kArenaBase},
+                     "stash-manager diagnostics should publish the reference IOP base");
+            t.Equals(metricValue(*service, "arena_size"), uint64_t{kArenaSize},
+                     "stash-manager diagnostics should publish the reference arena size");
+
+            std::array<uint32_t, 4> initializeSentinel{
+                0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+            (void)host.writeGuest(kInitializeReceive,
+                                  initializeSentinel.data(),
+                                  sizeof(initializeSentinel));
+            ps2x::iop::RpcRequest initialize{};
+            initialize.sid = kSid;
+            initialize.function = 2u;
+            initialize.receive = {kInitializeReceive, sizeof(initializeSentinel)};
+            const ps2x::iop::RpcResult initializeResult = subsystem.handleRpc(initialize);
+            t.IsTrue(initializeResult.handled,
+                     "stash-manager initialization RPC should be handled");
+            t.Equals(initializeResult.resultAddress, kInitializeReceive,
+                     "initialization should return its receive buffer");
+            t.Equals(host.readWord(kInitializeReceive), kArenaBase,
+                     "initialization should return the IOP arena base");
+            t.Equals(host.readWord(kInitializeReceive + 4u), kArenaSize,
+                     "initialization should return the IOP arena size");
+            t.Equals(host.readWord(kInitializeReceive + 8u), 0u,
+                     "initialization should clear the third response word");
+            t.Equals(host.readWord(kInitializeReceive + 12u), 0u,
+                     "initialization should clear the fourth response word");
+
+            std::array<uint8_t, 64> payload{};
+            for (uint32_t index = 0u; index < payload.size(); ++index)
+            {
+                payload[index] = static_cast<uint8_t>(0x40u + index);
+            }
+            (void)host.writeGuest(kUploadSource, payload.data(), payload.size());
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kUploadSource,
+                                     kArenaBase + 0x20u,
+                                     static_cast<uint32_t>(payload.size())});
+
+            constexpr uint32_t kPayloadReadOffset = 8u;
+            constexpr uint32_t kPayloadReadBytes = 32u;
+            const uint32_t readSource = kArenaBase + 0x20u + kPayloadReadOffset;
+            (void)host.writeWord(kReadRequest, readSource);
+            std::array<uint8_t, kPayloadReadBytes> receiveSentinel{};
+            receiveSentinel.fill(0xCCu);
+            (void)host.writeGuest(kReadReceive,
+                                  receiveSentinel.data(),
+                                  receiveSentinel.size());
+
+            ps2x::iop::RpcRequest read{};
+            read.sid = kSid;
+            read.function = 1u;
+            read.send = {kReadRequest, sizeof(readSource)};
+            read.receive = {kReadReceive, kPayloadReadBytes};
+            const ps2x::iop::RpcResult readResult = subsystem.handleRpc(read);
+            t.IsTrue(readResult.handled, "stash-manager read RPC should be handled");
+            t.Equals(readResult.resultAddress, kReadReceive,
+                     "stash-manager read should return its receive buffer");
+            t.IsTrue(std::equal(payload.begin() + kPayloadReadOffset,
+                                payload.begin() + kPayloadReadOffset + kPayloadReadBytes,
+                                host.memory.begin() + kReadReceive),
+                     "read RPC should return bytes uploaded to the IOP arena");
+
+            snapshot = subsystem.debugSnapshot();
+            service = findService(snapshot, "IOP_stashmgr");
+            if (!service)
+            {
+                t.Fail("stash-manager service should remain visible after transfers");
+                return;
+            }
+            t.Equals(metricValue(*service, "uploads"), uint64_t{1},
+                     "one matching SIF DMA should be retained");
+            t.Equals(metricValue(*service, "upload_bytes"), uint64_t{payload.size()},
+                     "upload metrics should count transferred bytes");
+            t.Equals(metricValue(*service, "reads"), uint64_t{1},
+                     "one valid read RPC should be counted");
+            t.Equals(metricValue(*service, "read_bytes"), uint64_t{kPayloadReadBytes},
+                     "read metrics should count returned bytes");
+
+            subsystem.reset();
+            receiveSentinel.fill(0xCCu);
+            (void)host.writeGuest(kReadReceive,
+                                  receiveSentinel.data(),
+                                  receiveSentinel.size());
+            (void)subsystem.handleRpc(read);
+            t.IsTrue(std::all_of(host.memory.begin() + kReadReceive,
+                                 host.memory.begin() + kReadReceive + kPayloadReadBytes,
+                                 [](uint8_t value) { return value == 0u; }),
+                     "reset should clear retained IOP stash bytes");
+
+            const uint32_t outOfBoundsSource = kArenaBase + kArenaSize - 8u;
+            (void)host.writeWord(kReadRequest, outOfBoundsSource);
+            receiveSentinel.fill(0xCCu);
+            (void)host.writeGuest(kReadReceive,
+                                  receiveSentinel.data(),
+                                  receiveSentinel.size());
+            (void)subsystem.handleRpc(read);
+            t.IsTrue(std::all_of(host.memory.begin() + kReadReceive,
+                                 host.memory.begin() + kReadReceive + kPayloadReadBytes,
+                                 [](uint8_t value) { return value == 0xCCu; }),
+                     "an out-of-bounds read should leave the receive buffer untouched");
+            snapshot = subsystem.debugSnapshot();
+            service = findService(snapshot, "IOP_stashmgr");
+            if (!service)
+            {
+                t.Fail("stash-manager service should remain visible after a rejected read");
+                return;
+            }
+            t.Equals(metricValue(*service, "rejected_reads"), uint64_t{1},
+                     "out-of-bounds reads should be visible in diagnostics");
+        });
+
         tc.Run("Sony 989snd loads and unloads a validated CD sound bank", [](TestCase &t)
         {
             FakeIopHost host;

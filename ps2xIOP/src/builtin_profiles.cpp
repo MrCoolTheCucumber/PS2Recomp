@@ -91,6 +91,16 @@ namespace ps2x::iop::detail
                 .imageBodyUpperName = "IMG_BD.BIN",
             };
         }
+
+        StashManagerBindings rac1StashManagerBindings()
+        {
+            return {
+                .serviceName = "IOP_stashmgr",
+                .sid = 0x00000011u,
+                .arenaBase = 0x000DE4D0u,
+                .arenaSize = 0x00094000u,
+            };
+        }
     }
 
     ServiceList createCoreServices(IopHost &host)
@@ -142,6 +152,18 @@ namespace ps2x::iop::detail
             {
                 ServiceList services;
                 services.emplace_back(createSdrdrvService(host, fatalFrameSdrdrvBindings()));
+                return services;
+            },
+        });
+
+        profiles.push_back({
+            "rac1-us",
+            "builtin",
+            {.elfName = "SCUS_971.99"},
+            [](IopHost &host, const GameIdentity &)
+            {
+                ServiceList services;
+                services.emplace_back(createStashManagerService(host, rac1StashManagerBindings()));
                 return services;
             },
         });
