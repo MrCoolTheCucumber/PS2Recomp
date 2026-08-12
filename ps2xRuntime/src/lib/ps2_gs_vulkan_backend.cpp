@@ -1562,7 +1562,7 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             m_impl->classifiedT8Sequence = command.sequence();
             m_impl->classifiedT8Resources = t8Resources;
             if (!m_impl->exactT8GouraudDepthCt32Triangle ||
-                !m_impl->decodedPalette)
+                (command.primitive().tme && !m_impl->decodedPalette))
             {
                 return {false, GsFallbackReason::BackendUnavailable};
             }
@@ -1872,13 +1872,17 @@ void GsVulkanRasterBackend::submit(
         }
         else if (isAssembledTriangle && commandIsT8[commandIndex] != 0u)
         {
-            t8Palette = m_impl->decodedPalette();
-            if (t8Palette.colors.size() != 256u)
+            const bool textured = command.primitive().tme;
+            if (textured)
             {
-                m_impl->failRequest(
-                    "T8 Gouraud triangle palette capture for draw " +
-                        std::to_string(command.sequence()),
-                    "frontend did not provide an exact 256-entry decoded palette");
+                t8Palette = m_impl->decodedPalette();
+                if (t8Palette.colors.size() != 256u)
+                {
+                    m_impl->failRequest(
+                        "T8 Gouraud triangle palette capture for draw " +
+                            std::to_string(command.sequence()),
+                        "frontend did not provide an exact 256-entry decoded palette");
+                }
             }
             const GsBackendDecision prepared =
                 prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
@@ -2422,35 +2426,45 @@ void GsVulkanRasterBackend::submit(
 
             if (isT8GouraudDepthTriangle)
             {
-                const bool repeatsPalette =
-                    m_impl->pendingT8PaletteIdentityValid &&
-                    t8Palette.generation ==
-                        m_impl->pendingT8PaletteGeneration &&
-                    t8Palette.texa == m_impl->pendingT8PaletteTexa &&
-                    t8Palette.sourcePsm ==
-                        m_impl->pendingT8PaletteSourcePsm &&
-                    t8Palette.csm == m_impl->pendingT8PaletteCsm &&
-                    t8Palette.csa == m_impl->pendingT8PaletteCsa;
-                if (!repeatsPalette)
+                if (!command.primitive().tme)
                 {
-                    GsVulkanT8Palette captured{};
-                    std::copy(
-                        t8Palette.colors.begin(), t8Palette.colors.end(),
-                        captured.begin());
-                    m_impl->pendingT8Palettes.push_back(
-                        std::move(captured));
-                    m_impl->pendingT8PaletteGeneration =
-                        t8Palette.generation;
-                    m_impl->pendingT8PaletteTexa = t8Palette.texa;
-                    m_impl->pendingT8PaletteSourcePsm =
-                        t8Palette.sourcePsm;
-                    m_impl->pendingT8PaletteCsm = t8Palette.csm;
-                    m_impl->pendingT8PaletteCsa = t8Palette.csa;
-                    m_impl->pendingT8PaletteIdentityValid = true;
+                    if (m_impl->pendingT8Palettes.empty())
+                        m_impl->pendingT8Palettes.emplace_back();
+                    t8GouraudDepthTriangle.paletteIndex = 0u;
                 }
-                t8GouraudDepthTriangle.paletteIndex =
-                    static_cast<uint32_t>(
-                        m_impl->pendingT8Palettes.size() - 1u);
+                else
+                {
+                    const bool repeatsPalette =
+                        m_impl->pendingT8PaletteIdentityValid &&
+                        t8Palette.generation ==
+                            m_impl->pendingT8PaletteGeneration &&
+                        t8Palette.texa == m_impl->pendingT8PaletteTexa &&
+                        t8Palette.sourcePsm ==
+                            m_impl->pendingT8PaletteSourcePsm &&
+                        t8Palette.csm == m_impl->pendingT8PaletteCsm &&
+                        t8Palette.csa == m_impl->pendingT8PaletteCsa;
+                    if (!repeatsPalette)
+                    {
+                        GsVulkanT8Palette captured{};
+                        std::copy(
+                            t8Palette.colors.begin(),
+                            t8Palette.colors.end(),
+                            captured.begin());
+                        m_impl->pendingT8Palettes.push_back(
+                            std::move(captured));
+                        m_impl->pendingT8PaletteGeneration =
+                            t8Palette.generation;
+                        m_impl->pendingT8PaletteTexa = t8Palette.texa;
+                        m_impl->pendingT8PaletteSourcePsm =
+                            t8Palette.sourcePsm;
+                        m_impl->pendingT8PaletteCsm = t8Palette.csm;
+                        m_impl->pendingT8PaletteCsa = t8Palette.csa;
+                        m_impl->pendingT8PaletteIdentityValid = true;
+                    }
+                    t8GouraudDepthTriangle.paletteIndex =
+                        static_cast<uint32_t>(
+                            m_impl->pendingT8Palettes.size() - 1u);
+                }
             }
 
             if (isFeedbackLinearDepthSprite &&

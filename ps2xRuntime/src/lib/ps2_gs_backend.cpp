@@ -1478,8 +1478,7 @@ GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
     {
         return {false, GsFallbackReason::UnsupportedPrimitive};
     }
-    if (command.vertexCount() != 3u || !primitive.tme ||
-        primitive.aa1 || primitive.fix)
+    if (command.vertexCount() != 3u || primitive.aa1 || primitive.fix)
     {
         return {false, GsFallbackReason::UnsupportedPrimitiveState};
     }
@@ -1513,24 +1512,28 @@ GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
     if (global.scanMask != 0u)
         return {false, GsFallbackReason::ScanMask};
 
-    if (context.tex0.psm != GS_PSM_T8 ||
-        context.tex0.cpsm != GS_PSM_CT32 ||
-        context.tex0.csm != 0u || context.tex0.csa != 0u)
+    if (primitive.tme &&
+        (context.tex0.psm != GS_PSM_T8 ||
+         context.tex0.cpsm != GS_PSM_CT32 ||
+         context.tex0.csm != 0u || context.tex0.csa != 0u))
     {
         return {false, GsFallbackReason::UnsupportedTextureFormat};
     }
-    if (context.tex0.tcc != 1u || context.tex0.tfx != 0u)
+    if (primitive.tme &&
+        (context.tex0.tcc != 1u || context.tex0.tfx != 0u))
     {
         return {false, GsFallbackReason::UnsupportedTextureFunction};
     }
-    if (context.tex0.tbw == 0u || context.tex0.tbw > 0x3Fu ||
-        context.tex0.tw > 10u || context.tex0.th > 10u)
+    if (primitive.tme &&
+        (context.tex0.tbw == 0u || context.tex0.tbw > 0x3Fu ||
+         context.tex0.tw > 10u || context.tex0.th > 10u))
     {
         return {false, GsFallbackReason::UnsupportedTextureState};
     }
 
-    const uint8_t maximumMipLevel =
-        static_cast<uint8_t>((context.tex1 >> 2u) & 0x7u);
+    const uint8_t maximumMipLevel = primitive.tme
+        ? static_cast<uint8_t>((context.tex1 >> 2u) & 0x7u)
+        : 0u;
     const uint8_t magnificationFilter =
         static_cast<uint8_t>((context.tex1 >> 5u) & 0x1u);
     const uint8_t minificationFilter =
@@ -1538,12 +1541,13 @@ GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
     const bool fixedLod = (context.tex1 & 1u) != 0u;
     const bool automaticMipBase =
         ((context.tex1 >> 9u) & 1u) != 0u;
-    if (maximumMipLevel > 3u ||
-        (primitive.fst && maximumMipLevel != 0u) ||
-        magnificationFilter != 1u ||
-        (maximumMipLevel == 0u
-             ? minificationFilter != 1u && minificationFilter != 4u
-             : fixedLod || minificationFilter != 4u || automaticMipBase))
+    if (primitive.tme &&
+        (maximumMipLevel > 3u ||
+         (primitive.fst && maximumMipLevel != 0u) ||
+         magnificationFilter != 1u ||
+         (maximumMipLevel == 0u
+              ? minificationFilter != 1u && minificationFilter != 4u
+              : fixedLod || minificationFilter != 4u || automaticMipBase)))
     {
         return {false, GsFallbackReason::UnsupportedTextureFilter};
     }
@@ -1551,7 +1555,7 @@ GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
         static_cast<uint8_t>(context.clamp & 0x3u);
     const uint8_t wrapModeV =
         static_cast<uint8_t>((context.clamp >> 2u) & 0x3u);
-    if (wrapModeU > 1u || wrapModeV > 1u)
+    if (primitive.tme && (wrapModeU > 1u || wrapModeV > 1u))
         return {false, GsFallbackReason::UnsupportedTextureWrap};
     for (uint8_t level = 1u; level <= maximumMipLevel; ++level)
     {
@@ -1583,7 +1587,7 @@ GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
 
     for (const GSVertex &vertex : command.vertices())
     {
-        if (!primitive.fst &&
+        if (primitive.tme && !primitive.fst &&
             (!std::isfinite(vertex.s) ||
              !std::isfinite(vertex.t) ||
              !std::isfinite(vertex.q)))

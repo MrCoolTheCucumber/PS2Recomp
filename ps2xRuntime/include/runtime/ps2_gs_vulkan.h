@@ -1086,12 +1086,15 @@ inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY =
     1u << 3u;
 inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED =
     1u << 4u;
+inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED =
+    1u << 5u;
 inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_VALID_FLAGS =
     GS_VULKAN_T8_GOURAUD_FLAG_FOG |
     GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
     GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE |
     GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY |
-    GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED;
+    GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED |
+    GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED;
 
 // Compact resident record for the same exact T8 contract. Palettes are
 // captured once per distinct consecutive CLUT image and indexed explicitly

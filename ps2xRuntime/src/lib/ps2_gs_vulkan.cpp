@@ -843,6 +843,43 @@ namespace
         {
             return "Vulkan T8 Gouraud triangle has non-zero reserved data";
         }
+        const bool textureDisabled =
+            (triangle.rasterFlags &
+             GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED) != 0u;
+        const auto allZero = [](const auto &values)
+        {
+            return std::all_of(
+                values.begin(), values.end(),
+                [](const auto value) { return value == 0; });
+        };
+        if (textureDisabled &&
+            (((triangle.rasterFlags &
+               GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED) != 0u) ||
+             triangle.maximumMipLevel != 0u ||
+             triangle.textureWidthLog2 != 0u ||
+             triangle.textureHeightLog2 != 0u ||
+             triangle.textureWrapU != 0u ||
+             triangle.textureWrapV != 0u ||
+             triangle.lodK != 0 || triangle.lodL != 0u ||
+             !allZero(triangle.textureBaseBlocks) ||
+             triangle.textureWidths[0] != 1u ||
+             !std::all_of(
+                 triangle.textureWidths.begin() + 1u,
+                 triangle.textureWidths.end(),
+                 [](uint32_t width) { return width == 0u; }) ||
+             !allZero(triangle.sBits) ||
+             !allZero(triangle.tBits) ||
+             !std::all_of(
+                 triangle.qBits.begin(), triangle.qBits.end(),
+                 [](uint32_t bits)
+                 {
+                     return bits == std::bit_cast<uint32_t>(1.0f);
+                 }) ||
+             !allZero(triangle.textureDxBits) ||
+             !allZero(triangle.textureDyBits)))
+        {
+            return "Vulkan untextured triangle has non-canonical texture data";
+        }
         if (triangle.textureWidthLog2 > 10u ||
             triangle.textureHeightLog2 > 10u ||
             triangle.maximumMipLevel > 3u ||
@@ -984,6 +1021,8 @@ namespace
                 height);
         if (framebufferPages.intersects(depthPages))
             return "Vulkan T8 Gouraud triangle color and depth alias";
+        if (textureDisabled)
+            return nullptr;
         GsVramPageMask texturePages;
         for (uint32_t level = 0u;
              level <= triangle.maximumMipLevel;
@@ -2517,6 +2556,7 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
     if (!decision.supported)
         return decision;
     const GSPrimReg &primitive = command.primitive();
+    const bool textured = primitive.tme;
     const GSContext &context = command.context();
     const GsDrawBounds &bounds = command.bounds();
     const auto &vertices = command.vertices();
@@ -2594,22 +2634,26 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
         gradientDy02 / gradientCross;
 
     GsVulkanResidentT8GouraudDepthCt32Triangle prepared{};
-    const float textureScaleU =
-        static_cast<float>(65536u << context.tex0.tw);
-    const float textureScaleV =
-        static_cast<float>(65536u << context.tex0.th);
-    const uint32_t maximumMipLevel =
-        static_cast<uint32_t>((context.tex1 >> 2u) & 0x7u);
+    const float textureScaleU = textured
+        ? static_cast<float>(65536u << context.tex0.tw)
+        : 1.0f;
+    const float textureScaleV = textured
+        ? static_cast<float>(65536u << context.tex0.th)
+        : 1.0f;
+    const uint32_t maximumMipLevel = textured
+        ? static_cast<uint32_t>((context.tex1 >> 2u) & 0x7u)
+        : 0u;
     const uint8_t minificationFilter =
         static_cast<uint8_t>((context.tex1 >> 6u) & 0x7u);
     const bool mipmapsEnabled =
         maximumMipLevel != 0u &&
         minificationFilter >= 2u && minificationFilter <= 5u;
     const bool constantQFixed =
-        primitive.fst ||
-        (!mipmapsEnabled &&
-         vertices[0].q == vertices[1].q &&
-         vertices[1].q == vertices[2].q);
+        textured &&
+        (primitive.fst ||
+         (!mipmapsEnabled &&
+          vertices[0].q == vertices[1].q &&
+          vertices[1].q == vertices[2].q));
     const auto finiteQ = [](float q)
     {
         return std::fabs(q) > 1.0e-8f ? q : 1.0f;
@@ -2637,7 +2681,13 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
             primitive.iip ? vertices[index] : vertices[2]);
         // The scanline setup consumes already texture-scaled S/T. Preserve
         // those exact host products rather than repeating them on the device.
-        if (primitive.fst)
+        if (!textured)
+        {
+            prepared.sBits[index] = std::bit_cast<uint32_t>(0.0f);
+            prepared.tBits[index] = std::bit_cast<uint32_t>(0.0f);
+            prepared.qBits[index] = std::bit_cast<uint32_t>(1.0f);
+        }
+        else if (primitive.fst)
         {
             prepared.sBits[index] = std::bit_cast<uint32_t>(
                 static_cast<float>(vertices[index].u) * 4096.0f -
@@ -2738,41 +2788,44 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
         prepared.depthDxBits = packDoubleBits(dx);
         prepared.depthDyBits = packDoubleBits(dy);
     }
-    for (size_t component = 0u; component < 3u; ++component)
+    if (textured)
     {
-        const auto value = [&](size_t sortedIndex)
+        for (size_t component = 0u; component < 3u; ++component)
         {
-            const GSVertex &vertex =
-                vertices[sorted[sortedIndex].index];
-            if (component == 0u)
-                return constantQFixed
-                    ? std::bit_cast<float>(prepared.sBits[
-                          sorted[sortedIndex].index])
-                    : vertex.s * textureScaleU;
-            if (component == 1u)
-                return constantQFixed
-                    ? std::bit_cast<float>(prepared.tBits[
-                          sorted[sortedIndex].index])
-                    : vertex.t * textureScaleV;
-            return constantQFixed ? 1.0f : vertex.q;
-        };
-        const float top = value(0u);
-        const float delta01 = value(1u) - top;
-        const float delta02 = value(2u) - top;
-        prepared.textureDxBits[component] =
-            std::bit_cast<uint32_t>(std::fma(
-                delta02,
-                gradientY01OverCross,
-                -(delta01 * gradientY02OverCross)));
-        prepared.textureDyBits[component] =
-            std::bit_cast<uint32_t>(std::fma(
-                delta01,
-                gradientX02OverCross,
-                -(delta02 * gradientX01OverCross)));
+            const auto value = [&](size_t sortedIndex)
+            {
+                const GSVertex &vertex =
+                    vertices[sorted[sortedIndex].index];
+                if (component == 0u)
+                    return constantQFixed
+                        ? std::bit_cast<float>(prepared.sBits[
+                              sorted[sortedIndex].index])
+                        : vertex.s * textureScaleU;
+                if (component == 1u)
+                    return constantQFixed
+                        ? std::bit_cast<float>(prepared.tBits[
+                              sorted[sortedIndex].index])
+                        : vertex.t * textureScaleV;
+                return constantQFixed ? 1.0f : vertex.q;
+            };
+            const float top = value(0u);
+            const float delta01 = value(1u) - top;
+            const float delta02 = value(2u) - top;
+            prepared.textureDxBits[component] =
+                std::bit_cast<uint32_t>(std::fma(
+                    delta02,
+                    gradientY01OverCross,
+                    -(delta01 * gradientY02OverCross)));
+            prepared.textureDyBits[component] =
+                std::bit_cast<uint32_t>(std::fma(
+                    delta01,
+                    gradientX02OverCross,
+                    -(delta02 * gradientX01OverCross)));
+        }
     }
 
-    prepared.textureBaseBlocks[0] = context.tex0.tbp0;
-    prepared.textureWidths[0] = context.tex0.tbw;
+    prepared.textureBaseBlocks[0] = textured ? context.tex0.tbp0 : 0u;
+    prepared.textureWidths[0] = textured ? context.tex0.tbw : 1u;
     prepared.maximumMipLevel = maximumMipLevel;
     for (uint32_t level = 1u;
          level <= prepared.maximumMipLevel;
@@ -2785,18 +2838,21 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
             static_cast<uint32_t>(
                 (context.miptbp1 >> (shift + 14u)) & 0x3Fu);
     }
-    prepared.textureWidthLog2 = context.tex0.tw;
-    prepared.textureHeightLog2 = context.tex0.th;
-    prepared.textureWrapU =
-        static_cast<uint32_t>(context.clamp & 0x3u);
-    prepared.textureWrapV =
-        static_cast<uint32_t>((context.clamp >> 2u) & 0x3u);
-    const int32_t rawK =
-        static_cast<int32_t>((context.tex1 >> 32u) & 0xFFFu);
-    prepared.lodK =
-        (rawK & 0x800) != 0 ? rawK - 0x1000 : rawK;
-    prepared.lodL =
-        static_cast<uint32_t>((context.tex1 >> 19u) & 0x3u);
+    if (textured)
+    {
+        prepared.textureWidthLog2 = context.tex0.tw;
+        prepared.textureHeightLog2 = context.tex0.th;
+        prepared.textureWrapU =
+            static_cast<uint32_t>(context.clamp & 0x3u);
+        prepared.textureWrapV =
+            static_cast<uint32_t>((context.clamp >> 2u) & 0x3u);
+        const int32_t rawK =
+            static_cast<int32_t>((context.tex1 >> 32u) & 0xFFFu);
+        prepared.lodK =
+            (rawK & 0x800) != 0 ? rawK - 0x1000 : rawK;
+        prepared.lodL =
+            static_cast<uint32_t>((context.tex1 >> 19u) & 0x3u);
+    }
     prepared.alphaReference =
         static_cast<uint32_t>((context.test >> 4u) & 0xFFu);
     prepared.paletteIndex = paletteIndex;
@@ -2815,6 +2871,9 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
              : 0u) |
         (constantQFixed
              ? GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED
+             : 0u) |
+        (!textured
+             ? GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED
              : 0u);
 
     // The classifier already proved exact non-aliasing resource masks for
@@ -2836,7 +2895,9 @@ prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
     GsVulkanT8GouraudDepthCt32Triangle &triangle,
     const GsDrawResources *classifiedResources) noexcept
 {
-    if (decodedPalette.size() != 256u)
+    const bool textured = command.primitive().tme;
+    if ((textured && decodedPalette.size() != 256u) ||
+        (!textured && !decodedPalette.empty()))
         return {false, GsFallbackReason::BackendUnavailable};
 
     GsVulkanResidentT8GouraudDepthCt32Triangle compact{};
@@ -2851,9 +2912,12 @@ prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
         GsVulkanT8GouraudDepthCt32Triangle, palette));
     std::memcpy(&prepared, &compact, sizeof(compact));
     prepared.paletteIndex = 0u;
-    std::copy(
-        decodedPalette.begin(), decodedPalette.end(),
-        prepared.palette.begin());
+    if (textured)
+    {
+        std::copy(
+            decodedPalette.begin(), decodedPalette.end(),
+            prepared.palette.begin());
+    }
     if (t8GouraudDepthCt32TriangleValidationError(prepared, false))
         return {false, GsFallbackReason::UnknownMemoryLayout};
     triangle = prepared;
@@ -3664,7 +3728,7 @@ namespace
     static_assert(
         kGsGouraudDepthCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(
-        sizeof(kGsT8GouraudDepthCt32TriangleShaderSpv) == 217712u);
+        sizeof(kGsT8GouraudDepthCt32TriangleShaderSpv) == 218356u);
     static_assert(
         kGsT8GouraudDepthCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);

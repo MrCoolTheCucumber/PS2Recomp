@@ -722,13 +722,24 @@ void rasterize_pixel(uint record_index, uint x, uint y)
         fixed_v = divide_float_to_int_exact(interpolated.y, safe_q);
         lod_q = interpolated.z;
     }
-    uint texel = sample_texture(fixed_u, fixed_v, lod_q);
-    ivec4 texture_color = unpack_color(texel);
-    ivec4 source = ivec4(
-        modulate_channel(texture_color.r, fixed_color.r),
-        modulate_channel(texture_color.g, fixed_color.g),
-        modulate_channel(texture_color.b, fixed_color.b),
-        modulate_channel(texture_color.a, fixed_color.a));
+    ivec4 source;
+    if ((triangle.raster_flags & 32u) != 0u)
+    {
+        // Untextured GS primitives pass the interpolated vertex color
+        // directly to alpha test and blending in 8-bit channel space.
+        source = clamp(
+            fixed_color >> 7, ivec4(0), ivec4(255));
+    }
+    else
+    {
+        uint texel = sample_texture(fixed_u, fixed_v, lod_q);
+        ivec4 texture_color = unpack_color(texel);
+        source = ivec4(
+            modulate_channel(texture_color.r, fixed_color.r),
+            modulate_channel(texture_color.g, fixed_color.g),
+            modulate_channel(texture_color.b, fixed_color.b),
+            modulate_channel(texture_color.a, fixed_color.a));
+    }
     if ((triangle.raster_flags & 1u) != 0u)
     {
         ivec3 fog_color = ivec3(

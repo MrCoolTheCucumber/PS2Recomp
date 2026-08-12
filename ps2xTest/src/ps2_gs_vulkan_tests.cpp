@@ -5888,8 +5888,61 @@ void register_ps2_gs_vulkan_tests()
                     "flat shading should use the provoking vertex color");
             }
 
+            GSPrimReg untexturedPrimitive = fixedCoordinates;
+            untexturedPrimitive.tme = false;
+            GSContext untexturedContext = fixedContext;
+            // ATE=1, ATST=GEQUAL, AREF=128, AFAIL=RGB_ONLY,
+            // DATE=0, ZTE=1, ZTST=GEQUAL.
+            untexturedContext.test = 0x5380Bull;
+            std::array<GSVertex, 3> untexturedVertices = fixedVertices;
+            for (GSVertex &vertex : untexturedVertices)
+            {
+                vertex.zInteger = 0x00FFFFF0u;
+                vertex.z = static_cast<double>(vertex.zInteger);
+            }
+            untexturedVertices[2].r = 4u;
+            untexturedVertices[2].g = 4u;
+            untexturedVertices[2].b = 4u;
+            untexturedVertices[2].a = 96u;
+            const GsDrawCommand untexturedFlat = buildGsDrawCommand(
+                36u, untexturedPrimitive, untexturedContext,
+                std::span<const GSVertex>(untexturedVertices),
+                command.globalState());
+            GsVulkanT8GouraudDepthCt32Triangle untexturedRecord{};
+            const GsBackendDecision untexturedDecision =
+                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                    untexturedFlat, std::span<const uint32_t>{},
+                    untexturedRecord);
+            t.IsTrue(
+                untexturedDecision.supported,
+                "flat untextured triangles should reuse the exact resident triangle kernel");
+            t.Equals(
+                untexturedRecord.rasterFlags,
+                GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
+                    GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE |
+                    GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY |
+                    GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED,
+                "untextured setup should retain depth and alpha state without texture DDA");
+            t.Equals(untexturedRecord.textureBaseBlocks[0], 0u,
+                     "untextured setup should use a canonical dummy base");
+            t.Equals(untexturedRecord.textureWidths[0], 1u,
+                     "untextured setup should use a valid dummy width");
+            for (size_t index = 0u; index < untexturedVertices.size(); ++index)
+            {
+                t.Equals(untexturedRecord.rgba[index], 0x60040404u,
+                         "untextured flat shading should normalize the provoking color");
+                t.Equals(untexturedRecord.sBits[index], 0u,
+                         "untextured setup should not retain an S coordinate");
+                t.Equals(untexturedRecord.tBits[index], 0u,
+                         "untextured setup should not retain a T coordinate");
+                t.Equals(
+                    untexturedRecord.qBits[index],
+                    std::bit_cast<uint32_t>(1.0f),
+                    "untextured setup should use canonical unit Q");
+            }
+
             const GsDrawCommand rejectedFixedMip = buildGsDrawCommand(
-                36u, fixedCoordinates, command.context(),
+                37u, fixedCoordinates, command.context(),
                 std::span<const GSVertex>(fixedVertices),
                 command.globalState());
             t.Equals(
@@ -5902,7 +5955,7 @@ void register_ps2_gs_vulkan_tests()
             nearestMip.tex1 &= ~(0x7ull << 6u);
             nearestMip.tex1 |= 1ull << 6u;
             const GsDrawCommand rejectedFilter = buildGsDrawCommand(
-                37u, command.primitive(), nearestMip,
+                38u, command.primitive(), nearestMip,
                 std::span<const GSVertex>(command.vertices()),
                 command.globalState());
             t.Equals(
@@ -9539,6 +9592,72 @@ void register_ps2_gs_vulkan_tests()
                      "CPU write to a sampled page must drain pending GPU reads");
             t.Equals(backend->serviceStatistics().queueSubmissions, 2ull,
                      "the conflicting write should upload inputs and execute one batch");
+        });
+
+        tc.Run("Vulkan untextured triangles need no palette or texture dependency", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand textured =
+                makeT8GouraudSourceOverDepthCt32TriangleCommand(30'201u);
+            GSPrimReg primitive = textured.primitive();
+            primitive.tme = false;
+            const GsDrawCommand command = buildGsDrawCommand(
+                30'202u, primitive, textured.context(),
+                std::span<const GSVertex>(textured.vertices()),
+                textured.globalState());
+            const GsDrawResources resources = command.resources();
+            t.IsFalse(resources.texturePages.any(),
+                      "texture-disabled commands should expose no base-level read pages");
+            t.IsFalse(resources.mipPages.any(),
+                      "texture-disabled commands should expose no mip read pages");
+            t.IsFalse(resources.clutPages.any(),
+                      "texture-disabled commands should expose no CLUT read pages");
+
+            std::vector<uint8_t> vram = makeVramPattern(0x554E5458u);
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact,
+                        true, true, true, true, true, true),
+                    config, vram,
+                    [&](const GsDrawCommand &) { ++softwareCalls; },
+                    [&](const GsDrawCommand &) { ++commitCalls; });
+            t.IsNotNull(backend.get(),
+                        "an exact untextured backend should construct without a palette callback");
+            if (!backend)
+                return;
+
+            const GsBackendDecision decision = backend->classify(command);
+            t.IsTrue(decision.supported,
+                     "texture-disabled classification should not require decoded CLUT state");
+            if (!decision.supported)
+                return;
+            backend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(1u),
+                     "the untextured command should remain in the resident triangle queue");
+            backend->flush(GsFlushReason::Explicit);
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(0u),
+                     "an explicit boundary should drain the untextured triangle");
+            t.Equals(softwareCalls, 0ull,
+                     "resident untextured execution must not invoke software fallback");
+            t.Equals(commitCalls, 1ull,
+                     "resident untextured execution should commit once");
+
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(service.t8GouraudDepthCt32TriangleDrawsCompleted, 1ull,
+                     "the shared exact triangle kernel should complete the draw");
+            t.Equals(
+                service.residentT8GouraudDepthCt32TriangleBatchesCompleted,
+                1ull,
+                "the untextured draw should execute as one resident batch");
+            t.Equals(service.pageUploadOperationsCompleted, 1ull,
+                     "only destination/depth inputs should require one scoped upload");
         });
 
         tc.Run("Vulkan resident queue drains at its configured bound", [](TestCase &t)
@@ -19653,8 +19772,34 @@ void register_ps2_gs_vulkan_tests()
                 fixedContext,
                 std::span<const GSVertex>(fixedVertices),
                 first.globalState());
-            const std::array<GsDrawCommand, 3> commands{{
-                first, second, fixed}};
+            GSPrimReg untexturedPrimitive = fixedPrimitive;
+            untexturedPrimitive.tme = false;
+            std::array<GSVertex, 3> untexturedVertices = fixedVertices;
+            for (GSVertex &vertex : untexturedVertices)
+            {
+                vertex.zInteger = 0x00FFFFF0u;
+                vertex.z = static_cast<double>(vertex.zInteger);
+            }
+            untexturedVertices[2].r = 4u;
+            untexturedVertices[2].g = 4u;
+            untexturedVertices[2].b = 4u;
+            untexturedVertices[2].a = 96u;
+            const GsDrawCommand untextured = buildGsDrawCommand(
+                30'104u,
+                untexturedPrimitive,
+                fixedContext,
+                std::span<const GSVertex>(untexturedVertices),
+                first.globalState());
+            GSPrimReg untexturedGouraudPrimitive = first.primitive();
+            untexturedGouraudPrimitive.tme = false;
+            const GsDrawCommand untexturedGouraud = buildGsDrawCommand(
+                30'105u,
+                untexturedGouraudPrimitive,
+                first.context(),
+                std::span<const GSVertex>(secondVertices),
+                first.globalState());
+            const std::array<GsDrawCommand, 5> commands{{
+                first, second, fixed, untextured, untexturedGouraud}};
 
             std::array<uint32_t, 256> palette{};
             std::vector<uint8_t> initial =
@@ -19702,12 +19847,16 @@ void register_ps2_gs_vulkan_tests()
                 }
             }
 
-            std::array<GsVulkanT8GouraudDepthCt32Triangle, 3> prepared{};
+            std::array<GsVulkanT8GouraudDepthCt32Triangle, 5> prepared{};
             for (size_t index = 0u; index < commands.size(); ++index)
             {
+                const std::span<const uint32_t> decodedPalette =
+                    commands[index].primitive().tme
+                        ? std::span<const uint32_t>(palette)
+                        : std::span<const uint32_t>{};
                 const GsBackendDecision decision =
                     prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
-                        commands[index], palette, prepared[index]);
+                        commands[index], decodedPalette, prepared[index]);
                 if (!decision.supported)
                 {
                     t.Fail(
@@ -19746,7 +19895,7 @@ void register_ps2_gs_vulkan_tests()
                 return output;
             };
             const std::vector<uint8_t> expectedSingle = renderSoftware(1u);
-            const std::vector<uint8_t> expectedResident = renderSoftware(3u);
+            const std::vector<uint8_t> expectedResident = renderSoftware(5u);
             const auto renderOneSoftware = [&](const GsDrawCommand &command)
             {
                 std::vector<uint8_t> output = initial;
@@ -19764,6 +19913,10 @@ void register_ps2_gs_vulkan_tests()
                 renderOneSoftware(third);
             const std::vector<uint8_t> expectedFixed =
                 renderOneSoftware(fixed);
+            const std::vector<uint8_t> expectedUntextured =
+                renderOneSoftware(untextured);
+            const std::vector<uint8_t> expectedUntexturedGouraud =
+                renderOneSoftware(untexturedGouraud);
 
             GsVulkanCapabilityReport preflight{};
             const GsVulkanServiceConfig config =
@@ -19872,6 +20025,50 @@ void register_ps2_gs_vulkan_tests()
                         mismatch.first - actualFixed.begin())));
                 return;
             }
+            std::vector<uint8_t> actualUntextured = {0xA5u};
+            if (!service->executeT8GouraudDepthCt32Triangle(
+                    initial, prepared[3], actualUntextured,
+                    &operationError))
+            {
+                t.Fail(
+                    "flat untextured Vulkan execution failed: " +
+                    operationError);
+                return;
+            }
+            if (actualUntextured != expectedUntextured)
+            {
+                const auto mismatch = std::mismatch(
+                    actualUntextured.begin(), actualUntextured.end(),
+                    expectedUntextured.begin());
+                t.Fail(
+                    "flat untextured Vulkan execution first disagreed with software at byte " +
+                    std::to_string(static_cast<size_t>(
+                        mismatch.first - actualUntextured.begin())));
+                return;
+            }
+            std::vector<uint8_t> actualUntexturedGouraud = {0xA5u};
+            if (!service->executeT8GouraudDepthCt32Triangle(
+                    initial, prepared[4], actualUntexturedGouraud,
+                    &operationError))
+            {
+                t.Fail(
+                    "untextured Gouraud/fog Vulkan execution failed: " +
+                    operationError);
+                return;
+            }
+            if (actualUntexturedGouraud != expectedUntexturedGouraud)
+            {
+                const auto mismatch = std::mismatch(
+                    actualUntexturedGouraud.begin(),
+                    actualUntexturedGouraud.end(),
+                    expectedUntexturedGouraud.begin());
+                t.Fail(
+                    "untextured Gouraud/fog Vulkan execution first disagreed with software at byte " +
+                    std::to_string(static_cast<size_t>(
+                        mismatch.first -
+                        actualUntexturedGouraud.begin())));
+                return;
+            }
 
             GsVramPageMask allPages;
             allPages.setAll();
@@ -19943,8 +20140,8 @@ void register_ps2_gs_vulkan_tests()
                 service->statistics();
             t.Equals(
                 statistics.t8GouraudDepthCt32TriangleDrawsCompleted,
-                6ull,
-                "three single and three resident T8 draws should complete");
+                10ull,
+                "five single and five resident triangle draws should complete");
             t.Equals(
                 statistics.t8GouraudDepthCt32TriangleDrawsFailed,
                 0ull,
@@ -19956,10 +20153,10 @@ void register_ps2_gs_vulkan_tests()
                 "the dependent resident pair should use one batch");
             t.Equals(
                 statistics.largestResidentT8GouraudDepthCt32TriangleBatch,
-                3ull,
-                "the resident batch high water should retain all three draws");
-            t.Equals(statistics.shaderDispatches, 4ull,
-                     "three single plus ordered resident T8 execution should use four dispatches");
+                5ull,
+                "the resident batch high water should retain all five draws");
+            t.Equals(statistics.shaderDispatches, 6ull,
+                     "five single plus ordered resident execution should use six dispatches");
             t.Equals(statistics.validationErrors, 0u,
                      "T8 execution must remain validation-clean");
             t.Equals(statistics.validationWarnings, 0u,
