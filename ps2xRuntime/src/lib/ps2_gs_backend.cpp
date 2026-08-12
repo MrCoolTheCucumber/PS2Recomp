@@ -1296,15 +1296,22 @@ GsSubmissionResult GsBackendRouter::submit(
     if (m_mode == GsRendererMode::Software)
     {
         transitionTo(ActiveBackend::Software);
-        const GsDrawResources resources = command.resources();
-        GsVramPageMask accessPages = resources.readPages;
-        accessPages.unionWith(resources.writePages);
-        synchronizeCpuVram(
-            accessPages, GsFlushReason::BackendSwitch);
-        m_softwareBackend->submit(
-            std::span<const GsDrawCommand>(&command, 1u));
         if (m_acceleratedBackend)
+        {
+            const GsDrawResources resources = command.resources();
+            GsVramPageMask accessPages = resources.readPages;
+            accessPages.unionWith(resources.writePages);
+            synchronizeCpuVram(
+                accessPages, GsFlushReason::BackendSwitch);
+            m_softwareBackend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
             m_acceleratedBackend->noteCpuVramWrite(resources.writePages);
+        }
+        else
+        {
+            m_softwareBackend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+        }
         m_activeBackend = ActiveBackend::Software;
         if (m_countersEnabled)
         {
