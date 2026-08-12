@@ -2588,6 +2588,7 @@ void GSRasterizer::prepareFeedbackSnapshot(
         if (m_feedbackSnapshotValid)
             flushDrawBatch(gs, GsFlushReason::FeedbackSnapshot);
         m_feedbackSnapshotValid = false;
+        m_feedbackSnapshotDeviceResident = false;
         return;
     }
 
@@ -2600,19 +2601,55 @@ void GSRasterizer::prepareFeedbackSnapshot(
         m_feedbackTextureWidth == context.tex0.tbw &&
         m_feedbackFrameWidth == context.frame.fbw;
     if (sameFeedbackSurface)
+    {
+        const bool currentCanUseDeviceSnapshot =
+            m_backendState &&
+            m_backendState->router.canCaptureFeedbackSnapshotOnDevice(
+                command);
+        if (m_feedbackSnapshotDeviceResident &&
+            !currentCanUseDeviceSnapshot)
+        {
+            m_textureSnapshot.resize(gs->m_vramSize);
+            std::string error;
+            if (!m_backendState->accelerated ||
+                !m_backendState->accelerated
+                     ->materializeFeedbackSnapshot(
+                         m_textureSnapshot, &error))
+            {
+                throw std::runtime_error(
+                    "failed to materialize immutable GS feedback snapshot: " +
+                    error);
+            }
+            m_feedbackSnapshotDeviceResident = false;
+        }
         return;
+    }
 
-    const GsDrawResources resources = command.resources();
-    beginCpuVramAccess(
-        gs,
-        resources.readPages,
-        {},
-        GsFlushReason::FeedbackSnapshot);
-    m_textureSnapshot.resize(gs->m_vramSize);
-    std::memcpy(
-        m_textureSnapshot.data(),
-        gs->m_vram,
-        gs->m_vramSize);
+    const bool deviceResidentSnapshot =
+        m_backendState &&
+        m_backendState->router.canCaptureFeedbackSnapshotOnDevice(
+            command);
+    if (deviceResidentSnapshot)
+    {
+        if (m_feedbackSnapshotValid)
+            flushDrawBatch(gs, GsFlushReason::FeedbackSnapshot);
+        m_textureSnapshot.clear();
+    }
+    else
+    {
+        const GsDrawResources resources = command.resources();
+        beginCpuVramAccess(
+            gs,
+            resources.readPages,
+            {},
+            GsFlushReason::FeedbackSnapshot);
+        m_textureSnapshot.resize(gs->m_vramSize);
+        std::memcpy(
+            m_textureSnapshot.data(),
+            gs->m_vram,
+            gs->m_vramSize);
+    }
+
     m_feedbackTextureBase = context.tex0.tbp0;
     m_feedbackFrameBase = frameBase;
     m_feedbackTexturePsm = context.tex0.psm;
@@ -2620,6 +2657,8 @@ void GSRasterizer::prepareFeedbackSnapshot(
     m_feedbackTextureWidth = context.tex0.tbw;
     m_feedbackFrameWidth = context.frame.fbw;
     m_feedbackSnapshotValid = true;
+    m_feedbackSnapshotDeviceResident = deviceResidentSnapshot;
+    ++m_feedbackSnapshotGeneration;
 }
 
 void GSRasterizer::submitSoftwareCommand(
@@ -2828,6 +2867,12 @@ bool GSRasterizer::setRendererMode(GsRendererMode mode)
                 [this](const GsVulkanAcceleratedCommitBatch &batch)
                 {
                     recordAcceleratedCommitBatch(m_owner, batch);
+                },
+                [this]() -> GsVulkanFeedbackSnapshotIdentity
+                {
+                    return {
+                        m_feedbackSnapshotGeneration,
+                        m_feedbackSnapshotDeviceResident};
                 });
         if (!accelerated)
             return false;
@@ -2917,8 +2962,27 @@ GsReplayRasterizerState GSRasterizer::captureReplayState() const
     state.feedbackTextureWidth = m_feedbackTextureWidth;
     state.feedbackFrameWidth = m_feedbackFrameWidth;
     state.feedbackSnapshotValid = m_feedbackSnapshotValid;
-    if (m_feedbackSnapshotValid)
-        state.feedbackVram = m_textureSnapshot;
+    if (state.feedbackSnapshotValid)
+    {
+        if (m_feedbackSnapshotDeviceResident)
+        {
+            state.feedbackVram.resize(GS_VULKAN_VRAM_SIZE);
+            std::string error;
+            if (!m_backendState || !m_backendState->accelerated ||
+                !m_backendState->accelerated
+                     ->materializeFeedbackSnapshot(
+                         state.feedbackVram, &error))
+            {
+                throw std::runtime_error(
+                    "failed to capture immutable GS feedback snapshot: " +
+                    error);
+            }
+        }
+        else
+        {
+            state.feedbackVram = m_textureSnapshot;
+        }
+    }
     state.decodedClut = m_decodedClut;
     state.decodedClutGeneration = m_decodedClutGeneration;
     state.decodedClutTexa = m_decodedClutTexa;
@@ -2950,6 +3014,8 @@ bool GSRasterizer::restoreReplayState(
     m_feedbackTextureWidth = state.feedbackTextureWidth;
     m_feedbackFrameWidth = state.feedbackFrameWidth;
     m_feedbackSnapshotValid = state.feedbackSnapshotValid;
+    m_feedbackSnapshotDeviceResident = false;
+    ++m_feedbackSnapshotGeneration;
     m_decodedClut = state.decodedClut;
     m_decodedClutGeneration = state.decodedClutGeneration;
     m_decodedClutTexa = state.decodedClutTexa;

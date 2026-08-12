@@ -308,6 +308,17 @@ public:
         return false;
     }
 
+    // Recursive texture draws normally require the raster frontend to copy
+    // an immutable CPU snapshot before routing. An accelerated backend may
+    // opt one exact command into a resident device-to-device snapshot instead.
+    // Verify deliberately remains on the CPU-snapshot path so its independent
+    // software oracle observes the same immutable bytes.
+    [[nodiscard]] virtual bool canCaptureFeedbackSnapshotOnDevice(
+        const GsDrawCommand &) const noexcept
+    {
+        return false;
+    }
+
     // Device-backed implementations use these hooks to keep their private GS
     // memory image coherent with the canonical CPU image. The default no-op
     // keeps software-only and diagnostic backends source-compatible. A CPU
@@ -352,6 +363,8 @@ public:
     [[nodiscard]] bool setMode(GsRendererMode mode);
     [[nodiscard]] GsRendererMode mode() const noexcept;
     [[nodiscard]] bool hasAcceleratedBackend() const noexcept;
+    [[nodiscard]] bool canCaptureFeedbackSnapshotOnDevice(
+        const GsDrawCommand &command) const noexcept;
 
     [[nodiscard]] GsSubmissionResult submit(
         const GsDrawCommand &command);
@@ -479,6 +492,18 @@ classifyGsFramebufferOnlyAlphaFailDepthCt32Sprite(
 [[nodiscard]] GsBackendDecision
 classifyGsFeedbackLinearDepthCt32Sprite(
     const GsDrawCommand &command) noexcept;
+
+// Exact recursive-feedback triangle slice selected from retained RAC1
+// gameplay. It covers flat STQ, direct CT32 nearest MODULATE sampling where
+// FRAME and TEX0 name the same surface. Alpha test NEVER with FB_ONLY and an
+// RGB framebuffer mask reduces the architectural write to source alpha only;
+// Z32/Z24 GEQUAL is still evaluated, but the failed alpha test suppresses the
+// depth write. The optional resource result removes that architecturally
+// suppressed depth write from resident coherency accounting.
+[[nodiscard]] GsBackendDecision
+classifyGsFeedbackNearestDepthCt32Triangle(
+    const GsDrawCommand &command,
+    GsDrawResources *supportedResources = nullptr) noexcept;
 
 // Phase 5's first triangle predicate deliberately admits only flat,
 // untextured CT32 triangles with no destination or depth dependency. It shares

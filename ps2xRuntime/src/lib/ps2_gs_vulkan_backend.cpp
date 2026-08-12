@@ -409,6 +409,39 @@ namespace
             << "\"texture_source\":" << sprite.textureSource << '}';
     }
 
+    void writePreparedRecord(
+        std::ostream &output,
+        const GsVulkanFeedbackNearestDepthCt32Triangle &triangle)
+    {
+        output
+            << "  \"feedback_nearest_depth_ct32_triangle\": {"
+            << "\"framebuffer_base_block\":"
+            << triangle.framebufferBaseBlock << ','
+            << "\"framebuffer_width\":"
+            << triangle.framebufferWidth << ','
+            << "\"bounds_x0\":" << triangle.boundsX0 << ','
+            << "\"bounds_y0\":" << triangle.boundsY0 << ','
+            << "\"bounds_x1\":" << triangle.boundsX1 << ','
+            << "\"bounds_y1\":" << triangle.boundsY1 << ','
+            << "\"depth_base_block\":"
+            << triangle.depthBaseBlock << ','
+            << "\"depth_psm\":" << triangle.depthPsm << ','
+            << "\"rgba\":" << triangle.rgba << ','
+            << "\"texture_base_block\":"
+            << triangle.textureBaseBlock << ','
+            << "\"texture_width\":" << triangle.textureWidth << ','
+            << "\"texture_width_log2\":"
+            << triangle.textureWidthLog2 << ','
+            << "\"texture_height_log2\":"
+            << triangle.textureHeightLog2 << ','
+            << "\"texture_wrap_u\":"
+            << triangle.textureWrapU << ','
+            << "\"texture_wrap_v\":"
+            << triangle.textureWrapV << ','
+            << "\"texture_source\":"
+            << triangle.textureSource << '}';
+    }
+
     template <typename PreparedRecord>
     bool writeCommandManifest(
         const fs::path &path,
@@ -750,6 +783,7 @@ struct GsVulkanRasterBackend::Impl final
         NearestCt32Sprite,
         LinearCt32Sprite,
         FeedbackLinearDepthCt32Sprite,
+        FeedbackNearestDepthCt32Triangle,
         Ct32Triangle,
         GouraudDepthCt32Triangle,
         T8GouraudDepthCt32Triangle,
@@ -762,6 +796,7 @@ struct GsVulkanRasterBackend::Impl final
     DrawCallback acceleratedCommit;
     AcceleratedBatchCommitCallback acceleratedBatchCommit;
     FeedbackSnapshotCallback feedbackSnapshot;
+    FeedbackSnapshotGenerationCallback feedbackSnapshotGeneration;
     DecodedPaletteCallback decodedPalette;
     GsVulkanRasterBackendStatistics statistics;
     GsVramCoherency coherency;
@@ -773,6 +808,8 @@ struct GsVulkanRasterBackend::Impl final
     std::vector<GsVulkanLinearCt32Sprite> pendingLinearCt32Sprites;
     std::vector<GsVulkanFeedbackLinearDepthCt32Sprite>
         pendingFeedbackLinearDepthCt32Sprites;
+    std::vector<GsVulkanFeedbackNearestDepthCt32Triangle>
+        pendingFeedbackNearestDepthCt32Triangles;
     std::vector<GsVulkanCt32Triangle> pendingTriangles;
     std::vector<GsVulkanGouraudDepthCt32Triangle>
         pendingGouraudDepthTriangles;
@@ -794,11 +831,20 @@ struct GsVulkanRasterBackend::Impl final
     uint64_t pendingResidentGpuWritePageTouches = 0u;
     GsVulkanAcceleratedCommitBatch pendingBatchCommit;
     std::vector<uint8_t> pendingFeedbackSnapshot;
+    GsVulkanFeedbackSnapshotMode pendingFeedbackSnapshotMode =
+        GsVulkanFeedbackSnapshotMode::UploadHost;
+    uint64_t pendingFeedbackSnapshotGeneration = 0u;
+    uint64_t residentFeedbackSnapshotGeneration = 0u;
+    bool residentFeedbackSnapshotValid = false;
     const GsDrawCommand *classifiedT8Command = nullptr;
     uint64_t classifiedT8Sequence = 0u;
     GsDrawResources classifiedT8Resources;
+    const GsDrawCommand *classifiedFeedbackNearestCommand = nullptr;
+    uint64_t classifiedFeedbackNearestSequence = 0u;
+    GsDrawResources classifiedFeedbackNearestResources;
     std::vector<GsDrawResources> submissionResourcesScratch;
     std::vector<uint8_t> submissionT8Scratch;
+    std::vector<uint8_t> submissionFeedbackNearestScratch;
     bool exactCt32Triangle = false;
     bool exactGouraudDepthCt32Triangle = false;
     bool exactT8GouraudDepthCt32Triangle = false;
@@ -806,6 +852,7 @@ struct GsVulkanRasterBackend::Impl final
     bool exactNearestCt32Sprite = false;
     bool exactLinearCt32Sprite = false;
     bool exactFeedbackLinearDepthCt32Sprite = false;
+    bool exactFeedbackNearestDepthCt32Triangle = false;
     bool failed = false;
     bool shutDown = false;
 
@@ -874,6 +921,7 @@ struct GsVulkanRasterBackend::Impl final
         pendingNearestCt32Sprites.clear();
         pendingLinearCt32Sprites.clear();
         pendingFeedbackLinearDepthCt32Sprites.clear();
+        pendingFeedbackNearestDepthCt32Triangles.clear();
         pendingTriangles.clear();
         pendingGouraudDepthTriangles.clear();
         pendingT8GouraudDepthTriangles.clear();
@@ -884,6 +932,9 @@ struct GsVulkanRasterBackend::Impl final
         pendingResidentGpuWritePageTouches = 0u;
         pendingBatchCommit = {};
         pendingFeedbackSnapshot.clear();
+        pendingFeedbackSnapshotMode =
+            GsVulkanFeedbackSnapshotMode::UploadHost;
+        pendingFeedbackSnapshotGeneration = 0u;
         pendingT8Palettes.clear();
         pendingT8PaletteIdentityValid = false;
     }
@@ -902,6 +953,8 @@ struct GsVulkanRasterBackend::Impl final
             return pendingLinearCt32Sprites.size();
         case ResidentPipeline::FeedbackLinearDepthCt32Sprite:
             return pendingFeedbackLinearDepthCt32Sprites.size();
+        case ResidentPipeline::FeedbackNearestDepthCt32Triangle:
+            return pendingFeedbackNearestDepthCt32Triangles.size();
         case ResidentPipeline::Ct32Triangle:
             return pendingTriangles.size();
         case ResidentPipeline::GouraudDepthCt32Triangle:
@@ -948,6 +1001,12 @@ struct GsVulkanRasterBackend::Impl final
         {
             batchName =
                 "resident feedback linear depth CT32 sprite batch";
+        }
+        else if (pipeline ==
+                 ResidentPipeline::FeedbackNearestDepthCt32Triangle)
+        {
+            batchName =
+                "resident feedback nearest depth CT32 triangle batch";
         }
         else if (pipeline == ResidentPipeline::Ct32Triangle)
             batchName = "resident CT32 triangle batch";
@@ -1029,6 +1088,29 @@ struct GsVulkanRasterBackend::Impl final
                     pendingFeedbackLinearDepthCt32Sprites,
                     &executionError);
         }
+        else if (pipeline ==
+                 ResidentPipeline::FeedbackNearestDepthCt32Triangle)
+        {
+            const bool needsHostSnapshot =
+                pendingFeedbackSnapshotMode ==
+                GsVulkanFeedbackSnapshotMode::UploadHost;
+            if (needsHostSnapshot &&
+                pendingFeedbackSnapshot.size() !=
+                    GS_VULKAN_VRAM_SIZE)
+            {
+                clearPendingResidentCommands();
+                failRequest(
+                    std::string(batchName) + " at " +
+                        std::string(gsFlushReasonName(reason)),
+                    "resident batch lost its exact host snapshot");
+            }
+            executed = executor
+                ->executeResidentFeedbackNearestDepthCt32Triangles(
+                    pendingFeedbackSnapshot,
+                    pendingFeedbackSnapshotMode,
+                    pendingFeedbackNearestDepthCt32Triangles,
+                    &executionError);
+        }
         else
         {
             executed = executor->executeResidentCt32Sprites(
@@ -1041,6 +1123,21 @@ struct GsVulkanRasterBackend::Impl final
                 std::string(batchName) + " at " +
                     std::string(gsFlushReasonName(reason)),
                 std::move(executionError));
+        }
+
+        if (pipeline ==
+            ResidentPipeline::FeedbackNearestDepthCt32Triangle)
+        {
+            residentFeedbackSnapshotGeneration =
+                pendingFeedbackSnapshotGeneration;
+            residentFeedbackSnapshotValid = true;
+        }
+        else if (pipeline ==
+                 ResidentPipeline::FeedbackLinearDepthCt32Sprite)
+        {
+            // This legacy path uploads through the shared immutable-snapshot
+            // allocation without publishing a generation identity.
+            residentFeedbackSnapshotValid = false;
         }
 
         coherency.noteGpuWriteBatch(
@@ -1106,7 +1203,8 @@ GsVulkanRasterBackend::create(
     std::string *error,
     FeedbackSnapshotCallback feedbackSnapshot,
     DecodedPaletteCallback decodedPalette,
-    AcceleratedBatchCommitCallback acceleratedBatchCommit)
+    AcceleratedBatchCommitCallback acceleratedBatchCommit,
+    FeedbackSnapshotGenerationCallback feedbackSnapshotGeneration)
 {
     std::unique_ptr<GsVulkanService> service =
         GsVulkanService::create(serviceConfig, report, error);
@@ -1116,7 +1214,8 @@ GsVulkanRasterBackend::create(
         std::move(service), backendConfig, canonicalVram,
         std::move(softwareOracle), std::move(acceleratedCommit), error,
         std::move(feedbackSnapshot), std::move(decodedPalette),
-        std::move(acceleratedBatchCommit));
+        std::move(acceleratedBatchCommit),
+        std::move(feedbackSnapshotGeneration));
 }
 
 std::unique_ptr<GsVulkanRasterBackend>
@@ -1129,7 +1228,8 @@ GsVulkanRasterBackend::createWithExecutor(
     std::string *error,
     FeedbackSnapshotCallback feedbackSnapshot,
     DecodedPaletteCallback decodedPalette,
-    AcceleratedBatchCommitCallback acceleratedBatchCommit)
+    AcceleratedBatchCommitCallback acceleratedBatchCommit,
+    FeedbackSnapshotGenerationCallback feedbackSnapshotGeneration)
 {
     const auto reject = [&](std::string message)
     {
@@ -1182,12 +1282,17 @@ GsVulkanRasterBackend::createWithExecutor(
     impl->exactFeedbackLinearDepthCt32Sprite =
         selectedDevice &&
         selectedDevice->exactFeedbackLinearDepthCt32Sprite;
+    impl->exactFeedbackNearestDepthCt32Triangle =
+        selectedDevice &&
+        selectedDevice->exactFeedbackNearestDepthCt32Triangle;
     impl->config = backendConfig;
     impl->canonicalVram = canonicalVram;
     impl->softwareOracle = std::move(softwareOracle);
     impl->acceleratedCommit = std::move(acceleratedCommit);
     impl->acceleratedBatchCommit = std::move(acceleratedBatchCommit);
     impl->feedbackSnapshot = std::move(feedbackSnapshot);
+    impl->feedbackSnapshotGeneration =
+        std::move(feedbackSnapshotGeneration);
     impl->decodedPalette = std::move(decodedPalette);
     impl->pendingSprites.reserve(backendConfig.maximumResidentBatchCommands);
     impl->pendingDepthCt32Sprites.reserve(
@@ -1198,6 +1303,8 @@ GsVulkanRasterBackend::createWithExecutor(
         backendConfig.maximumResidentBatchCommands);
     impl->pendingFeedbackLinearDepthCt32Sprites.reserve(
         backendConfig.maximumResidentBatchCommands);
+    impl->pendingFeedbackNearestDepthCt32Triangles.reserve(
+        GS_VULKAN_MAX_RESIDENT_FEEDBACK_NEAREST_DEPTH_CT32_TRIANGLE_BATCH);
     impl->pendingTriangles.reserve(backendConfig.maximumResidentBatchCommands);
     impl->pendingGouraudDepthTriangles.reserve(
         GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH);
@@ -1215,6 +1322,7 @@ GsVulkanRasterBackend::createWithExecutor(
     impl->pendingT8Palettes.reserve(16u);
     impl->submissionResourcesScratch.reserve(1u);
     impl->submissionT8Scratch.reserve(1u);
+    impl->submissionFeedbackNearestScratch.reserve(1u);
     GsVramPageMask allPages;
     allPages.setAll();
     // The canonical image predates the device allocation. Start with explicit
@@ -1244,6 +1352,7 @@ GsBackendDecision GsVulkanRasterBackend::classify(
     const GsDrawCommand &command) const
 {
     m_impl->classifiedT8Command = nullptr;
+    m_impl->classifiedFeedbackNearestCommand = nullptr;
     if (m_impl->shutDown || m_impl->failed ||
         !m_impl->executor->healthy())
         return {false, GsFallbackReason::BackendUnavailable};
@@ -1416,6 +1525,26 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         command.primitive().type == GS_PRIM_TRIFAN;
     if (assembledTriangle && acceleratedMode)
     {
+        GsDrawResources feedbackNearestResources;
+        const GsBackendDecision feedbackNearestDecision =
+            classifyGsFeedbackNearestDepthCt32Triangle(
+                command, &feedbackNearestResources);
+        if (feedbackNearestDecision.supported)
+        {
+            m_impl->classifiedFeedbackNearestCommand = &command;
+            m_impl->classifiedFeedbackNearestSequence =
+                command.sequence();
+            m_impl->classifiedFeedbackNearestResources =
+                feedbackNearestResources;
+            if (!m_impl->exactFeedbackNearestDepthCt32Triangle ||
+                (m_impl->config.mode == GsRendererMode::Verify &&
+                 !m_impl->feedbackSnapshot))
+            {
+                return {false, GsFallbackReason::BackendUnavailable};
+            }
+            return feedbackNearestDecision;
+        }
+
         GsDrawResources t8Resources;
         const GsBackendDecision t8Decision =
             classifyGsT8GouraudSourceOverDepthCt32Triangle(
@@ -1608,6 +1737,19 @@ bool GsVulkanRasterBackend::hybridBatchCompatible(
            firstSprite.textureWidth == nextSprite.textureWidth;
 }
 
+bool GsVulkanRasterBackend::canCaptureFeedbackSnapshotOnDevice(
+    const GsDrawCommand &command) const noexcept
+{
+    if ((m_impl->config.mode != GsRendererMode::Hybrid &&
+         m_impl->config.mode != GsRendererMode::GpuStrict) ||
+        m_impl->shutDown || m_impl->failed ||
+        !m_impl->exactFeedbackNearestDepthCt32Triangle)
+    {
+        return false;
+    }
+    return classifyGsFeedbackNearestDepthCt32Triangle(command).supported;
+}
+
 void GsVulkanRasterBackend::submit(
     std::span<const GsDrawCommand> commands)
 {
@@ -1618,16 +1760,24 @@ void GsVulkanRasterBackend::submit(
         m_impl->submissionResourcesScratch;
     std::vector<uint8_t> &commandIsT8 =
         m_impl->submissionT8Scratch;
+    std::vector<uint8_t> &commandIsFeedbackNearest =
+        m_impl->submissionFeedbackNearestScratch;
     commandResources.clear();
     commandResources.resize(commands.size());
     commandIsT8.assign(commands.size(), 0u);
+    commandIsFeedbackNearest.assign(commands.size(), 0u);
     for (size_t index = 0u; index < commands.size(); ++index)
     {
         const GsDrawCommand &command = commands[index];
         const bool cachedT8 =
             m_impl->classifiedT8Command == &command &&
             m_impl->classifiedT8Sequence == command.sequence();
-        const GsBackendDecision decision = cachedT8
+        const bool cachedFeedbackNearest =
+            m_impl->classifiedFeedbackNearestCommand == &command &&
+            m_impl->classifiedFeedbackNearestSequence ==
+                command.sequence();
+        const GsBackendDecision decision =
+            (cachedT8 || cachedFeedbackNearest)
             ? GsBackendDecision{true, GsFallbackReason::Supported}
             : classify(command);
         if (!decision.supported)
@@ -1637,7 +1787,15 @@ void GsVulkanRasterBackend::submit(
                 std::to_string(command.sequence()) + ": " +
                 std::string(gsFallbackReasonName(decision.reason)));
         }
-        if (m_impl->classifiedT8Command == &command &&
+        if (m_impl->classifiedFeedbackNearestCommand == &command &&
+            m_impl->classifiedFeedbackNearestSequence ==
+                command.sequence())
+        {
+            commandResources[index] =
+                m_impl->classifiedFeedbackNearestResources;
+            commandIsFeedbackNearest[index] = 1u;
+        }
+        else if (m_impl->classifiedT8Command == &command &&
             m_impl->classifiedT8Sequence == command.sequence())
         {
             commandResources[index] = m_impl->classifiedT8Resources;
@@ -1649,6 +1807,7 @@ void GsVulkanRasterBackend::submit(
         }
     }
     m_impl->classifiedT8Command = nullptr;
+    m_impl->classifiedFeedbackNearestCommand = nullptr;
 
     for (size_t commandIndex = 0u;
          commandIndex < commands.size(); ++commandIndex)
@@ -1660,6 +1819,8 @@ void GsVulkanRasterBackend::submit(
         GsVulkanLinearCt32Sprite linearTexturedSprite{};
         GsVulkanFeedbackLinearDepthCt32Sprite
             feedbackLinearDepthSprite{};
+        GsVulkanFeedbackNearestDepthCt32Triangle
+            feedbackNearestDepthTriangle{};
         GsVulkanCt32Triangle triangle{};
         GsVulkanGouraudDepthCt32Triangle
             gouraudDepthTriangle{};
@@ -1682,9 +1843,27 @@ void GsVulkanRasterBackend::submit(
         bool isDepthSprite = false;
         bool isLinearTexturedSprite = false;
         bool isFeedbackLinearDepthSprite = false;
+        bool isFeedbackNearestDepthTriangle = false;
         bool isGouraudDepthTriangle = false;
         bool isT8GouraudDepthTriangle = false;
-        if (isAssembledTriangle && commandIsT8[commandIndex] != 0u)
+        if (isAssembledTriangle &&
+            commandIsFeedbackNearest[commandIndex] != 0u)
+        {
+            const GsBackendDecision prepared =
+                prepareGsVulkanFeedbackNearestDepthCt32Triangle(
+                    command,
+                    feedbackNearestDepthTriangle,
+                    &resources);
+            if (!prepared.supported)
+            {
+                m_impl->failRequest(
+                    "feedback nearest triangle preparation for draw " +
+                        std::to_string(command.sequence()),
+                    "frontend did not provide a valid recursive setup record");
+            }
+            isFeedbackNearestDepthTriangle = true;
+        }
+        else if (isAssembledTriangle && commandIsT8[commandIndex] != 0u)
         {
             t8Palette = m_impl->decodedPalette();
             if (t8Palette.colors.size() != 256u)
@@ -1787,7 +1966,8 @@ void GsVulkanRasterBackend::submit(
         if (m_impl->config.mode == GsRendererMode::Verify)
         {
             std::span<const uint8_t> feedbackSnapshot;
-            if (isFeedbackLinearDepthSprite)
+            if (isFeedbackLinearDepthSprite ||
+                isFeedbackNearestDepthTriangle)
             {
                 feedbackSnapshot = m_impl->feedbackSnapshot();
                 if (feedbackSnapshot.size() != GS_VULKAN_VRAM_SIZE)
@@ -1808,7 +1988,15 @@ void GsVulkanRasterBackend::submit(
             std::vector<uint8_t> gpuOutput;
             std::string executionError;
             bool executed = false;
-            if (isT8GouraudDepthTriangle)
+            if (isFeedbackNearestDepthTriangle)
+            {
+                executed = m_impl->executor
+                    ->executeFeedbackNearestDepthCt32Triangle(
+                        initial, feedbackSnapshot,
+                        feedbackNearestDepthTriangle,
+                        gpuOutput, &executionError);
+            }
+            else if (isT8GouraudDepthTriangle)
             {
                 executed = m_impl->executor
                     ->executeT8GouraudDepthCt32Triangle(
@@ -1897,7 +2085,17 @@ void GsVulkanRasterBackend::submit(
                 std::string artifactPath;
                 std::string artifactError;
                 bool artifactWritten = false;
-                if (isT8GouraudDepthTriangle)
+                if (isFeedbackNearestDepthTriangle)
+                {
+                    artifactWritten = writeVerificationArtifact(
+                        m_impl->config.verificationArtifactDirectory,
+                        command, feedbackNearestDepthTriangle,
+                        firstDifference, initial,
+                        m_impl->canonicalVram, gpuOutput,
+                        artifactPath, artifactError,
+                        feedbackSnapshot);
+                }
+                else if (isT8GouraudDepthTriangle)
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
@@ -1993,7 +2191,12 @@ void GsVulkanRasterBackend::submit(
         {
             Impl::ResidentPipeline pipeline =
                 Impl::ResidentPipeline::Ct32Sprite;
-            if (isT8GouraudDepthTriangle)
+            if (isFeedbackNearestDepthTriangle)
+            {
+                pipeline = Impl::ResidentPipeline::
+                    FeedbackNearestDepthCt32Triangle;
+            }
+            else if (isT8GouraudDepthTriangle)
             {
                 pipeline = Impl::ResidentPipeline::
                     T8GouraudDepthCt32Triangle;
@@ -2018,7 +2221,8 @@ void GsVulkanRasterBackend::submit(
                 pipeline = Impl::ResidentPipeline::NearestCt32Sprite;
 
             GsVramPageMask residentReadPages = resources.readPages;
-            if (isFeedbackLinearDepthSprite)
+            if (isFeedbackLinearDepthSprite ||
+                isFeedbackNearestDepthTriangle)
             {
                 // Texture, mip, and CLUT reads consume the independently
                 // copied snapshot rather than canonical resident VRAM.
@@ -2076,6 +2280,38 @@ void GsVulkanRasterBackend::submit(
             {
                 m_impl->drainPendingResidentCommands(
                     GsFlushReason::PipelineChange);
+            }
+            if (pipeline == Impl::ResidentPipeline::
+                    FeedbackNearestDepthCt32Triangle &&
+                m_impl->pendingResidentCommandTotal != 0u)
+            {
+                const auto &first =
+                    m_impl->pendingFeedbackNearestDepthCt32Triangles.front();
+                const bool sameRenderTarget =
+                    first.framebufferBaseBlock ==
+                        feedbackNearestDepthTriangle.framebufferBaseBlock &&
+                    first.framebufferWidth ==
+                        feedbackNearestDepthTriangle.framebufferWidth &&
+                    first.depthBaseBlock ==
+                        feedbackNearestDepthTriangle.depthBaseBlock &&
+                    first.depthPsm ==
+                        feedbackNearestDepthTriangle.depthPsm &&
+                    first.textureBaseBlock ==
+                        feedbackNearestDepthTriangle.textureBaseBlock &&
+                    first.textureWidth ==
+                        feedbackNearestDepthTriangle.textureWidth;
+                const GsVulkanFeedbackSnapshotIdentity identity =
+                    m_impl->feedbackSnapshotGeneration
+                        ? m_impl->feedbackSnapshotGeneration()
+                        : GsVulkanFeedbackSnapshotIdentity{};
+                if (!sameRenderTarget ||
+                    identity.generation !=
+                        m_impl->pendingFeedbackSnapshotGeneration)
+                {
+                    m_impl->drainPendingResidentCommands(
+                        GsFlushReason::PipelineChange);
+                    m_impl->residentFeedbackSnapshotValid = false;
+                }
             }
             if (pipeline == Impl::ResidentPipeline::
                     T8GouraudDepthCt32Triangle &&
@@ -2149,6 +2385,8 @@ void GsVulkanRasterBackend::submit(
                 pipeline == Impl::ResidentPipeline::
                     FeedbackLinearDepthCt32Sprite ||
                 pipeline == Impl::ResidentPipeline::
+                    FeedbackNearestDepthCt32Triangle ||
+                pipeline == Impl::ResidentPipeline::
                     GouraudDepthCt32Triangle ||
                 pipeline == Impl::ResidentPipeline::
                     T8GouraudDepthCt32Triangle;
@@ -2159,6 +2397,9 @@ void GsVulkanRasterBackend::submit(
             }
             const size_t maximumBatchCommands =
                 pipeline == Impl::ResidentPipeline::
+                                FeedbackNearestDepthCt32Triangle
+                    ? GS_VULKAN_MAX_RESIDENT_FEEDBACK_NEAREST_DEPTH_CT32_TRIANGLE_BATCH
+                : pipeline == Impl::ResidentPipeline::
                                 T8GouraudDepthCt32Triangle
                     ? GS_VULKAN_MAX_RESIDENT_T8_TRIANGLE_BATCH
                 : pipeline == Impl::ResidentPipeline::
@@ -2222,6 +2463,49 @@ void GsVulkanRasterBackend::submit(
                 }
             }
 
+            if (isFeedbackNearestDepthTriangle &&
+                m_impl->pendingResidentCommandTotal == 0u)
+            {
+                const GsVulkanFeedbackSnapshotIdentity identity =
+                    m_impl->feedbackSnapshotGeneration
+                        ? m_impl->feedbackSnapshotGeneration()
+                        : GsVulkanFeedbackSnapshotIdentity{};
+                m_impl->pendingFeedbackSnapshotGeneration =
+                    identity.generation;
+                if (identity.deviceResident)
+                {
+                    const bool canReuse =
+                        m_impl->residentFeedbackSnapshotValid &&
+                        m_impl->residentFeedbackSnapshotGeneration ==
+                            identity.generation;
+                    m_impl->pendingFeedbackSnapshotMode = canReuse
+                        ? GsVulkanFeedbackSnapshotMode::ReuseResident
+                        : GsVulkanFeedbackSnapshotMode::CaptureResident;
+                    m_impl->pendingFeedbackSnapshot.clear();
+                }
+                else
+                {
+                    if (!m_impl->feedbackSnapshot)
+                    {
+                        m_impl->failRequest(
+                            "resident feedback nearest batch assembly",
+                            "frontend did not provide a host snapshot callback");
+                    }
+                    const std::span<const uint8_t> snapshot =
+                        m_impl->feedbackSnapshot();
+                    if (snapshot.size() != GS_VULKAN_VRAM_SIZE)
+                    {
+                        m_impl->failRequest(
+                            "resident feedback nearest batch assembly",
+                            "frontend did not provide an exact 4 MiB snapshot");
+                    }
+                    m_impl->pendingFeedbackSnapshotMode =
+                        GsVulkanFeedbackSnapshotMode::UploadHost;
+                    m_impl->pendingFeedbackSnapshot.assign(
+                        snapshot.begin(), snapshot.end());
+                }
+            }
+
             if (m_impl->pendingResidentCommandTotal == 0u)
                 m_impl->pendingResidentPipeline = pipeline;
             switch (pipeline)
@@ -2242,6 +2526,10 @@ void GsVulkanRasterBackend::submit(
             case Impl::ResidentPipeline::FeedbackLinearDepthCt32Sprite:
                 m_impl->pendingFeedbackLinearDepthCt32Sprites.push_back(
                     feedbackLinearDepthSprite);
+                break;
+            case Impl::ResidentPipeline::FeedbackNearestDepthCt32Triangle:
+                m_impl->pendingFeedbackNearestDepthCt32Triangles.push_back(
+                    feedbackNearestDepthTriangle);
                 break;
             case Impl::ResidentPipeline::Ct32Triangle:
                 m_impl->pendingTriangles.push_back(triangle);
@@ -2267,6 +2555,17 @@ void GsVulkanRasterBackend::submit(
                     static_cast<uint64_t>(bounds.y1 - bounds.y0);
                 m_impl->pendingBatchCommit.framebufferBasePages.set(
                     command.context().frame.fbp);
+            }
+            if (pipeline == Impl::ResidentPipeline::
+                    FeedbackNearestDepthCt32Triangle &&
+                m_impl->pendingFeedbackSnapshotMode ==
+                    GsVulkanFeedbackSnapshotMode::CaptureResident)
+            {
+                // CaptureResident copies the complete immutable 4 MiB image,
+                // and that identity can outlive the currently sampled pages.
+                // GPU-newer pages are already correct in resident VRAM; make
+                // sure every CPU-newer page is uploaded before the copy too.
+                residentReadPages.setAll();
             }
             m_impl->pendingResidentReadPages.unionWith(
                 residentReadPages);
@@ -2349,6 +2648,35 @@ void GsVulkanRasterBackend::noteCpuVramWrite(
     const GsVramPageMask &pages)
 {
     m_impl->coherency.noteCpuWrite(pages);
+}
+
+bool GsVulkanRasterBackend::materializeFeedbackSnapshot(
+    std::span<uint8_t> destination,
+    std::string *error)
+{
+    if (destination.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+            *error = "feedback snapshot materialization requires exactly 4 MiB";
+        return false;
+    }
+    if (m_impl->shutDown || m_impl->failed ||
+        !m_impl->executor->healthy())
+    {
+        if (error)
+            *error = "Vulkan GS backend is not healthy";
+        return false;
+    }
+
+    m_impl->drainPendingResidentCommands(GsFlushReason::SaveLoad);
+    if (!m_impl->residentFeedbackSnapshotValid)
+    {
+        if (error)
+            *error = "no immutable resident feedback snapshot is available";
+        return false;
+    }
+    return m_impl->executor->downloadFeedbackSnapshot(
+        destination, error);
 }
 
 GsVulkanRasterBackendStatistics

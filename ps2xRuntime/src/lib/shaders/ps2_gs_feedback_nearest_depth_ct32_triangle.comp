@@ -1,0 +1,453 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+#extension GL_ARB_gpu_shader_fp64 : require
+
+#include "ps2_gs_memory.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer GsVram
+{
+    uint words[];
+} gs_vram;
+
+struct FeedbackNearestDepthTriangle
+{
+    uint framebuffer_base_block;
+    uint framebuffer_width;
+    uint bounds_x0;
+    uint bounds_y0;
+    uint bounds_x1;
+    uint bounds_y1;
+    uint depth_base_block;
+    uint depth_psm;
+    uint positive_area;
+    uint top_left_edge_mask;
+    int vertex_x_12_4[3];
+    int vertex_y_12_4[3];
+    uint vertex_z[3];
+    uint rgba;
+    uint scaled_s_bits[3];
+    uint scaled_t_bits[3];
+    uint texture_dx_bits[2];
+    uint texture_dy_bits[2];
+    uint depth_dx_bits[2];
+    uint depth_dy_bits[2];
+    uint texture_base_block;
+    uint texture_width;
+    uint texture_width_log2;
+    uint texture_height_log2;
+    uint texture_wrap_u;
+    uint texture_wrap_v;
+    uint texture_source;
+    uint reserved[3];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer TriangleRecords
+{
+    FeedbackNearestDepthTriangle records[];
+} triangle_records;
+
+layout(set = 0, binding = 2, std430) readonly buffer TileWork
+{
+    uint words[];
+} tile_work;
+
+layout(set = 0, binding = 3, std430) readonly buffer GsFeedbackSnapshot
+{
+    uint words[];
+} gs_feedback;
+
+layout(push_constant) uniform TriangleParameters
+{
+    uint record_index;
+    uint tile_index_words;
+    uint reserved;
+} parameters;
+
+uint current_record_index;
+#define triangle triangle_records.records[current_record_index]
+
+int64_t edge_value(
+    int ax,
+    int ay,
+    int bx,
+    int by,
+    int sample_x,
+    int sample_y)
+{
+    return
+        (int64_t(bx) - int64_t(ax)) *
+            (int64_t(sample_y) - int64_t(ay)) -
+        (int64_t(by) - int64_t(ay)) *
+            (int64_t(sample_x) - int64_t(ax));
+}
+
+int64_t oriented_edge_value(
+    int ax,
+    int ay,
+    int bx,
+    int by,
+    int sample_x,
+    int sample_y)
+{
+    int64_t value = edge_value(
+        ax, ay, bx, by, sample_x, sample_y);
+    return triangle.positive_area != 0u ? value : -value;
+}
+
+bool edge_covers(int64_t value, uint mask_bit)
+{
+    return value > int64_t(0) ||
+           (value == int64_t(0) &&
+            (triangle.top_left_edge_mask & mask_bit) != 0u);
+}
+
+bool sample_covered(int sample_x, int sample_y)
+{
+    int64_t edge0 = oriented_edge_value(
+        triangle.vertex_x_12_4[1], triangle.vertex_y_12_4[1],
+        triangle.vertex_x_12_4[2], triangle.vertex_y_12_4[2],
+        sample_x, sample_y);
+    int64_t edge1 = oriented_edge_value(
+        triangle.vertex_x_12_4[2], triangle.vertex_y_12_4[2],
+        triangle.vertex_x_12_4[0], triangle.vertex_y_12_4[0],
+        sample_x, sample_y);
+    int64_t edge2 = oriented_edge_value(
+        triangle.vertex_x_12_4[0], triangle.vertex_y_12_4[0],
+        triangle.vertex_x_12_4[1], triangle.vertex_y_12_4[1],
+        sample_x, sample_y);
+    return edge_covers(edge0, 1u) &&
+           edge_covers(edge1, 2u) &&
+           edge_covers(edge2, 4u);
+}
+
+void clip_span_to_edge(
+    int64_t edge,
+    int64_t step,
+    bool top_left,
+    inout int span_start,
+    inout int span_end)
+{
+    int64_t threshold = top_left ? int64_t(0) : int64_t(1);
+    if (step > int64_t(0))
+    {
+        if (edge < threshold)
+        {
+            int64_t delta = threshold - edge;
+            int64_t first = (delta + step - int64_t(1)) / step;
+            if (first >= int64_t(span_end))
+                span_start = span_end;
+            else
+                span_start = max(span_start, int(first));
+        }
+    }
+    else if (step < int64_t(0))
+    {
+        if (edge < threshold)
+        {
+            span_end = 0;
+        }
+        else
+        {
+            int64_t last = (edge - threshold) / -step;
+            if (last < int64_t(span_end - 1))
+                span_end = int(last + int64_t(1));
+        }
+    }
+    else if (edge < threshold)
+    {
+        span_end = 0;
+    }
+}
+
+int scanline_left(uint y)
+{
+    int sample_x = int(triangle.bounds_x0 << 4u);
+    int sample_y = int(y << 4u);
+    int64_t edge0 = oriented_edge_value(
+        triangle.vertex_x_12_4[1], triangle.vertex_y_12_4[1],
+        triangle.vertex_x_12_4[2], triangle.vertex_y_12_4[2],
+        sample_x, sample_y);
+    int64_t edge1 = oriented_edge_value(
+        triangle.vertex_x_12_4[2], triangle.vertex_y_12_4[2],
+        triangle.vertex_x_12_4[0], triangle.vertex_y_12_4[0],
+        sample_x, sample_y);
+    int64_t edge2 = oriented_edge_value(
+        triangle.vertex_x_12_4[0], triangle.vertex_y_12_4[0],
+        triangle.vertex_x_12_4[1], triangle.vertex_y_12_4[1],
+        sample_x, sample_y);
+    int64_t step0 =
+        -int64_t(triangle.vertex_y_12_4[2] -
+                 triangle.vertex_y_12_4[1]) * int64_t(16);
+    int64_t step1 =
+        -int64_t(triangle.vertex_y_12_4[0] -
+                 triangle.vertex_y_12_4[2]) * int64_t(16);
+    int64_t step2 =
+        -int64_t(triangle.vertex_y_12_4[1] -
+                 triangle.vertex_y_12_4[0]) * int64_t(16);
+    if (triangle.positive_area == 0u)
+    {
+        step0 = -step0;
+        step1 = -step1;
+        step2 = -step2;
+    }
+
+    int span_start = 0;
+    int span_end = int(triangle.bounds_x1 - triangle.bounds_x0);
+    clip_span_to_edge(
+        edge0, step0,
+        (triangle.top_left_edge_mask & 1u) != 0u,
+        span_start, span_end);
+    clip_span_to_edge(
+        edge1, step1,
+        (triangle.top_left_edge_mask & 2u) != 0u,
+        span_start, span_end);
+    clip_span_to_edge(
+        edge2, step2,
+        (triangle.top_left_edge_mask & 4u) != 0u,
+        span_start, span_end);
+    return span_start < span_end
+        ? int(triangle.bounds_x0) + span_start
+        : int(triangle.bounds_x1);
+}
+
+void swap_uint(inout uint a, inout uint b)
+{
+    uint temporary = a;
+    a = b;
+    b = temporary;
+}
+
+uvec3 sorted_vertex_indices()
+{
+    uint top = 0u;
+    uint middle = 1u;
+    uint bottom = 2u;
+    if (triangle.vertex_y_12_4[middle] <
+        triangle.vertex_y_12_4[top])
+    {
+        swap_uint(top, middle);
+    }
+    if (triangle.vertex_y_12_4[bottom] <
+        triangle.vertex_y_12_4[middle])
+    {
+        swap_uint(middle, bottom);
+    }
+    if (triangle.vertex_y_12_4[middle] <
+        triangle.vertex_y_12_4[top])
+    {
+        swap_uint(top, middle);
+    }
+    return uvec3(top, middle, bottom);
+}
+
+uint scanline_base_index(uint y, uvec3 sorted)
+{
+    uint base = sorted.x;
+    precise float top_x =
+        float(triangle.vertex_x_12_4[sorted.x]) / 16.0f;
+    precise float top_y =
+        float(triangle.vertex_y_12_4[sorted.x]) / 16.0f;
+    precise float middle_x =
+        float(triangle.vertex_x_12_4[sorted.y]) / 16.0f;
+    precise float middle_y =
+        float(triangle.vertex_y_12_4[sorted.y]) / 16.0f;
+    precise float bottom_x =
+        float(triangle.vertex_x_12_4[sorted.z]) / 16.0f;
+    precise float bottom_y =
+        float(triangle.vertex_y_12_4[sorted.z]) / 16.0f;
+    if (top_y == middle_y)
+    {
+        precise float flat_cross =
+            (middle_y - top_y) * (bottom_x - top_x) -
+            (middle_x - top_x) * (bottom_y - top_y);
+        if (!(flat_cross < 0.0f))
+            base = sorted.y;
+    }
+    else if (float(y) >= ceil(middle_y))
+    {
+        base = sorted.y;
+    }
+    return base;
+}
+
+int floor_divide_power_of_two(int value, int divisor)
+{
+    int quotient = value / divisor;
+    if (value < 0 && (value % divisor) != 0)
+        --quotient;
+    return quotient;
+}
+
+int floor_fixed_16_16(int value)
+{
+    return floor_divide_power_of_two(value, 65536);
+}
+
+int wrap_coordinate(int coordinate, int size, uint mode)
+{
+    if (mode == 0u)
+        return int(uint(coordinate) & uint(size - 1));
+    return clamp(coordinate, 0, size - 1);
+}
+
+uint read_feedback_ct32(int x, int y)
+{
+    uint bit_address = gs_pixel_bit_address(
+        0x00u,
+        triangle.texture_base_block,
+        triangle.texture_width,
+        uint(x),
+        uint(y));
+    uint word_index =
+        (bit_address >> 5u) & (GS_MEMORY_WORD_COUNT - 1u);
+    return gs_feedback.words[word_index];
+}
+
+uint gs_word_index(uint psm, uint base_block, uint x, uint y)
+{
+    uint bit_address = gs_pixel_bit_address(
+        psm, base_block, triangle.framebuffer_width, x, y);
+    return (bit_address >> 5u) & (GS_MEMORY_WORD_COUNT - 1u);
+}
+
+void write_alpha(uint word_index, uint alpha)
+{
+    uint expected = atomicAdd(gs_vram.words[word_index], 0u);
+    for (;;)
+    {
+        uint replacement =
+            (expected & 0x00ffffffu) | ((alpha & 0xffu) << 24u);
+        uint observed = atomicCompSwap(
+            gs_vram.words[word_index], expected, replacement);
+        if (observed == expected)
+            return;
+        expected = observed;
+    }
+}
+
+void rasterize_pixel(uint record_index, uint x, uint y)
+{
+    current_record_index = record_index;
+    if (x < triangle.bounds_x0 || y < triangle.bounds_y0 ||
+        x >= triangle.bounds_x1 || y >= triangle.bounds_y1)
+    {
+        return;
+    }
+    int sample_x = int(x << 4u);
+    int sample_y = int(y << 4u);
+    if (!sample_covered(sample_x, sample_y))
+        return;
+
+    int left = scanline_left(y);
+    if (left >= int(triangle.bounds_x1))
+        return;
+    uvec3 sorted = sorted_vertex_indices();
+    uint base_index = scanline_base_index(y, sorted);
+    precise float base_x =
+        float(triangle.vertex_x_12_4[base_index]) / 16.0f;
+    precise float base_y =
+        float(triangle.vertex_y_12_4[base_index]) / 16.0f;
+    precise float delta_y = float(y) - base_y;
+    precise float prestep = float(left) - base_x;
+    int scanline_skip = left & 7;
+    int aligned_left = left & ~7;
+    int block = (int(x) - aligned_left) / 8;
+    int lane_offset = (int(x) & 7) - scanline_skip;
+
+    double depth_dx = packDouble2x32(uvec2(
+        triangle.depth_dx_bits[0], triangle.depth_dx_bits[1]));
+    double depth_dy = packDouble2x32(uvec2(
+        triangle.depth_dy_bits[0], triangle.depth_dy_bits[1]));
+    double edge_depth = fma(
+        depth_dy,
+        double(delta_y),
+        double(triangle.vertex_z[base_index]));
+    double scanline_depth = fma(
+        depth_dx, double(prestep), edge_depth);
+    precise float depth_lane_delta =
+        float(depth_dx) * float(lane_offset);
+    double depth = scanline_depth + double(depth_lane_delta);
+    double depth_block_delta = depth_dx * 8.0;
+    for (int index = 0; index < block; ++index)
+        depth += depth_block_delta;
+    uint integer_depth = uint(depth);
+
+    uint depth_word_index = gs_word_index(
+        triangle.depth_psm, triangle.depth_base_block, x, y);
+    uint destination_depth_word =
+        atomicAdd(gs_vram.words[depth_word_index], 0u);
+    uint destination_depth = triangle.depth_psm == 0x31u
+        ? destination_depth_word & 0x00ffffffu
+        : destination_depth_word;
+    if (integer_depth < destination_depth)
+        return;
+
+    precise vec2 texture_dx = vec2(
+        uintBitsToFloat(triangle.texture_dx_bits[0]),
+        uintBitsToFloat(triangle.texture_dx_bits[1]));
+    precise vec2 texture_dy = vec2(
+        uintBitsToFloat(triangle.texture_dy_bits[0]),
+        uintBitsToFloat(triangle.texture_dy_bits[1]));
+    precise vec2 base_texture = vec2(
+        uintBitsToFloat(triangle.scaled_s_bits[base_index]),
+        uintBitsToFloat(triangle.scaled_t_bits[base_index]));
+    precise vec2 edge_texture = fma(
+        texture_dy, vec2(delta_y), base_texture);
+    precise vec2 scanline_texture = fma(
+        texture_dx, vec2(prestep), edge_texture);
+    // The software constant-Q path truncates the scanline base, lane delta,
+    // and eight-pixel step independently before unsigned accumulation.
+    uvec2 fixed_coordinates =
+        uvec2(ivec2(scanline_texture)) +
+        uvec2(ivec2(texture_dx * float(lane_offset))) +
+        uvec2(ivec2(texture_dx * 8.0f)) * uint(block);
+    int fixed_u = int(fixed_coordinates.x);
+    int fixed_v = int(fixed_coordinates.y);
+    int texture_width = 1 << int(triangle.texture_width_log2);
+    int texture_height = 1 << int(triangle.texture_height_log2);
+    int u = wrap_coordinate(
+        floor_fixed_16_16(fixed_u),
+        texture_width,
+        triangle.texture_wrap_u);
+    int v = wrap_coordinate(
+        floor_fixed_16_16(fixed_v),
+        texture_height,
+        triangle.texture_wrap_v);
+    uint texel = read_feedback_ct32(u, v);
+    uint texture_alpha = texel >> 24u;
+    uint vertex_fixed_alpha = (triangle.rgba >> 24u) * 128u;
+    uint source_alpha = min(
+        255u, (texture_alpha * vertex_fixed_alpha) >> 14u);
+
+    uint framebuffer_word_index = gs_word_index(
+        0x00u, triangle.framebuffer_base_block, x, y);
+    write_alpha(framebuffer_word_index, source_alpha);
+}
+
+void main()
+{
+    if (parameters.tile_index_words == 0u)
+    {
+        current_record_index = parameters.record_index;
+        uint x = triangle.bounds_x0 + gl_GlobalInvocationID.x;
+        uint y = triangle.bounds_y0 + gl_GlobalInvocationID.y;
+        rasterize_pixel(parameters.record_index, x, y);
+        return;
+    }
+
+    uint descriptor = gl_WorkGroupID.x * 4u;
+    uint x = tile_work.words[descriptor] + gl_LocalInvocationID.x;
+    uint y = tile_work.words[descriptor + 1u] + gl_LocalInvocationID.y;
+    uint first = tile_work.words[descriptor + 2u];
+    uint count = tile_work.words[descriptor + 3u];
+    for (uint index = 0u; index < count; ++index)
+    {
+        uint record_index = tile_work.words[
+            parameters.tile_index_words + first + index];
+        rasterize_pixel(record_index, x, y);
+    }
+}

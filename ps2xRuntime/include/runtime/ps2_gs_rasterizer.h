@@ -138,6 +138,8 @@ private:
     uint8_t m_feedbackTextureWidth = 0;
     uint8_t m_feedbackFrameWidth = 0;
     bool m_feedbackSnapshotValid = false;
+    bool m_feedbackSnapshotDeviceResident = false;
+    uint64_t m_feedbackSnapshotGeneration = 0u;
     std::array<uint32_t, 256> m_decodedClut{};
     uint64_t m_decodedClutGeneration = UINT64_MAX;
     uint16_t m_decodedClutTexa = 0u;

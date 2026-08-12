@@ -644,6 +644,8 @@ target_sources(ps2_runtime PRIVATE
     src/lib/shaders/ps2_gs_depth_ct32_sprite_spv.inc
     src/lib/shaders/ps2_gs_feedback_linear_depth_ct32_sprite.comp
     src/lib/shaders/ps2_gs_feedback_linear_depth_ct32_sprite_spv.inc
+    src/lib/shaders/ps2_gs_feedback_nearest_depth_ct32_triangle.comp
+    src/lib/shaders/ps2_gs_feedback_nearest_depth_ct32_triangle_spv.inc
     src/lib/shaders/ps2_gs_gouraud_depth_ct32_triangle.comp
     src/lib/shaders/ps2_gs_gouraud_depth_ct32_triangle_spv.inc
     src/lib/shaders/ps2_gs_t8_gouraud_depth_ct32_triangle.comp
@@ -667,6 +669,8 @@ set_source_files_properties(
     src/lib/shaders/ps2_gs_depth_ct32_sprite_spv.inc
     src/lib/shaders/ps2_gs_feedback_linear_depth_ct32_sprite.comp
     src/lib/shaders/ps2_gs_feedback_linear_depth_ct32_sprite_spv.inc
+    src/lib/shaders/ps2_gs_feedback_nearest_depth_ct32_triangle.comp
+    src/lib/shaders/ps2_gs_feedback_nearest_depth_ct32_triangle_spv.inc
     src/lib/shaders/ps2_gs_gouraud_depth_ct32_triangle.comp
     src/lib/shaders/ps2_gs_gouraud_depth_ct32_triangle_spv.inc
     src/lib/shaders/ps2_gs_t8_gouraud_depth_ct32_triangle.comp

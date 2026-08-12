@@ -100,6 +100,12 @@ struct GsVulkanDecodedPalette
     uint8_t csa = 0u;
 };
 
+struct GsVulkanFeedbackSnapshotIdentity
+{
+    uint64_t generation = 0u;
+    bool deviceResident = false;
+};
+
 // Verify mode retains Phase 3's independent whole-image transaction and full
 // 4 MiB comparison. Hybrid and strict use the page-coherency hooks inherited
 // from IGsRasterBackend, so canonical CPU VRAM may be stale until the router
@@ -117,6 +123,10 @@ public:
     // callback.
     using FeedbackSnapshotCallback =
         std::function<std::span<const uint8_t>()>;
+    // Monotonically identifies the frontend's current immutable feedback run.
+    // Device-resident snapshots reuse bytes only while this identity matches.
+    using FeedbackSnapshotGenerationCallback =
+        std::function<GsVulkanFeedbackSnapshotIdentity()>;
     // The callback refreshes and exposes the frontend's architectural decoded
     // CLUT. Its exact identity fields must change whenever the decoded colors
     // can change. The backend copies all 256 entries synchronously only when a
@@ -134,7 +144,9 @@ public:
         std::string *error = nullptr,
         FeedbackSnapshotCallback feedbackSnapshot = {},
         DecodedPaletteCallback decodedPalette = {},
-        AcceleratedBatchCommitCallback acceleratedBatchCommit = {});
+        AcceleratedBatchCommitCallback acceleratedBatchCommit = {},
+        FeedbackSnapshotGenerationCallback
+            feedbackSnapshotGeneration = {});
 
     // Dependency-injected construction keeps mismatch, execution-failure, and
     // lifecycle tests deterministic even on compiled-out or GPU-less hosts.
@@ -148,7 +160,9 @@ public:
         std::string *error = nullptr,
         FeedbackSnapshotCallback feedbackSnapshot = {},
         DecodedPaletteCallback decodedPalette = {},
-        AcceleratedBatchCommitCallback acceleratedBatchCommit = {});
+        AcceleratedBatchCommitCallback acceleratedBatchCommit = {},
+        FeedbackSnapshotGenerationCallback
+            feedbackSnapshotGeneration = {});
 
     ~GsVulkanRasterBackend() override;
 
@@ -166,6 +180,8 @@ public:
     [[nodiscard]] bool hybridBatchCompatible(
         const GsDrawCommand &first,
         const GsDrawCommand &next) const noexcept override;
+    [[nodiscard]] bool canCaptureFeedbackSnapshotOnDevice(
+        const GsDrawCommand &command) const noexcept override;
     void submit(std::span<const GsDrawCommand> commands) override;
     void flush(GsFlushReason reason) override;
     [[nodiscard]] size_t pendingCommandCount() const noexcept override;
@@ -177,6 +193,12 @@ public:
         const GsVramPageMask &writePages,
         GsFlushReason reason) override;
     void noteCpuVramWrite(const GsVramPageMask &pages) override;
+
+    // Flushes pending resident work and copies the immutable device feedback
+    // image without changing canonical CPU/GPU VRAM ownership.
+    [[nodiscard]] bool materializeFeedbackSnapshot(
+        std::span<uint8_t> destination,
+        std::string *error = nullptr);
 
     [[nodiscard]] GsVulkanRasterBackendStatistics
     backendStatistics() const;

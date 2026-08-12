@@ -46,6 +46,9 @@ inline constexpr size_t
     GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH = 6144u;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_T8_TRIANGLE_BATCH =
     6144u;
+inline constexpr size_t
+    GS_VULKAN_MAX_RESIDENT_FEEDBACK_NEAREST_DEPTH_CT32_TRIANGLE_BATCH =
+        6144u;
 
 enum class GsVulkanProbeStatus : uint8_t
 {
@@ -148,6 +151,10 @@ struct GsVulkanDeviceReport
     // Recursive linear/depth execution additionally requires a separately
     // bound immutable 4 MiB texture snapshot and the exact 128-byte record.
     bool exactFeedbackLinearDepthCt32Sprite = false;
+
+    // Flat recursive CT32 triangles retain signed 64-bit edge equations and
+    // binary64 depth interpolation while sampling an immutable device snapshot.
+    bool exactFeedbackNearestDepthCt32Triangle = false;
     bool suitable = false;
     std::string rejectionReason;
 };
@@ -242,6 +249,20 @@ struct GsVulkanServiceStatistics
         residentFeedbackLinearDepthCt32SpriteBatchesCompleted = 0u;
     uint64_t residentFeedbackLinearDepthCt32SpriteBatchesFailed = 0u;
     uint64_t largestResidentFeedbackLinearDepthCt32SpriteBatch = 0u;
+    uint64_t feedbackNearestDepthCt32TriangleDrawsCompleted = 0u;
+    uint64_t feedbackNearestDepthCt32TriangleDrawsFailed = 0u;
+    uint64_t
+        feedbackNearestDepthCt32TriangleCandidatePixelsExecuted = 0u;
+    uint64_t
+        residentFeedbackNearestDepthCt32TriangleBatchesCompleted = 0u;
+    uint64_t
+        residentFeedbackNearestDepthCt32TriangleBatchesFailed = 0u;
+    uint64_t
+        largestResidentFeedbackNearestDepthCt32TriangleBatch = 0u;
+    uint64_t residentFeedbackSnapshotsCaptured = 0u;
+    uint64_t residentFeedbackSnapshotsReused = 0u;
+    uint64_t residentFeedbackSnapshotsDownloaded = 0u;
+    uint64_t residentFeedbackSnapshotDownloadsFailed = 0u;
     uint64_t residentLinearCt32SpriteBatchesCompleted = 0u;
     uint64_t residentLinearCt32SpriteBatchesFailed = 0u;
     uint64_t largestResidentLinearCt32SpriteBatch = 0u;
@@ -725,6 +746,94 @@ prepareGsVulkanFeedbackLinearDepthCt32Sprite(
     const GsDrawCommand &command,
     GsVulkanFeedbackLinearDepthCt32Sprite &sprite) noexcept;
 
+// Storage-buffer ABI for the exact point-sampled recursive triangle contract.
+// Texture coordinates are the software rasterizer's already scaled,
+// constant-Q 16.16 scanline values. Alpha-test failure suppresses depth writes,
+// so the shader performs only GEQUAL reads and atomically replaces FRAME's
+// high byte while preserving the RGB bytes selected by FBMSK.
+struct alignas(16) GsVulkanFeedbackNearestDepthCt32Triangle
+{
+    uint32_t framebufferBaseBlock = 0u;
+    uint32_t framebufferWidth = 0u;
+    uint32_t boundsX0 = 0u;
+    uint32_t boundsY0 = 0u;
+    uint32_t boundsX1 = 0u;
+    uint32_t boundsY1 = 0u;
+    uint32_t depthBaseBlock = 0u;
+    uint32_t depthPsm = 0u;
+    uint32_t positiveArea = 0u;
+    uint32_t topLeftEdgeMask = 0u;
+    std::array<int32_t, 3> vertexX12_4{};
+    std::array<int32_t, 3> vertexY12_4{};
+    std::array<uint32_t, 3> vertexZ{};
+    uint32_t rgba = 0u;
+    std::array<uint32_t, 3> sBits{};
+    std::array<uint32_t, 3> tBits{};
+    std::array<uint32_t, 2> textureDxBits{};
+    std::array<uint32_t, 2> textureDyBits{};
+    std::array<uint32_t, 2> depthDxBits{};
+    std::array<uint32_t, 2> depthDyBits{};
+    uint32_t textureBaseBlock = 0u;
+    uint32_t textureWidth = 0u;
+    uint32_t textureWidthLog2 = 0u;
+    uint32_t textureHeightLog2 = 0u;
+    uint32_t textureWrapU = 0u;
+    uint32_t textureWrapV = 0u;
+    uint32_t textureSource =
+        GS_VULKAN_TEXTURE_SOURCE_FEEDBACK_SNAPSHOT;
+    std::array<uint32_t, 3> reserved{};
+
+    bool operator==(
+        const GsVulkanFeedbackNearestDepthCt32Triangle &) const = default;
+};
+
+static_assert(
+    sizeof(GsVulkanFeedbackNearestDepthCt32Triangle) == 176u);
+static_assert(std::is_standard_layout_v<
+              GsVulkanFeedbackNearestDepthCt32Triangle>);
+static_assert(std::is_trivially_copyable_v<
+              GsVulkanFeedbackNearestDepthCt32Triangle>);
+static_assert(offsetof(
+    GsVulkanFeedbackNearestDepthCt32Triangle,
+    framebufferBaseBlock) == 0u);
+static_assert(offsetof(
+    GsVulkanFeedbackNearestDepthCt32Triangle,
+    positiveArea) == 32u);
+static_assert(offsetof(
+    GsVulkanFeedbackNearestDepthCt32Triangle,
+    vertexX12_4) == 40u);
+static_assert(offsetof(
+    GsVulkanFeedbackNearestDepthCt32Triangle,
+    rgba) == 76u);
+static_assert(offsetof(
+    GsVulkanFeedbackNearestDepthCt32Triangle,
+    sBits) == 80u);
+static_assert(offsetof(
+    GsVulkanFeedbackNearestDepthCt32Triangle,
+    textureDxBits) == 104u);
+static_assert(offsetof(
+    GsVulkanFeedbackNearestDepthCt32Triangle,
+    depthDxBits) == 120u);
+static_assert(offsetof(
+    GsVulkanFeedbackNearestDepthCt32Triangle,
+    textureBaseBlock) == 136u);
+static_assert(offsetof(
+    GsVulkanFeedbackNearestDepthCt32Triangle,
+    textureSource) == 160u);
+
+[[nodiscard]] GsBackendDecision
+prepareGsVulkanFeedbackNearestDepthCt32Triangle(
+    const GsDrawCommand &command,
+    GsVulkanFeedbackNearestDepthCt32Triangle &triangle,
+    const GsDrawResources *classifiedResources = nullptr) noexcept;
+
+enum class GsVulkanFeedbackSnapshotMode : uint8_t
+{
+    UploadHost,
+    CaptureResident,
+    ReuseResident,
+};
+
 // Phase 5's first exact triangle record. Vertex coordinates retain the signed
 // 12.4 window-space values after XYOFFSET. Preparation normalizes the winding
 // to positive area; topLeftEdgeMask bits 0..2 describe the edges opposite
@@ -1098,6 +1207,17 @@ public:
         const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeFeedbackNearestDepthCt32Triangle(
+        std::span<const uint8_t>,
+        std::span<const uint8_t>,
+        const GsVulkanFeedbackNearestDepthCt32Triangle &,
+        std::vector<uint8_t> &,
+        std::string *error = nullptr)
+    {
+        if (error)
+            *error = "feedback nearest depth CT32 triangle execution is unavailable";
+        return false;
+    }
     [[nodiscard]] virtual bool executeCt32Triangle(
         std::span<const uint8_t> input,
         const GsVulkanCt32Triangle &triangle,
@@ -1126,6 +1246,17 @@ public:
         std::span<uint8_t> destination,
         const GsVramPageMask &pages,
         std::string *error = nullptr) = 0;
+    // Materializes the immutable snapshot most recently established by a
+    // resident feedback request. This is used only at architectural save/load
+    // boundaries or when a CPU feedback consumer joins the same snapshot run.
+    [[nodiscard]] virtual bool downloadFeedbackSnapshot(
+        std::span<uint8_t>,
+        std::string *error = nullptr)
+    {
+        if (error)
+            *error = "resident feedback snapshot download is unavailable";
+        return false;
+    }
     [[nodiscard]] virtual bool executeResidentCt32Sprite(
         const GsVulkanCt32Sprite &sprite,
         std::string *error = nullptr) = 0;
@@ -1148,6 +1279,17 @@ public:
         std::span<const uint8_t> feedbackSnapshot,
         std::span<const GsVulkanFeedbackLinearDepthCt32Sprite> sprites,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool
+    executeResidentFeedbackNearestDepthCt32Triangles(
+        std::span<const uint8_t>,
+        GsVulkanFeedbackSnapshotMode,
+        std::span<const GsVulkanFeedbackNearestDepthCt32Triangle>,
+        std::string *error = nullptr)
+    {
+        if (error)
+            *error = "resident feedback nearest depth CT32 triangle execution is unavailable";
+        return false;
+    }
     [[nodiscard]] virtual bool executeResidentNearestCt32Sprite(
         const GsVulkanNearestCt32Sprite &sprite,
         std::string *error = nullptr) = 0;
@@ -1281,6 +1423,13 @@ public:
         std::vector<uint8_t> &output,
         std::string *error = nullptr) override;
 
+    [[nodiscard]] bool executeFeedbackNearestDepthCt32Triangle(
+        std::span<const uint8_t> input,
+        std::span<const uint8_t> feedbackSnapshot,
+        const GsVulkanFeedbackNearestDepthCt32Triangle &triangle,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) override;
+
     // Uploads canonical 4 MiB CPU VRAM, executes one prepared exact flat
     // CT32 triangle, and publishes the complete synchronized image. Devices
     // without the explicit 64-bit triangle capability reject before posting.
@@ -1320,6 +1469,9 @@ public:
         std::span<uint8_t> destination,
         const GsVramPageMask &pages,
         std::string *error = nullptr) override;
+    [[nodiscard]] bool downloadFeedbackSnapshot(
+        std::span<uint8_t> destination,
+        std::string *error = nullptr) override;
 
     // Executes against already-resident device VRAM without an implicit
     // upload or download. Page ownership remains the caller's responsibility.
@@ -1354,6 +1506,12 @@ public:
     [[nodiscard]] bool executeResidentFeedbackLinearDepthCt32Sprites(
         std::span<const uint8_t> feedbackSnapshot,
         std::span<const GsVulkanFeedbackLinearDepthCt32Sprite> sprites,
+        std::string *error = nullptr) override;
+
+    [[nodiscard]] bool executeResidentFeedbackNearestDepthCt32Triangles(
+        std::span<const uint8_t> feedbackSnapshot,
+        GsVulkanFeedbackSnapshotMode snapshotMode,
+        std::span<const GsVulkanFeedbackNearestDepthCt32Triangle> triangles,
         std::string *error = nullptr) override;
 
     // Records a bounded nearest-texture batch against resident raw VRAM.

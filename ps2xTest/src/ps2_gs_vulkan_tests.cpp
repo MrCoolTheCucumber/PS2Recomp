@@ -686,6 +686,60 @@ namespace
             linear.globalState());
     }
 
+    GsDrawCommand makeFeedbackNearestDepthCt32TriangleCommand(
+        uint64_t sequence,
+        GSPrimType primitiveType = GS_PRIM_TRISTRIP)
+    {
+        GSPrimReg primitive{};
+        primitive.type = primitiveType;
+        primitive.tme = true;
+        primitive.abe = true;
+
+        GSContext context{};
+        context.frame = {4u, 1u, GS_PSM_CT32, 0x00FFFFFFu};
+        context.scissor = {0u, 63u, 0u, 31u};
+        context.tex0 = {
+            4u << 5u, 1u, GS_PSM_CT32, 6u, 5u,
+            1u, 0u, 0u, GS_PSM_CT32, 0u, 0u, 0u};
+        context.zbuf = {200u, GS_PSM_Z24, false};
+        context.test =
+            1ull |          // ATE=1, ATST=NEVER.
+            (1ull << 12u) | // AFAIL=FB_ONLY.
+            (1ull << 16u) | // ZTE=1.
+            (2ull << 17u);  // ZTST=GEQUAL.
+        context.alpha = 0x8000000044ull;
+
+        GsDrawGlobalState global{};
+        global.colorClamp = true;
+
+        constexpr std::array<uint16_t, 3> rawX{{32u, 640u, 112u}};
+        constexpr std::array<uint16_t, 3> rawY{{32u, 96u, 448u}};
+        constexpr std::array<uint32_t, 3> depth{{
+            0x00102030u,
+            0x00102010u,
+            0x00104000u,
+        }};
+        constexpr std::array<float, 3> s{{0.125f, 0.875f, 0.25f}};
+        constexpr std::array<float, 3> texT{{0.125f, 0.25f, 0.875f}};
+        std::array<GSVertex, 3> vertices{};
+        for (size_t index = 0u; index < vertices.size(); ++index)
+        {
+            vertices[index].x12_4 = rawX[index];
+            vertices[index].y12_4 = rawY[index];
+            vertices[index].z = static_cast<double>(depth[index]);
+            vertices[index].zInteger = depth[index];
+            vertices[index].s = s[index];
+            vertices[index].t = texT[index];
+            vertices[index].q = 1.0f;
+            vertices[index].r = 128u;
+            vertices[index].g = 255u;
+            vertices[index].b = 128u;
+            vertices[index].a = 130u;
+        }
+        return buildGsDrawCommand(
+            sequence, primitive, context, vertices, global);
+    }
+
     GsDrawCommand makeCt32TriangleCommand(
         uint64_t sequence,
         uint32_t framebufferPage,
@@ -2220,7 +2274,8 @@ namespace
             bool exactLinearCt32Sprite_ = true,
             bool exactDepthCt32Sprite_ = true,
             bool exactFeedbackLinearDepthCt32Sprite_ = true,
-            bool exactT8GouraudDepthCt32Triangle_ = false)
+            bool exactT8GouraudDepthCt32Triangle_ = false,
+            bool exactFeedbackNearestDepthCt32Triangle_ = false)
             : behavior(behavior_)
         {
             report.compiled = true;
@@ -2244,6 +2299,8 @@ namespace
                 exactFeedbackLinearDepthCt32Sprite_;
             report.devices[0].exactT8GouraudDepthCt32Triangle =
                 exactT8GouraudDepthCt32Triangle_;
+            report.devices[0].exactFeedbackNearestDepthCt32Triangle =
+                exactFeedbackNearestDepthCt32Triangle_;
         }
 
         void setExactGouraudDepthCt32Triangle(bool exact) noexcept
@@ -2643,6 +2700,110 @@ namespace
             serviceStatistics.pagesDownloaded += pages.count();
             serviceStatistics.bytesDownloaded +=
                 pages.count() * GS_VRAM_PAGE_SIZE;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool downloadFeedbackSnapshot(
+            std::span<uint8_t> destination,
+            std::string *error) override
+        {
+            if (!isHealthy || !feedbackSnapshotValid ||
+                destination.size() != GS_VULKAN_VRAM_SIZE)
+            {
+                ++serviceStatistics
+                      .residentFeedbackSnapshotDownloadsFailed;
+                if (error)
+                    *error = "injected feedback snapshot download failure";
+                return false;
+            }
+            std::copy(
+                feedbackSnapshot.begin(), feedbackSnapshot.end(),
+                destination.begin());
+            ++serviceStatistics.residentFeedbackSnapshotsDownloaded;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool executeResidentFeedbackNearestDepthCt32Triangles(
+            std::span<const uint8_t> uploadedSnapshot,
+            GsVulkanFeedbackSnapshotMode snapshotMode,
+            std::span<const GsVulkanFeedbackNearestDepthCt32Triangle>
+                triangles,
+            std::string *error) override
+        {
+            const bool uploadsHostSnapshot =
+                snapshotMode == GsVulkanFeedbackSnapshotMode::UploadHost;
+            if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::FailResidentDraw ||
+                behavior == Behavior::InvalidOutput || triangles.empty() ||
+                triangles.size() >
+                    GS_VULKAN_MAX_RESIDENT_FEEDBACK_NEAREST_DEPTH_CT32_TRIANGLE_BATCH ||
+                !report.devices[0]
+                     .exactFeedbackNearestDepthCt32Triangle ||
+                (uploadsHostSnapshot &&
+                 uploadedSnapshot.size() != GS_VULKAN_VRAM_SIZE) ||
+                (!uploadsHostSnapshot && !uploadedSnapshot.empty()) ||
+                (snapshotMode ==
+                     GsVulkanFeedbackSnapshotMode::ReuseResident &&
+                 !feedbackSnapshotValid))
+            {
+                serviceStatistics
+                    .feedbackNearestDepthCt32TriangleDrawsFailed +=
+                    triangles.size();
+                ++serviceStatistics
+                      .residentFeedbackNearestDepthCt32TriangleBatchesFailed;
+                if (error)
+                {
+                    *error =
+                        "injected feedback nearest triangle failure";
+                }
+                return false;
+            }
+
+            if (snapshotMode ==
+                GsVulkanFeedbackSnapshotMode::CaptureResident)
+            {
+                feedbackSnapshot = residentVram;
+                feedbackSnapshotValid = true;
+                ++serviceStatistics.residentFeedbackSnapshotsCaptured;
+            }
+            else if (uploadsHostSnapshot)
+            {
+                feedbackSnapshot.assign(
+                    uploadedSnapshot.begin(), uploadedSnapshot.end());
+                feedbackSnapshotValid = true;
+            }
+            else
+            {
+                ++serviceStatistics.residentFeedbackSnapshotsReused;
+            }
+
+            serviceStatistics
+                .feedbackNearestDepthCt32TriangleDrawsCompleted +=
+                triangles.size();
+            for (const auto &triangle : triangles)
+            {
+                serviceStatistics
+                    .feedbackNearestDepthCt32TriangleCandidatePixelsExecuted +=
+                    static_cast<uint64_t>(
+                        triangle.boundsX1 - triangle.boundsX0) *
+                    static_cast<uint64_t>(
+                        triangle.boundsY1 - triangle.boundsY0);
+            }
+            ++serviceStatistics
+                  .residentFeedbackNearestDepthCt32TriangleBatchesCompleted;
+            serviceStatistics
+                .largestResidentFeedbackNearestDepthCt32TriangleBatch =
+                std::max(
+                    serviceStatistics
+                        .largestResidentFeedbackNearestDepthCt32TriangleBatch,
+                    static_cast<uint64_t>(triangles.size()));
+            ++serviceStatistics.queueSubmissions;
+            ++serviceStatistics.shaderDispatches;
+            ++serviceStatistics.fenceWaits;
             if (error)
                 error->clear();
             return true;
@@ -3102,6 +3263,9 @@ namespace
         GsVulkanServiceStatistics serviceStatistics;
         std::vector<uint8_t> residentVram =
             std::vector<uint8_t>(GS_VULKAN_VRAM_SIZE);
+        std::vector<uint8_t> feedbackSnapshot =
+            std::vector<uint8_t>(GS_VULKAN_VRAM_SIZE);
+        bool feedbackSnapshotValid = false;
         bool isHealthy = true;
     };
 
@@ -5101,6 +5265,197 @@ void register_ps2_gs_vulkan_tests()
                     return;
                 }
             }
+        });
+
+        tc.Run("Recursive nearest CT32 triangle preparation retains immutable alpha-only state", [](TestCase &t)
+        {
+            const GsDrawCommand command =
+                makeFeedbackNearestDepthCt32TriangleCommand(26u);
+            GsDrawResources classifiedResources{};
+            const GsBackendDecision classified =
+                classifyGsFeedbackNearestDepthCt32Triangle(
+                    command, &classifiedResources);
+            t.IsTrue(
+                classified.supported,
+                "the measured flat recursive CT32 contract should classify");
+            t.IsTrue(
+                classifiedResources.framebufferWritePages.any(),
+                "the recursive contract should publish its alpha destination");
+            t.IsFalse(
+                classifiedResources.depthWritePages.any(),
+                "NEVER plus FB_ONLY must remove the architecturally dead Z write");
+
+            GsVulkanFeedbackNearestDepthCt32Triangle triangle{};
+            triangle.reserved.fill(0xDEADBEEFu);
+            const GsBackendDecision prepared =
+                prepareGsVulkanFeedbackNearestDepthCt32Triangle(
+                    command, triangle, &classifiedResources);
+            t.IsTrue(
+                prepared.supported,
+                "the recursive contract should publish one shader record");
+            t.Equals(
+                triangle.framebufferBaseBlock, 128u,
+                "FRAME page units should become the aliased texture block");
+            t.Equals(
+                triangle.textureBaseBlock, triangle.framebufferBaseBlock,
+                "the immutable sampler should retain exact framebuffer aliasing");
+            t.Equals(
+                triangle.framebufferWidth, 1u,
+                "the framebuffer width should remain exact");
+            t.Equals(
+                triangle.textureWidth, 1u,
+                "the aliased texture width should remain exact");
+            t.Equals(
+                triangle.depthBaseBlock, 6400u,
+                "the record should retain the disjoint Z24 surface");
+            t.Equals(
+                triangle.depthPsm, static_cast<uint32_t>(GS_PSM_Z24),
+                "the record should retain Z24 GEQUAL reads");
+            t.Equals(
+                triangle.textureSource,
+                GS_VULKAN_TEXTURE_SOURCE_FEEDBACK_SNAPSHOT,
+                "recursive sampling must name the immutable snapshot binding");
+            t.Equals(
+                triangle.rgba, 0x8280FF80u,
+                "flat modulation should use the provoking vertex color");
+            t.IsTrue(
+                triangle.textureDxBits[0] != 0u ||
+                    triangle.textureDxBits[1] != 0u,
+                "varying S should retain a prepared horizontal DDA");
+            t.IsTrue(
+                triangle.depthDyBits[0] != 0u ||
+                    triangle.depthDyBits[1] != 0u,
+                "varying Z should retain a prepared binary64 vertical DDA");
+            t.IsTrue(
+                std::all_of(
+                    triangle.reserved.begin(), triangle.reserved.end(),
+                    [](uint32_t value) { return value == 0u; }),
+                "prepared recursive records should clear reserved data");
+
+            const GsVulkanFeedbackNearestDepthCt32Triangle sentinel =
+                triangle;
+            std::array<GSVertex, 3> varyingQ = command.vertices();
+            varyingQ[1].q = 0.5f;
+            const GsDrawCommand varyingQCommand = buildGsDrawCommand(
+                27u, command.primitive(), command.context(), varyingQ,
+                command.globalState());
+            const GsBackendDecision varyingQDecision =
+                prepareGsVulkanFeedbackNearestDepthCt32Triangle(
+                    varyingQCommand, triangle);
+            t.Equals(
+                varyingQDecision.reason,
+                GsFallbackReason::UnsupportedTextureCoordinates,
+                "the first exact contract should reject perspective-varying Q");
+            t.IsTrue(
+                triangle == sentinel,
+                "rejected Q state must preserve the caller's record");
+
+            GSContext wrongMask = command.context();
+            wrongMask.frame.fbmsk = 0u;
+            const GsDrawCommand wrongMaskCommand = buildGsDrawCommand(
+                28u, command.primitive(), wrongMask, command.vertices(),
+                command.globalState());
+            t.Equals(
+                classifyGsFeedbackNearestDepthCt32Triangle(
+                    wrongMaskCommand).reason,
+                GsFallbackReason::FramebufferMask,
+                "RGB writes should remain outside the alpha-only contract");
+
+            GSContext wrongAlias = command.context();
+            ++wrongAlias.tex0.tbp0;
+            const GsDrawCommand wrongAliasCommand = buildGsDrawCommand(
+                29u, command.primitive(), wrongAlias, command.vertices(),
+                command.globalState());
+            t.Equals(
+                classifyGsFeedbackNearestDepthCt32Triangle(
+                    wrongAliasCommand).reason,
+                GsFallbackReason::ResourceAlias,
+                "the immutable contract should require exact framebuffer texture aliasing");
+
+            const GsDrawCommand fan =
+                makeFeedbackNearestDepthCt32TriangleCommand(
+                    30u, GS_PRIM_TRIFAN);
+            t.IsTrue(
+                classifyGsFeedbackNearestDepthCt32Triangle(fan).supported,
+                "assembled triangle fans should share the exact record contract");
+        });
+
+        tc.Run("Device feedback capture includes every CPU-newer VRAM page", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command =
+                makeFeedbackNearestDepthCt32TriangleCommand(31u);
+            std::vector<uint8_t> vram =
+                makeVramPattern(0x46554C4Cu);
+            const std::vector<uint8_t> expectedSnapshot = vram;
+            uint64_t softwareCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::GpuStrict;
+            std::string creationError;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Noop,
+                        true, true, true, true, true, false, true),
+                    config, vram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++softwareCalls;
+                    },
+                    {}, &creationError, {}, {}, {},
+                    []() -> GsVulkanFeedbackSnapshotIdentity
+                    {
+                        return {77u, true};
+                    });
+            t.IsNotNull(
+                backend.get(),
+                "an exact injected feedback backend should construct");
+            if (!backend)
+            {
+                t.Fail("feedback backend creation failed: " + creationError);
+                return;
+            }
+            t.IsTrue(
+                backend->classify(command).supported,
+                "the injected backend should admit the recursive triangle");
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+            t.Equals(
+                backend->pendingCommandCount(), size_t{1u},
+                "the device capture should stay deferred with its draw");
+
+            std::vector<uint8_t> captured(GS_VULKAN_VRAM_SIZE, 0u);
+            std::string materializationError;
+            t.IsTrue(
+                backend->materializeFeedbackSnapshot(
+                    captured, &materializationError),
+                "the complete resident snapshot should materialize");
+            if (!materializationError.empty())
+            {
+                t.Fail(
+                    "feedback materialization failed: " +
+                    materializationError);
+            }
+            t.IsTrue(
+                captured == expectedSnapshot,
+                "device capture must include CPU-newer pages outside the current draw resources");
+            t.Equals(
+                softwareCalls, 0ull,
+                "strict device capture must not invoke software fallback");
+
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(
+                service.pagesUploaded,
+                static_cast<uint64_t>(GS_VRAM_PAGE_COUNT),
+                "the first complete snapshot should establish every CPU-owned page");
+            t.Equals(
+                service.residentFeedbackSnapshotsCaptured, 1ull,
+                "the deferred draw should capture one immutable device image");
+            t.Equals(
+                service.residentFeedbackSnapshotsDownloaded, 1ull,
+                "the architectural observation should download that image once");
         });
 
         tc.Run("CT32 triangle preparation normalizes exact fixed-point edges", [](TestCase &t)
@@ -17632,6 +17987,129 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(
                 after.validationWarnings, 0u,
                 "framebuffer-only execution should emit no validation warnings");
+            service->shutdown();
+        });
+
+        tc.Run("Vulkan resident feedback snapshots survive canonical interruptions", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command =
+                makeFeedbackNearestDepthCt32TriangleCommand(30'150u);
+            GsVulkanFeedbackNearestDepthCt32Triangle triangle{};
+            const GsBackendDecision decision =
+                prepareGsVulkanFeedbackNearestDepthCt32Triangle(
+                    command, triangle);
+            if (!decision.supported)
+            {
+                t.Fail(
+                    "the resident recursive triangle fixture was rejected as " +
+                    std::string(gsFallbackReasonName(decision.reason)));
+                return;
+            }
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(
+                    service.get(),
+                    "an unavailable host should skip recursive snapshot execution cleanly");
+                return;
+            }
+            t.IsNotNull(
+                service.get(),
+                "a suitable device should create the recursive snapshot service");
+            if (!service)
+                return;
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(
+                selected,
+                "the recursive snapshot service should retain its device");
+            if (!selected ||
+                !selected->exactFeedbackNearestDepthCt32Triangle)
+            {
+                service->shutdown();
+                return;
+            }
+
+            GsVramPageMask allPages;
+            allPages.setAll();
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x52464331u);
+            const std::vector<uint8_t> interrupted =
+                makeVramPattern(0x52464332u);
+            std::string operationError;
+            t.IsTrue(
+                service->uploadVramPages(
+                    initial, allPages, &operationError),
+                "the recursive fixture should establish resident canonical VRAM");
+            if (!operationError.empty())
+                t.Fail("initial recursive upload failed: " + operationError);
+
+            const std::span<const GsVulkanFeedbackNearestDepthCt32Triangle>
+                triangles(&triangle, 1u);
+            t.IsTrue(
+                service->executeResidentFeedbackNearestDepthCt32Triangles(
+                    {}, GsVulkanFeedbackSnapshotMode::CaptureResident,
+                    triangles, &operationError),
+                "the first recursive request should capture device VRAM");
+            if (!operationError.empty())
+                t.Fail("recursive capture failed: " + operationError);
+
+            std::vector<uint8_t> captured(GS_VULKAN_VRAM_SIZE);
+            t.IsTrue(
+                service->downloadFeedbackSnapshot(
+                    captured, &operationError),
+                "an architectural boundary should materialize the snapshot");
+            t.IsTrue(
+                captured == initial,
+                "triangle writes must not mutate their immutable source snapshot");
+
+            t.IsTrue(
+                service->uploadVramPages(
+                    interrupted, allPages, &operationError),
+                "the fixture should interrupt canonical VRAM independently");
+            t.IsTrue(
+                service->executeResidentFeedbackNearestDepthCt32Triangles(
+                    {}, GsVulkanFeedbackSnapshotMode::ReuseResident,
+                    triangles, &operationError),
+                "a later recursive batch should reuse the original snapshot");
+            std::vector<uint8_t> reused(GS_VULKAN_VRAM_SIZE);
+            t.IsTrue(
+                service->downloadFeedbackSnapshot(
+                    reused, &operationError),
+                "the reused snapshot should remain materializable");
+            t.IsTrue(
+                reused == initial,
+                "canonical writes between batches must not replace the immutable snapshot");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            t.Equals(
+                statistics.residentFeedbackSnapshotsCaptured, 1ull,
+                "the first batch should perform one device copy");
+            t.Equals(
+                statistics.residentFeedbackSnapshotsReused, 1ull,
+                "the interrupted batch should perform one immutable reuse");
+            t.Equals(
+                statistics.residentFeedbackSnapshotsDownloaded, 2ull,
+                "both explicit architectural observations should be counted");
+            t.Equals(
+                statistics.residentFeedbackSnapshotDownloadsFailed, 0ull,
+                "valid materialization should never count a failure");
+            t.Equals(
+                statistics.validationErrors, 0u,
+                "snapshot capture, reuse, and download must remain validation-clean");
+            t.Equals(
+                statistics.validationWarnings, 0u,
+                "snapshot lifecycle operations should emit no warnings");
             service->shutdown();
         });
 

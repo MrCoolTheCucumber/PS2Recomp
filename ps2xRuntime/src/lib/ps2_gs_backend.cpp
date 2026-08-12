@@ -1264,6 +1264,157 @@ GsBackendDecision classifyGsFeedbackLinearDepthCt32Sprite(
         AliasRequirement::ExactFramebufferTextureFeedback);
 }
 
+GsBackendDecision classifyGsFeedbackNearestDepthCt32Triangle(
+    const GsDrawCommand &command,
+    GsDrawResources *supportedResources) noexcept
+{
+    const GSPrimReg &primitive = command.primitive();
+    const GSContext &context = command.context();
+    const GsDrawGlobalState &global = command.globalState();
+    const GsDrawBounds &bounds = command.bounds();
+
+    if (bounds.empty())
+        return {false, GsFallbackReason::EmptyBounds};
+    if (!bounds.exact)
+        return {false, GsFallbackReason::InexactBounds};
+    if (primitive.type != GS_PRIM_TRIANGLE &&
+        primitive.type != GS_PRIM_TRISTRIP &&
+        primitive.type != GS_PRIM_TRIFAN)
+    {
+        return {false, GsFallbackReason::UnsupportedPrimitive};
+    }
+    if (command.vertexCount() != 3u || primitive.iip ||
+        !primitive.tme || primitive.fst || primitive.fge ||
+        primitive.aa1 || primitive.fix)
+    {
+        return {false, GsFallbackReason::UnsupportedPrimitiveState};
+    }
+    if (context.frame.psm != GS_PSM_CT32)
+        return {false, GsFallbackReason::UnsupportedFramebufferFormat};
+    // RGB is architecturally retained by FBMSK. Alpha itself is never
+    // blended on GS, so this standard equation still publishes source alpha.
+    if (context.frame.fbmsk != 0x00FFFFFFu)
+        return {false, GsFallbackReason::FramebufferMask};
+    if (!isSourceOverAlphaBlend(primitive, context, global))
+        return {false, GsFallbackReason::AlphaBlend};
+
+    const bool alphaTestEnabled = (context.test & 1u) != 0u;
+    const uint8_t alphaTestMethod =
+        static_cast<uint8_t>((context.test >> 1u) & 0x7u);
+    const uint8_t alphaFailMethod =
+        static_cast<uint8_t>((context.test >> 12u) & 0x3u);
+    if (!alphaTestEnabled || alphaTestMethod != 0u ||
+        alphaFailMethod != 1u)
+    {
+        return {false, GsFallbackReason::AlphaTest};
+    }
+    if (((context.test >> 14u) & 1u) != 0u)
+        return {false, GsFallbackReason::DestinationAlphaTest};
+    if ((context.fba & 1u) != 0u)
+    {
+        return {
+            false,
+            GsFallbackReason::FramebufferAlphaCorrection};
+    }
+    if (global.dither)
+        return {false, GsFallbackReason::Dither};
+    if (global.scanMask != 0u)
+        return {false, GsFallbackReason::ScanMask};
+
+    if (context.tex0.psm != GS_PSM_CT32)
+        return {false, GsFallbackReason::UnsupportedTextureFormat};
+    if (context.tex0.tcc != 1u || context.tex0.tfx != 0u)
+    {
+        return {
+            false,
+            GsFallbackReason::UnsupportedTextureFunction};
+    }
+    if (context.tex0.tbw == 0u || context.tex0.tbw > 0x3Fu ||
+        context.tex0.tw > 10u || context.tex0.th > 10u)
+    {
+        return {false, GsFallbackReason::UnsupportedTextureState};
+    }
+    const uint8_t maximumMipLevel =
+        static_cast<uint8_t>((context.tex1 >> 2u) & 0x7u);
+    const uint8_t magnificationFilter =
+        static_cast<uint8_t>((context.tex1 >> 5u) & 0x1u);
+    const uint8_t minificationFilter =
+        static_cast<uint8_t>((context.tex1 >> 6u) & 0x7u);
+    if (maximumMipLevel != 0u || magnificationFilter != 0u ||
+        minificationFilter != 0u)
+    {
+        return {false, GsFallbackReason::UnsupportedTextureFilter};
+    }
+    const uint8_t wrapModeU =
+        static_cast<uint8_t>(context.clamp & 0x3u);
+    const uint8_t wrapModeV =
+        static_cast<uint8_t>((context.clamp >> 2u) & 0x3u);
+    if (wrapModeU > 1u || wrapModeV > 1u)
+        return {false, GsFallbackReason::UnsupportedTextureWrap};
+
+    const bool depthTestEnabled =
+        ((context.test >> 16u) & 1u) != 0u;
+    const uint8_t depthTestMethod =
+        static_cast<uint8_t>((context.test >> 17u) & 0x3u);
+    if ((context.zbuf.psm != GS_PSM_Z32 &&
+         context.zbuf.psm != GS_PSM_Z24) ||
+        !depthTestEnabled || depthTestMethod != 2u)
+    {
+        return {false, GsFallbackReason::UnsupportedDepthFunction};
+    }
+    if (!ct32RectangleHasUniqueWords(
+            bounds,
+            std::max<uint32_t>(context.frame.fbw, 1u)))
+    {
+        return {false, GsFallbackReason::UnknownMemoryLayout};
+    }
+
+    const auto &vertices = command.vertices();
+    for (const GSVertex &vertex : vertices)
+    {
+        if (!std::isfinite(vertex.s) ||
+            !std::isfinite(vertex.t) ||
+            !std::isfinite(vertex.q))
+        {
+            return {
+                false,
+                GsFallbackReason::UnsupportedTextureCoordinates};
+        }
+    }
+    // This first point-sampled contract retains the software rasterizer's
+    // constant-Q fixed scanline path. Variable Q remains with the broader
+    // perspective fallback until it has an independently verified crossover.
+    if (vertices[0].q != vertices[1].q ||
+        vertices[1].q != vertices[2].q)
+    {
+        return {
+            false,
+            GsFallbackReason::UnsupportedTextureCoordinates};
+    }
+
+    GsDrawResources resources = command.resources();
+    if (resources.unknownMemoryLayout)
+        return {false, GsFallbackReason::UnknownMemoryLayout};
+    const bool exactFeedbackSurface =
+        resources.framebufferTextureAlias &&
+        !resources.framebufferDepthAlias &&
+        !resources.framebufferClutAlias &&
+        context.tex0.tbp0 == (context.frame.fbp << 5u) &&
+        context.tex0.tbw ==
+            std::max<uint32_t>(context.frame.fbw, 1u);
+    if (!exactFeedbackSurface)
+        return {false, GsFallbackReason::ResourceAlias};
+
+    // Alpha NEVER + FB_ONLY suppresses the Z write regardless of ZMASK. The
+    // generic resource description cannot encode that conditional outcome,
+    // so remove only the proven-dead write from resident ownership tracking.
+    resources.depthWritePages.clear();
+    resources.writePages = resources.framebufferWritePages;
+    if (supportedResources)
+        *supportedResources = resources;
+    return {true, GsFallbackReason::Supported};
+}
+
 GsBackendDecision classifyGsFlatCt32Triangle(
     const GsDrawCommand &command) noexcept
 {
@@ -1498,6 +1649,16 @@ GsRendererMode GsBackendRouter::mode() const noexcept
 bool GsBackendRouter::hasAcceleratedBackend() const noexcept
 {
     return m_acceleratedBackend != nullptr;
+}
+
+bool GsBackendRouter::canCaptureFeedbackSnapshotOnDevice(
+    const GsDrawCommand &command) const noexcept
+{
+    return (m_mode == GsRendererMode::Hybrid ||
+            m_mode == GsRendererMode::GpuStrict) &&
+           m_acceleratedBackend &&
+           m_acceleratedBackend->canCaptureFeedbackSnapshotOnDevice(
+               command);
 }
 
 GsSubmissionResult GsBackendRouter::submit(

@@ -1006,6 +1006,166 @@ namespace
         return nullptr;
     }
 
+    const char *feedbackNearestDepthCt32TriangleValidationError(
+        const GsVulkanFeedbackNearestDepthCt32Triangle &triangle) noexcept
+    {
+        if (triangle.framebufferBaseBlock > 0x3FFFu ||
+            triangle.depthBaseBlock > 0x3FFFu ||
+            triangle.textureBaseBlock > 0x3FFFu)
+        {
+            return "Vulkan feedback nearest triangle surface base is outside GS VRAM";
+        }
+        if (triangle.framebufferWidth == 0u ||
+            triangle.framebufferWidth > 0x3Fu ||
+            triangle.textureWidth == 0u ||
+            triangle.textureWidth > 0x3Fu)
+        {
+            return "Vulkan feedback nearest triangle surface width is invalid";
+        }
+        if (triangle.boundsX0 >= triangle.boundsX1 ||
+            triangle.boundsY0 >= triangle.boundsY1 ||
+            triangle.boundsX1 > 2048u || triangle.boundsY1 > 2048u)
+        {
+            return "Vulkan feedback nearest triangle bounds are invalid";
+        }
+        if (triangle.depthPsm != GS_PSM_Z32 &&
+            triangle.depthPsm != GS_PSM_Z24)
+        {
+            return "Vulkan feedback nearest triangle depth format is invalid";
+        }
+        if (triangle.positiveArea > 1u ||
+            (triangle.topLeftEdgeMask & ~0x7u) != 0u)
+        {
+            return "Vulkan feedback nearest triangle winding data is invalid";
+        }
+        if (triangle.textureWidthLog2 > 10u ||
+            triangle.textureHeightLog2 > 10u ||
+            triangle.textureWrapU > 1u ||
+            triangle.textureWrapV > 1u)
+        {
+            return "Vulkan feedback nearest triangle texture state is invalid";
+        }
+        if (triangle.textureSource !=
+                GS_VULKAN_TEXTURE_SOURCE_FEEDBACK_SNAPSHOT ||
+            std::any_of(
+                triangle.reserved.begin(), triangle.reserved.end(),
+                [](uint32_t value) { return value != 0u; }))
+        {
+            return "Vulkan feedback nearest triangle snapshot state is invalid";
+        }
+        if (triangle.textureBaseBlock !=
+                triangle.framebufferBaseBlock ||
+            triangle.textureWidth != triangle.framebufferWidth)
+        {
+            return "Vulkan feedback nearest triangle does not name one exact recursive surface";
+        }
+
+        constexpr int32_t kMinimumWindowFixed = -65535;
+        constexpr int32_t kMaximumWindowFixed = 65535;
+        std::array<FixedTriangleVertex, 3> vertices{};
+        for (size_t index = 0u; index < vertices.size(); ++index)
+        {
+            vertices[index] = {
+                triangle.vertexX12_4[index],
+                triangle.vertexY12_4[index]};
+            if (vertices[index].x < kMinimumWindowFixed ||
+                vertices[index].x > kMaximumWindowFixed ||
+                vertices[index].y < kMinimumWindowFixed ||
+                vertices[index].y > kMaximumWindowFixed)
+            {
+                return "Vulkan feedback nearest triangle vertex is outside GS window range";
+            }
+        }
+        const int64_t signedArea =
+            triangleEdge(vertices[0], vertices[1], vertices[2]);
+        if (signedArea == 0 ||
+            (signedArea > 0) != (triangle.positiveArea != 0u))
+        {
+            return "Vulkan feedback nearest triangle winding is inconsistent";
+        }
+        const bool positiveArea = signedArea > 0;
+        const auto orientedTopLeft =
+            [positiveArea](
+                const FixedTriangleVertex &a,
+                const FixedTriangleVertex &b)
+        {
+            return positiveArea
+                ? isTopLeftEdge(a, b)
+                : isTopLeftEdge(b, a);
+        };
+        const uint32_t expectedTopLeftMask =
+            (orientedTopLeft(vertices[1], vertices[2]) ? 1u : 0u) |
+            (orientedTopLeft(vertices[2], vertices[0]) ? 2u : 0u) |
+            (orientedTopLeft(vertices[0], vertices[1]) ? 4u : 0u);
+        if (triangle.topLeftEdgeMask != expectedTopLeftMask)
+            return "Vulkan feedback nearest triangle edge mask is inconsistent";
+
+        const auto finiteFloatBits = [](uint32_t bits)
+        {
+            return std::isfinite(std::bit_cast<float>(bits));
+        };
+        if (!std::all_of(
+                triangle.sBits.begin(), triangle.sBits.end(),
+                finiteFloatBits) ||
+            !std::all_of(
+                triangle.tBits.begin(), triangle.tBits.end(),
+                finiteFloatBits) ||
+            !std::all_of(
+                triangle.textureDxBits.begin(),
+                triangle.textureDxBits.end(), finiteFloatBits) ||
+            !std::all_of(
+                triangle.textureDyBits.begin(),
+                triangle.textureDyBits.end(), finiteFloatBits))
+        {
+            return "Vulkan feedback nearest triangle contains non-finite texture setup";
+        }
+        const auto unpackDouble = [](const std::array<uint32_t, 2> &bits)
+        {
+            const uint64_t packed =
+                static_cast<uint64_t>(bits[0]) |
+                (static_cast<uint64_t>(bits[1]) << 32u);
+            return std::bit_cast<double>(packed);
+        };
+        if (!std::isfinite(unpackDouble(triangle.depthDxBits)) ||
+            !std::isfinite(unpackDouble(triangle.depthDyBits)))
+        {
+            return "Vulkan feedback nearest triangle contains non-finite depth setup";
+        }
+        if (!ct32RectangleHasUniqueWords(
+                triangle.boundsX0,
+                triangle.boundsY0,
+                triangle.boundsX1,
+                triangle.boundsY1,
+                triangle.framebufferWidth))
+        {
+            return "Vulkan feedback nearest triangle destination aliases itself";
+        }
+
+        const uint32_t width = triangle.boundsX1 - triangle.boundsX0;
+        const uint32_t height = triangle.boundsY1 - triangle.boundsY0;
+        const GsVramPageMask framebufferPages =
+            gsVramPagesForSurfaceRect(
+                triangle.framebufferBaseBlock,
+                triangle.framebufferWidth,
+                GS_PSM_CT32,
+                triangle.boundsX0,
+                triangle.boundsY0,
+                width,
+                height);
+        const GsVramPageMask depthPages =
+            gsVramPagesForSurfaceRect(
+                triangle.depthBaseBlock,
+                triangle.framebufferWidth,
+                static_cast<uint8_t>(triangle.depthPsm),
+                triangle.boundsX0,
+                triangle.boundsY0,
+                width,
+                height);
+        if (framebufferPages.intersects(depthPages))
+            return "Vulkan feedback nearest triangle color and depth alias";
+        return nullptr;
+    }
+
     bool validateResidentCt32SpriteBatch(
         std::span<const GsVulkanCt32Sprite> sprites,
         std::string &error)
@@ -1251,6 +1411,38 @@ namespace
             {
                 error =
                     "Vulkan resident T8 Gouraud depth CT32 triangle " +
+                    std::to_string(index) + ": " + validationError;
+                return false;
+            }
+        }
+        error.clear();
+        return true;
+    }
+
+    bool validateResidentFeedbackNearestDepthCt32TriangleBatch(
+        std::span<
+            const GsVulkanFeedbackNearestDepthCt32Triangle> triangles,
+        std::string &error)
+    {
+        if (triangles.empty() ||
+            triangles.size() >
+                GS_VULKAN_MAX_RESIDENT_FEEDBACK_NEAREST_DEPTH_CT32_TRIANGLE_BATCH)
+        {
+            error =
+                "Vulkan resident feedback nearest depth CT32 triangle batches require between 1 and " +
+                std::to_string(
+                    GS_VULKAN_MAX_RESIDENT_FEEDBACK_NEAREST_DEPTH_CT32_TRIANGLE_BATCH) +
+                " records";
+            return false;
+        }
+        for (size_t index = 0u; index < triangles.size(); ++index)
+        {
+            if (const char *validationError =
+                    feedbackNearestDepthCt32TriangleValidationError(
+                        triangles[index]))
+            {
+                error =
+                    "Vulkan resident feedback nearest depth CT32 triangle " +
                     std::to_string(index) + ": " + validationError;
                 return false;
             }
@@ -2120,6 +2312,194 @@ GsBackendDecision prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
     if (gouraudDepthCt32TriangleValidationError(prepared))
         return {false, GsFallbackReason::UnknownMemoryLayout};
 
+    triangle = prepared;
+    return decision;
+}
+
+GsBackendDecision
+prepareGsVulkanFeedbackNearestDepthCt32Triangle(
+    const GsDrawCommand &command,
+    GsVulkanFeedbackNearestDepthCt32Triangle &triangle,
+    const GsDrawResources *classifiedResources) noexcept
+{
+    const GsBackendDecision decision = classifiedResources
+        ? GsBackendDecision{true, GsFallbackReason::Supported}
+        : classifyGsFeedbackNearestDepthCt32Triangle(command);
+    if (!decision.supported)
+        return decision;
+
+    const GSContext &context = command.context();
+    const GsDrawBounds &bounds = command.bounds();
+    const auto &vertices = command.vertices();
+    const std::array<FixedTriangleVertex, 3> fixedVertices{{
+        {command.fixedX()[0], command.fixedY()[0]},
+        {command.fixedX()[1], command.fixedY()[1]},
+        {command.fixedX()[2], command.fixedY()[2]},
+    }};
+    const int64_t signedArea = triangleEdge(
+        fixedVertices[0], fixedVertices[1], fixedVertices[2]);
+    if (signedArea == 0)
+        return {false, GsFallbackReason::UnsupportedPrimitiveState};
+    const bool positiveArea = signedArea > 0;
+    const auto orientedTopLeft =
+        [positiveArea](
+            const FixedTriangleVertex &a,
+            const FixedTriangleVertex &b)
+    {
+        return positiveArea
+            ? isTopLeftEdge(a, b)
+            : isTopLeftEdge(b, a);
+    };
+    const auto packRgba = [](const GSVertex &vertex)
+    {
+        return static_cast<uint32_t>(vertex.r) |
+               (static_cast<uint32_t>(vertex.g) << 8u) |
+               (static_cast<uint32_t>(vertex.b) << 16u) |
+               (static_cast<uint32_t>(vertex.a) << 24u);
+    };
+    const auto packDoubleBits = [](double value)
+    {
+        const uint64_t bits = std::bit_cast<uint64_t>(value);
+        return std::array<uint32_t, 2>{
+            static_cast<uint32_t>(bits),
+            static_cast<uint32_t>(bits >> 32u)};
+    };
+
+    struct SortedVertex
+    {
+        size_t index;
+        float x;
+        float y;
+    };
+    std::array<SortedVertex, 3> sorted{{
+        {0u, static_cast<float>(fixedVertices[0].x) / 16.0f,
+         static_cast<float>(fixedVertices[0].y) / 16.0f},
+        {1u, static_cast<float>(fixedVertices[1].x) / 16.0f,
+         static_cast<float>(fixedVertices[1].y) / 16.0f},
+        {2u, static_cast<float>(fixedVertices[2].x) / 16.0f,
+         static_cast<float>(fixedVertices[2].y) / 16.0f},
+    }};
+    if (sorted[1].y < sorted[0].y)
+        std::swap(sorted[0], sorted[1]);
+    if (sorted[2].y < sorted[1].y)
+        std::swap(sorted[1], sorted[2]);
+    if (sorted[1].y < sorted[0].y)
+        std::swap(sorted[0], sorted[1]);
+    const float gradientDx01 = sorted[1].x - sorted[0].x;
+    const float gradientDy01 = sorted[1].y - sorted[0].y;
+    const float gradientDx02 = sorted[2].x - sorted[0].x;
+    const float gradientDy02 = sorted[2].y - sorted[0].y;
+    const float gradientCross = std::fma(
+        gradientDy01,
+        gradientDx02,
+        -(gradientDx01 * gradientDy02));
+    if (gradientCross == 0.0f || !std::isfinite(gradientCross))
+        return {false, GsFallbackReason::UnsupportedPrimitiveState};
+    const float gradientX01OverCross =
+        gradientDx01 / gradientCross;
+    const float gradientY01OverCross =
+        gradientDy01 / gradientCross;
+    const float gradientX02OverCross =
+        gradientDx02 / gradientCross;
+    const float gradientY02OverCross =
+        gradientDy02 / gradientCross;
+
+    GsVulkanFeedbackNearestDepthCt32Triangle prepared{};
+    prepared.framebufferBaseBlock = context.frame.fbp << 5u;
+    prepared.framebufferWidth =
+        std::max<uint32_t>(context.frame.fbw, 1u);
+    prepared.boundsX0 = static_cast<uint32_t>(bounds.x0);
+    prepared.boundsY0 = static_cast<uint32_t>(bounds.y0);
+    prepared.boundsX1 = static_cast<uint32_t>(bounds.x1);
+    prepared.boundsY1 = static_cast<uint32_t>(bounds.y1);
+    prepared.depthBaseBlock = context.zbuf.zbp << 5u;
+    prepared.depthPsm = context.zbuf.psm;
+    prepared.positiveArea = positiveArea ? 1u : 0u;
+    prepared.topLeftEdgeMask =
+        (orientedTopLeft(fixedVertices[1], fixedVertices[2]) ? 1u : 0u) |
+        (orientedTopLeft(fixedVertices[2], fixedVertices[0]) ? 2u : 0u) |
+        (orientedTopLeft(fixedVertices[0], fixedVertices[1]) ? 4u : 0u);
+    const float textureScaleU =
+        static_cast<float>(65536u << context.tex0.tw);
+    const float textureScaleV =
+        static_cast<float>(65536u << context.tex0.th);
+    const auto finiteQ = [](float q)
+    {
+        return std::fabs(q) > 1.0e-8f ? q : 1.0f;
+    };
+    for (size_t index = 0u; index < 3u; ++index)
+    {
+        prepared.vertexX12_4[index] = fixedVertices[index].x;
+        prepared.vertexY12_4[index] = fixedVertices[index].y;
+        prepared.vertexZ[index] = vertices[index].zInteger;
+        const float q = finiteQ(vertices[index].q);
+        prepared.sBits[index] = std::bit_cast<uint32_t>(
+            (vertices[index].s / q) * textureScaleU);
+        prepared.tBits[index] = std::bit_cast<uint32_t>(
+            (vertices[index].t / q) * textureScaleV);
+    }
+    prepared.rgba = packRgba(vertices[2]);
+
+    const auto gradient =
+        [&](double top, double middle, double bottom)
+    {
+        const double delta01 = middle - top;
+        const double delta02 = bottom - top;
+        return std::pair<double, double>{
+            std::fma(
+                delta02,
+                static_cast<double>(gradientY01OverCross),
+                -(delta01 *
+                  static_cast<double>(gradientY02OverCross))),
+            std::fma(
+                delta01,
+                static_cast<double>(gradientX02OverCross),
+                -(delta02 *
+                  static_cast<double>(gradientX01OverCross)))};
+    };
+    {
+        const auto [dx, dy] = gradient(
+            static_cast<double>(vertices[sorted[0].index].zInteger),
+            static_cast<double>(vertices[sorted[1].index].zInteger),
+            static_cast<double>(vertices[sorted[2].index].zInteger));
+        prepared.depthDxBits = packDoubleBits(dx);
+        prepared.depthDyBits = packDoubleBits(dy);
+    }
+    for (size_t component = 0u; component < 2u; ++component)
+    {
+        const auto value = [&](size_t sortedIndex)
+        {
+            const size_t index = sorted[sortedIndex].index;
+            return std::bit_cast<float>(
+                component == 0u
+                    ? prepared.sBits[index]
+                    : prepared.tBits[index]);
+        };
+        const float top = value(0u);
+        const float delta01 = value(1u) - top;
+        const float delta02 = value(2u) - top;
+        prepared.textureDxBits[component] =
+            std::bit_cast<uint32_t>(std::fma(
+                delta02,
+                gradientY01OverCross,
+                -(delta01 * gradientY02OverCross)));
+        prepared.textureDyBits[component] =
+            std::bit_cast<uint32_t>(std::fma(
+                delta01,
+                gradientX02OverCross,
+                -(delta02 * gradientX01OverCross)));
+    }
+    prepared.textureBaseBlock = context.tex0.tbp0;
+    prepared.textureWidth = context.tex0.tbw;
+    prepared.textureWidthLog2 = context.tex0.tw;
+    prepared.textureHeightLog2 = context.tex0.th;
+    prepared.textureWrapU =
+        static_cast<uint32_t>(context.clamp & 0x3u);
+    prepared.textureWrapV =
+        static_cast<uint32_t>((context.clamp >> 2u) & 0x3u);
+
+    if (feedbackNearestDepthCt32TriangleValidationError(prepared))
+        return {false, GsFallbackReason::UnknownMemoryLayout};
     triangle = prepared;
     return decision;
 }
@@ -3197,6 +3577,9 @@ GsVulkanCapabilityReport probeGsVulkanCapabilities(
         device.exactNearestCt32Sprite = device.suitable;
         device.exactLinearCt32Sprite = device.suitable;
         device.exactFeedbackLinearDepthCt32Sprite = device.suitable;
+        device.exactFeedbackNearestDepthCt32Triangle =
+            device.suitable && device.shaderInt64 &&
+            device.shaderFloat64;
 
         if (device.kind == GsVulkanDeviceKind::Cpu)
             device.rejectionReason = "CPU Vulkan implementations are not hardware-GS targets";
@@ -3242,6 +3625,7 @@ namespace
 #include "shaders/ps2_gs_ct32_sprite_spv.inc"
 #include "shaders/ps2_gs_depth_ct32_sprite_spv.inc"
 #include "shaders/ps2_gs_feedback_linear_depth_ct32_sprite_spv.inc"
+#include "shaders/ps2_gs_feedback_nearest_depth_ct32_triangle_spv.inc"
 #include "shaders/ps2_gs_gouraud_depth_ct32_triangle_spv.inc"
 #include "shaders/ps2_gs_t8_gouraud_depth_ct32_triangle_spv.inc"
 #include "shaders/ps2_gs_ct32_triangle_spv.inc"
@@ -3258,6 +3642,10 @@ namespace
         sizeof(kGsFeedbackLinearDepthCt32SpriteShaderSpv) == 46420u);
     static_assert(
         kGsFeedbackLinearDepthCt32SpriteShaderSpv[0] == 0x07230203u);
+    static_assert(
+        sizeof(kGsFeedbackNearestDepthCt32TriangleShaderSpv) == 67552u);
+    static_assert(
+        kGsFeedbackNearestDepthCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(
         sizeof(kGsGouraudDepthCt32TriangleShaderSpv) == 61112u);
     static_assert(
@@ -3609,6 +3997,11 @@ namespace
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
+        bool downloadFeedbackSnapshot(
+            std::span<uint8_t> destination,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
         bool executeResidentCt32Sprites(
             std::span<const GsVulkanCt32Sprite> sprites,
             GsVulkanCapabilityReport &report,
@@ -3622,6 +4015,14 @@ namespace
         bool executeResidentFeedbackLinearDepthCt32Sprites(
             std::span<const uint8_t> feedbackSnapshot,
             std::span<const GsVulkanFeedbackLinearDepthCt32Sprite> sprites,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
+        bool executeResidentFeedbackNearestDepthCt32Triangles(
+            std::span<const uint8_t> feedbackSnapshot,
+            GsVulkanFeedbackSnapshotMode snapshotMode,
+            std::span<
+                const GsVulkanFeedbackNearestDepthCt32Triangle> triangles,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
@@ -3782,6 +4183,10 @@ namespace
             VK_NULL_HANDLE;
         VkPipeline m_feedbackLinearDepthCt32SpritePipeline =
             VK_NULL_HANDLE;
+        VkShaderModule m_feedbackNearestDepthCt32TriangleShaderModule =
+            VK_NULL_HANDLE;
+        VkPipeline m_feedbackNearestDepthCt32TrianglePipeline =
+            VK_NULL_HANDLE;
         VkShaderModule m_triangleShaderModule = VK_NULL_HANDLE;
         VkPipeline m_trianglePipeline = VK_NULL_HANDLE;
         VkShaderModule m_gouraudDepthCt32TriangleShaderModule =
@@ -3802,6 +4207,8 @@ namespace
         bool m_exactCt32Triangle = false;
         bool m_exactGouraudDepthCt32Triangle = false;
         bool m_exactT8GouraudDepthCt32Triangle = false;
+        bool m_exactFeedbackNearestDepthCt32Triangle = false;
+        bool m_feedbackSnapshotResidentValid = false;
         bool m_healthy = false;
     };
 
@@ -4146,11 +4553,13 @@ namespace
         enabledFeatures.shaderInt64 =
             (selected.exactCt32Triangle ||
              selected.exactGouraudDepthCt32Triangle ||
-             selected.exactT8GouraudDepthCt32Triangle)
+             selected.exactT8GouraudDepthCt32Triangle ||
+             selected.exactFeedbackNearestDepthCt32Triangle)
                 ? VK_TRUE
                 : VK_FALSE;
         enabledFeatures.shaderFloat64 =
-            selected.exactT8GouraudDepthCt32Triangle
+            (selected.exactT8GouraudDepthCt32Triangle ||
+             selected.exactFeedbackNearestDepthCt32Triangle)
                 ? VK_TRUE
                 : VK_FALSE;
         m_exactCt32Triangle = selected.exactCt32Triangle;
@@ -4158,6 +4567,8 @@ namespace
             selected.exactGouraudDepthCt32Triangle;
         m_exactT8GouraudDepthCt32Triangle =
             selected.exactT8GouraudDepthCt32Triangle;
+        m_exactFeedbackNearestDepthCt32Triangle =
+            selected.exactFeedbackNearestDepthCt32Triangle;
         VkDeviceCreateInfo deviceInfo{};
         deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         deviceInfo.queueCreateInfoCount = 1u;
@@ -4316,6 +4727,7 @@ namespace
             !createBuffer(
                 GS_VULKAN_VRAM_SIZE,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -4547,6 +4959,16 @@ namespace
                 m_t8GouraudDepthCt32TriangleShaderModule,
                 m_t8GouraudDepthCt32TrianglePipeline,
                 "T8 Gouraud depth CT32 triangle"))
+        {
+            return false;
+        }
+        if (m_exactFeedbackNearestDepthCt32Triangle &&
+            !createComputePipeline(
+                kGsFeedbackNearestDepthCt32TriangleShaderSpv,
+                sizeof(kGsFeedbackNearestDepthCt32TriangleShaderSpv),
+                m_feedbackNearestDepthCt32TriangleShaderModule,
+                m_feedbackNearestDepthCt32TrianglePipeline,
+                "feedback nearest depth CT32 triangle"))
         {
             return false;
         }
@@ -5568,6 +5990,114 @@ namespace
         return true;
     }
 
+    bool VulkanExecutionContext::downloadFeedbackSnapshot(
+        std::span<uint8_t> destination,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (!m_feedbackSnapshotResidentValid ||
+            destination.size() != GS_VULKAN_VRAM_SIZE)
+        {
+            error =
+                "Vulkan GS feedback snapshot download requires one resident 4 MiB snapshot";
+            return false;
+        }
+
+        const uint32_t validationErrorsBefore =
+            m_validation.errors.load(std::memory_order_relaxed);
+        if (!beginCommands(report, error))
+            return false;
+
+        VkBufferMemoryBarrier snapshotBarrier{};
+        snapshotBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        snapshotBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        snapshotBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        snapshotBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        snapshotBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        snapshotBarrier.buffer = m_feedbackSnapshot.buffer;
+        snapshotBarrier.offset = 0u;
+        snapshotBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 1u, &snapshotBarrier, 0u, nullptr);
+
+        VkBufferMemoryBarrier stagingPrepareBarrier{};
+        stagingPrepareBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        stagingPrepareBarrier.srcAccessMask =
+            VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
+        stagingPrepareBarrier.dstAccessMask =
+            VK_ACCESS_TRANSFER_WRITE_BIT;
+        stagingPrepareBarrier.srcQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        stagingPrepareBarrier.dstQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        stagingPrepareBarrier.buffer = m_staging.buffer;
+        stagingPrepareBarrier.offset = 0u;
+        stagingPrepareBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 1u, &stagingPrepareBarrier,
+            0u, nullptr);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdCopyBuffer(
+            m_commandBuffer,
+            m_feedbackSnapshot.buffer,
+            m_staging.buffer,
+            1u, &copyRegion);
+
+        VkBufferMemoryBarrier stagingCompleteBarrier{};
+        stagingCompleteBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        stagingCompleteBarrier.srcAccessMask =
+            VK_ACCESS_TRANSFER_WRITE_BIT;
+        stagingCompleteBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        stagingCompleteBarrier.srcQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        stagingCompleteBarrier.dstQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        stagingCompleteBarrier.buffer = m_staging.buffer;
+        stagingCompleteBarrier.offset = 0u;
+        stagingCompleteBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            0u, 0u, nullptr, 1u, &stagingCompleteBarrier,
+            0u, nullptr);
+
+        if (!submitCommands(
+                "feedback snapshot download", 0u, 3u, 0u,
+                report, statistics, error) ||
+            !invalidateMappedAllocation(
+                m_staging, "feedback snapshot download", report, error) ||
+            !finishOperation(
+                "feedback snapshot download", validationErrorsBefore,
+                report, statistics, error))
+        {
+            return false;
+        }
+
+        std::memcpy(
+            destination.data(), m_stagingMap, GS_VULKAN_VRAM_SIZE);
+        statistics.bytesDownloaded += GS_VULKAN_VRAM_SIZE;
+        error.clear();
+        return true;
+    }
+
     bool VulkanExecutionContext::executeResidentCt32Sprites(
         std::span<const GsVulkanCt32Sprite> sprites,
         GsVulkanCapabilityReport &report,
@@ -6557,6 +7087,359 @@ namespace
     }
 
     bool VulkanExecutionContext::
+        executeResidentFeedbackNearestDepthCt32Triangles(
+            std::span<const uint8_t> feedbackSnapshot,
+            GsVulkanFeedbackSnapshotMode snapshotMode,
+            std::span<
+                const GsVulkanFeedbackNearestDepthCt32Triangle> triangles,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error)
+    {
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (!m_exactFeedbackNearestDepthCt32Triangle ||
+            m_feedbackNearestDepthCt32TrianglePipeline == VK_NULL_HANDLE)
+        {
+            error =
+                "Vulkan device does not support exact feedback nearest depth CT32 triangles";
+            return false;
+        }
+        const bool uploadsHostSnapshot =
+            snapshotMode == GsVulkanFeedbackSnapshotMode::UploadHost;
+        if ((uploadsHostSnapshot &&
+             feedbackSnapshot.size() != GS_VULKAN_VRAM_SIZE) ||
+            (!uploadsHostSnapshot && !feedbackSnapshot.empty()))
+        {
+            error =
+                "Vulkan feedback nearest depth CT32 triangles received an invalid snapshot source";
+            return false;
+        }
+        if (snapshotMode == GsVulkanFeedbackSnapshotMode::ReuseResident &&
+            !m_feedbackSnapshotResidentValid)
+        {
+            error =
+                "Vulkan feedback nearest depth CT32 triangles cannot reuse an uninitialized resident snapshot";
+            return false;
+        }
+        if (!validateResidentFeedbackNearestDepthCt32TriangleBatch(
+                triangles, error))
+        {
+            return false;
+        }
+
+        GsVulkanTriangleTileWorkPlan tileWork;
+        const GsVulkanDeviceReport *selectedDevice =
+            report.selectedDevice();
+        const bool tiled =
+            buildTriangleTileWork(triangles, tileWork) &&
+            selectedDevice &&
+            tileWork.tileCount <=
+                selectedDevice->maxComputeWorkGroupCountX;
+
+        const VkDeviceSize recordBytes =
+            sizeof(GsVulkanFeedbackNearestDepthCt32Triangle) *
+            triangles.size();
+        std::memcpy(
+            m_memoryCasesMap, triangles.data(),
+            static_cast<size_t>(recordBytes));
+        if (!flushMappedAllocation(
+                m_memoryCases,
+                "feedback nearest triangle records",
+                report, error))
+        {
+            return false;
+        }
+        const VkDeviceSize tileBytes = tiled
+            ? sizeof(uint32_t) * tileWork.words.size()
+            : 0u;
+        if (tiled)
+        {
+            std::memcpy(
+                m_memoryResultsMap, tileWork.words.data(),
+                static_cast<size_t>(tileBytes));
+            if (!flushMappedAllocation(
+                    m_memoryResults,
+                    "feedback nearest triangle tile state",
+                    report, error))
+            {
+                return false;
+            }
+        }
+        if (uploadsHostSnapshot)
+        {
+            std::memcpy(
+                m_feedbackStagingMap,
+                feedbackSnapshot.data(),
+                feedbackSnapshot.size());
+            if (!flushMappedAllocation(
+                    m_feedbackStaging,
+                    "feedback nearest triangle snapshot",
+                    report, error))
+            {
+                return false;
+            }
+        }
+
+        const uint32_t validationErrorsBefore =
+            m_validation.errors.load(std::memory_order_relaxed);
+        if (!beginCommands(report, error))
+            return false;
+
+        std::array<VkBufferMemoryBarrier, 2> hostRecordBarriers{};
+        VkBufferMemoryBarrier &recordBarrier = hostRecordBarriers[0];
+        recordBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        recordBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        recordBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        recordBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        recordBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        recordBarrier.buffer = m_memoryCases.buffer;
+        recordBarrier.offset = 0u;
+        recordBarrier.size = recordBytes;
+        uint32_t hostRecordBarrierCount = 1u;
+        if (tiled)
+        {
+            VkBufferMemoryBarrier &tileBarrier = hostRecordBarriers[1];
+            tileBarrier.sType =
+                VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            tileBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            tileBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            tileBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            tileBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            tileBarrier.buffer = m_memoryResults.buffer;
+            tileBarrier.offset = 0u;
+            tileBarrier.size = tileBytes;
+            hostRecordBarrierCount = 2u;
+        }
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr,
+            hostRecordBarrierCount, hostRecordBarriers.data(),
+            0u, nullptr);
+
+        uint64_t pipelineBarrierCount = 1u;
+        if (uploadsHostSnapshot)
+        {
+            VkBufferMemoryBarrier stagingBarrier{};
+            stagingBarrier.sType =
+                VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            stagingBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            stagingBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            stagingBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            stagingBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            stagingBarrier.buffer = m_feedbackStaging.buffer;
+            stagingBarrier.offset = 0u;
+            stagingBarrier.size = GS_VULKAN_VRAM_SIZE;
+            m_functions.cmdPipelineBarrier(
+                m_commandBuffer,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u, 0u, nullptr, 1u, &stagingBarrier,
+                0u, nullptr);
+
+            VkBufferCopy copyRegion{};
+            copyRegion.size = GS_VULKAN_VRAM_SIZE;
+            m_functions.cmdCopyBuffer(
+                m_commandBuffer,
+                m_feedbackStaging.buffer,
+                m_feedbackSnapshot.buffer,
+                1u, &copyRegion);
+            ++pipelineBarrierCount;
+        }
+        else if (snapshotMode ==
+                 GsVulkanFeedbackSnapshotMode::CaptureResident)
+        {
+            VkBufferMemoryBarrier captureSourceBarrier{};
+            captureSourceBarrier.sType =
+                VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            captureSourceBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            captureSourceBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            captureSourceBarrier.srcQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            captureSourceBarrier.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            captureSourceBarrier.buffer = m_vram.buffer;
+            captureSourceBarrier.offset = 0u;
+            captureSourceBarrier.size = GS_VULKAN_VRAM_SIZE;
+            m_functions.cmdPipelineBarrier(
+                m_commandBuffer,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u, 0u, nullptr, 1u, &captureSourceBarrier,
+                0u, nullptr);
+
+            VkBufferCopy copyRegion{};
+            copyRegion.size = GS_VULKAN_VRAM_SIZE;
+            m_functions.cmdCopyBuffer(
+                m_commandBuffer,
+                m_vram.buffer,
+                m_feedbackSnapshot.buffer,
+                1u, &copyRegion);
+            ++pipelineBarrierCount;
+        }
+
+        VkBufferMemoryBarrier snapshotReadBarrier{};
+        snapshotReadBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        snapshotReadBarrier.srcAccessMask =
+            snapshotMode == GsVulkanFeedbackSnapshotMode::ReuseResident
+                ? VK_ACCESS_MEMORY_WRITE_BIT
+                : VK_ACCESS_TRANSFER_WRITE_BIT;
+        snapshotReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        snapshotReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        snapshotReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        snapshotReadBarrier.buffer = m_feedbackSnapshot.buffer;
+        snapshotReadBarrier.offset = 0u;
+        snapshotReadBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            snapshotMode == GsVulkanFeedbackSnapshotMode::ReuseResident
+                ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+                : VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr, 1u, &snapshotReadBarrier,
+            0u, nullptr);
+        ++pipelineBarrierCount;
+
+        VkBufferMemoryBarrier prepareBarrier{};
+        prepareBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        prepareBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        prepareBarrier.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        prepareBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        prepareBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        prepareBarrier.buffer = m_vram.buffer;
+        prepareBarrier.offset = 0u;
+        prepareBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr, 1u, &prepareBarrier,
+            0u, nullptr);
+        ++pipelineBarrierCount;
+
+        m_functions.cmdBindPipeline(
+            m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_feedbackNearestDepthCt32TrianglePipeline);
+        m_functions.cmdBindDescriptorSets(
+            m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_pipelineLayout, 0u, 1u, &m_descriptorSet,
+            0u, nullptr);
+
+        constexpr uint32_t localSize = 8u;
+        size_t dispatchCount = 0u;
+        if (tiled)
+        {
+            const GsVulkanT8TriangleParameters parameters{
+                0u, tileWork.indexOffsetWords, 0u};
+            m_functions.cmdPushConstants(
+                m_commandBuffer, m_pipelineLayout,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+                sizeof(parameters), &parameters);
+            m_functions.cmdDispatch(
+                m_commandBuffer, tileWork.tileCount, 1u, 1u);
+            dispatchCount = 1u;
+        }
+        else for (size_t index = 0u; index < triangles.size(); ++index)
+        {
+            if (index != 0u)
+            {
+                VkBufferMemoryBarrier dependencyBarrier{};
+                dependencyBarrier.sType =
+                    VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                dependencyBarrier.srcAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT;
+                dependencyBarrier.dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT;
+                dependencyBarrier.srcQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                dependencyBarrier.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                dependencyBarrier.buffer = m_vram.buffer;
+                dependencyBarrier.offset = 0u;
+                dependencyBarrier.size = GS_VULKAN_VRAM_SIZE;
+                m_functions.cmdPipelineBarrier(
+                    m_commandBuffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0u, 0u, nullptr, 1u, &dependencyBarrier,
+                    0u, nullptr);
+                ++pipelineBarrierCount;
+            }
+            const auto &triangle = triangles[index];
+            const uint32_t groupCountX =
+                (triangle.boundsX1 - triangle.boundsX0 +
+                 localSize - 1u) / localSize;
+            const uint32_t groupCountY =
+                (triangle.boundsY1 - triangle.boundsY0 +
+                 localSize - 1u) / localSize;
+            const GsVulkanT8TriangleParameters parameters{
+                static_cast<uint32_t>(index), 0u, 0u};
+            m_functions.cmdPushConstants(
+                m_commandBuffer, m_pipelineLayout,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+                sizeof(parameters), &parameters);
+            m_functions.cmdDispatch(
+                m_commandBuffer, groupCountX, groupCountY, 1u);
+            ++dispatchCount;
+        }
+
+        VkBufferMemoryBarrier completeBarrier{};
+        completeBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        completeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        completeBarrier.dstAccessMask =
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        completeBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        completeBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        completeBarrier.buffer = m_vram.buffer;
+        completeBarrier.offset = 0u;
+        completeBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            0u, 0u, nullptr, 1u, &completeBarrier,
+            0u, nullptr);
+        ++pipelineBarrierCount;
+
+        if (!submitCommands(
+                "resident feedback nearest depth CT32 triangle batch",
+                dispatchCount, pipelineBarrierCount, 1u,
+                report, statistics, error) ||
+            !finishOperation(
+                "resident feedback nearest depth CT32 triangle batch",
+                validationErrorsBefore,
+                report, statistics, error))
+        {
+            return false;
+        }
+        m_feedbackSnapshotResidentValid = true;
+        if (snapshotMode ==
+            GsVulkanFeedbackSnapshotMode::CaptureResident)
+        {
+            ++statistics.residentFeedbackSnapshotsCaptured;
+        }
+        else if (snapshotMode ==
+                 GsVulkanFeedbackSnapshotMode::ReuseResident)
+        {
+            ++statistics.residentFeedbackSnapshotsReused;
+        }
+        error.clear();
+        return true;
+    }
+
+    bool VulkanExecutionContext::
         executeResidentT8GouraudDepthCt32Triangles(
             std::span<
                 const GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
@@ -7244,6 +8127,26 @@ namespace
         }
         m_descriptorPool = VK_NULL_HANDLE;
         m_descriptorSet = VK_NULL_HANDLE;
+        if (m_feedbackNearestDepthCt32TrianglePipeline !=
+                VK_NULL_HANDLE &&
+            m_functions.destroyPipeline)
+        {
+            m_functions.destroyPipeline(
+                m_device,
+                m_feedbackNearestDepthCt32TrianglePipeline,
+                nullptr);
+        }
+        m_feedbackNearestDepthCt32TrianglePipeline = VK_NULL_HANDLE;
+        if (m_feedbackNearestDepthCt32TriangleShaderModule !=
+                VK_NULL_HANDLE &&
+            m_functions.destroyShaderModule)
+        {
+            m_functions.destroyShaderModule(
+                m_device,
+                m_feedbackNearestDepthCt32TriangleShaderModule,
+                nullptr);
+        }
+        m_feedbackNearestDepthCt32TriangleShaderModule = VK_NULL_HANDLE;
         if (m_t8GouraudDepthCt32TrianglePipeline != VK_NULL_HANDLE &&
             m_functions.destroyPipeline)
         {
@@ -7466,6 +8369,7 @@ enum class GsVulkanRequestKind : uint8_t
     T8GouraudDepthCt32Triangle,
     UploadPages,
     DownloadPages,
+    DownloadFeedbackSnapshot,
     ResidentCt32Sprites,
     ResidentDepthCt32Sprites,
     ResidentFeedbackLinearDepthCt32Sprites,
@@ -7474,6 +8378,7 @@ enum class GsVulkanRequestKind : uint8_t
     ResidentCt32Triangles,
     ResidentGouraudDepthCt32Triangles,
     ResidentT8GouraudDepthCt32Triangles,
+    ResidentFeedbackNearestDepthCt32Triangles,
 };
 
 struct GsVulkanService::Impl final
@@ -7631,6 +8536,16 @@ struct GsVulkanService::Impl final
                           .residentT8GouraudDepthCt32TriangleBatchesFailed;
                 }
                 else if (activeRequestKind ==
+                         GsVulkanRequestKind::
+                             ResidentFeedbackNearestDepthCt32Triangles)
+                {
+                    statistics
+                        .feedbackNearestDepthCt32TriangleDrawsFailed +=
+                        activeRequestFeedbackNearestTriangleCount;
+                    ++statistics
+                          .residentFeedbackNearestDepthCt32TriangleBatchesFailed;
+                }
+                else if (activeRequestKind ==
                          GsVulkanRequestKind::UploadPages)
                 {
                     ++statistics.pageUploadOperationsFailed;
@@ -7639,6 +8554,12 @@ struct GsVulkanService::Impl final
                          GsVulkanRequestKind::DownloadPages)
                 {
                     ++statistics.pageDownloadOperationsFailed;
+                }
+                else if (activeRequestKind ==
+                         GsVulkanRequestKind::DownloadFeedbackSnapshot)
+                {
+                    ++statistics
+                          .residentFeedbackSnapshotDownloadsFailed;
                 }
                 else
                 {
@@ -7705,7 +8626,11 @@ struct GsVulkanService::Impl final
                 t8GouraudDepthCt32Triangles;
             std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle>
                 residentT8GouraudDepthCt32Triangles;
+            std::vector<GsVulkanFeedbackNearestDepthCt32Triangle>
+                feedbackNearestDepthCt32Triangles;
             std::vector<GsVulkanT8Palette> t8Palettes;
+            GsVulkanFeedbackSnapshotMode feedbackSnapshotMode =
+                GsVulkanFeedbackSnapshotMode::UploadHost;
             std::span<const uint8_t> pageUploadSource;
             std::span<uint8_t> pageDownloadDestination;
             GsVramPageMask pages;
@@ -7741,7 +8666,11 @@ struct GsVulkanService::Impl final
                 residentT8GouraudDepthCt32Triangles =
                     std::move(
                         requestResidentT8GouraudDepthCt32Triangles);
+                feedbackNearestDepthCt32Triangles =
+                    std::move(
+                        requestFeedbackNearestDepthCt32Triangles);
                 t8Palettes = std::move(requestT8Palettes);
+                feedbackSnapshotMode = requestFeedbackSnapshotMode;
                 pageUploadSource = requestPageUploadSource;
                 pageDownloadDestination =
                     requestPageDownloadDestination;
@@ -7767,6 +8696,8 @@ struct GsVulkanService::Impl final
                                 ResidentT8GouraudDepthCt32Triangles
                         ? residentT8GouraudDepthCt32Triangles.size()
                         : t8GouraudDepthCt32Triangles.size();
+                activeRequestFeedbackNearestTriangleCount =
+                    feedbackNearestDepthCt32Triangles.size();
                 requestPending = false;
                 requestInFlight = true;
             }
@@ -7858,6 +8789,13 @@ struct GsVulkanService::Impl final
                     pageDownloadDestination, pages, localCapabilities,
                     localStatistics, operationError);
             }
+            else if (kind ==
+                     GsVulkanRequestKind::DownloadFeedbackSnapshot)
+            {
+                succeeded = context.downloadFeedbackSnapshot(
+                    pageDownloadDestination, localCapabilities,
+                    localStatistics, operationError);
+            }
             else if (kind == GsVulkanRequestKind::ResidentCt32Sprites)
             {
                 succeeded = context.executeResidentCt32Sprites(
@@ -7902,6 +8840,18 @@ struct GsVulkanService::Impl final
                     executeResidentT8GouraudDepthCt32Triangles(
                         residentT8GouraudDepthCt32Triangles,
                         t8Palettes,
+                        localCapabilities, localStatistics,
+                        operationError);
+            }
+            else if (kind ==
+                     GsVulkanRequestKind::
+                         ResidentFeedbackNearestDepthCt32Triangles)
+            {
+                succeeded = context.
+                    executeResidentFeedbackNearestDepthCt32Triangles(
+                        feedbackSnapshot,
+                        feedbackSnapshotMode,
+                        feedbackNearestDepthCt32Triangles,
                         localCapabilities, localStatistics,
                         operationError);
             }
@@ -8355,6 +9305,44 @@ struct GsVulkanService::Impl final
                           .residentT8GouraudDepthCt32TriangleBatchesFailed;
                 }
             }
+            else if (kind ==
+                     GsVulkanRequestKind::
+                         ResidentFeedbackNearestDepthCt32Triangles)
+            {
+                if (succeeded)
+                {
+                    localStatistics
+                        .feedbackNearestDepthCt32TriangleDrawsCompleted +=
+                        feedbackNearestDepthCt32Triangles.size();
+                    for (const auto &triangle :
+                         feedbackNearestDepthCt32Triangles)
+                    {
+                        localStatistics
+                            .feedbackNearestDepthCt32TriangleCandidatePixelsExecuted +=
+                            static_cast<uint64_t>(
+                                triangle.boundsX1 - triangle.boundsX0) *
+                            static_cast<uint64_t>(
+                                triangle.boundsY1 - triangle.boundsY0);
+                    }
+                    ++localStatistics
+                          .residentFeedbackNearestDepthCt32TriangleBatchesCompleted;
+                    localStatistics
+                        .largestResidentFeedbackNearestDepthCt32TriangleBatch =
+                        std::max(
+                            localStatistics
+                                .largestResidentFeedbackNearestDepthCt32TriangleBatch,
+                            static_cast<uint64_t>(
+                                feedbackNearestDepthCt32Triangles.size()));
+                }
+                else
+                {
+                    localStatistics
+                        .feedbackNearestDepthCt32TriangleDrawsFailed +=
+                        feedbackNearestDepthCt32Triangles.size();
+                    ++localStatistics
+                          .residentFeedbackNearestDepthCt32TriangleBatchesFailed;
+                }
+            }
             else if (kind == GsVulkanRequestKind::UploadPages)
             {
                 if (succeeded)
@@ -8368,6 +9356,20 @@ struct GsVulkanService::Impl final
                     ++localStatistics.pageDownloadOperationsCompleted;
                 else
                     ++localStatistics.pageDownloadOperationsFailed;
+            }
+            else if (kind ==
+                     GsVulkanRequestKind::DownloadFeedbackSnapshot)
+            {
+                if (succeeded)
+                {
+                    ++localStatistics
+                          .residentFeedbackSnapshotsDownloaded;
+                }
+                else
+                {
+                    ++localStatistics
+                          .residentFeedbackSnapshotDownloadsFailed;
+                }
             }
             else if (succeeded)
             {
@@ -8476,7 +9478,11 @@ struct GsVulkanService::Impl final
             residentT8GouraudDepthCt32Triangles = {},
         std::vector<GsVulkanT8Palette> t8Palettes = {},
         std::span<const uint8_t> pageUploadSource = {},
-        std::span<uint8_t> pageDownloadDestination = {})
+        std::span<uint8_t> pageDownloadDestination = {},
+        std::vector<GsVulkanFeedbackNearestDepthCt32Triangle>
+            feedbackNearestDepthCt32Triangles = {},
+        GsVulkanFeedbackSnapshotMode feedbackSnapshotMode =
+            GsVulkanFeedbackSnapshotMode::UploadHost)
     {
         bool pageTransferValid =
             pageUploadSource.empty() &&
@@ -8488,6 +9494,13 @@ struct GsVulkanService::Impl final
                 pageDownloadDestination.empty();
         }
         else if (kind == GsVulkanRequestKind::DownloadPages)
+        {
+            pageTransferValid =
+                pageUploadSource.empty() &&
+                pageDownloadDestination.size() == GS_VULKAN_VRAM_SIZE;
+        }
+        else if (kind ==
+                 GsVulkanRequestKind::DownloadFeedbackSnapshot)
         {
             pageTransferValid =
                 pageUploadSource.empty() &&
@@ -8536,6 +9549,9 @@ struct GsVulkanService::Impl final
         requestResidentT8GouraudDepthCt32Triangles =
             std::move(residentT8GouraudDepthCt32Triangles);
         requestT8Palettes = std::move(t8Palettes);
+        requestFeedbackNearestDepthCt32Triangles =
+            std::move(feedbackNearestDepthCt32Triangles);
+        requestFeedbackSnapshotMode = feedbackSnapshotMode;
         requestPageUploadSource = pageUploadSource;
         requestPageDownloadDestination = pageDownloadDestination;
         requestPages = pages;
@@ -8621,6 +9637,10 @@ struct GsVulkanService::Impl final
     std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle>
         requestResidentT8GouraudDepthCt32Triangles;
     std::vector<GsVulkanT8Palette> requestT8Palettes;
+    std::vector<GsVulkanFeedbackNearestDepthCt32Triangle>
+        requestFeedbackNearestDepthCt32Triangles;
+    GsVulkanFeedbackSnapshotMode requestFeedbackSnapshotMode =
+        GsVulkanFeedbackSnapshotMode::UploadHost;
     // Page transfer calls are synchronous: the posting thread remains blocked
     // under callMutex until the owning Vulkan worker finishes consuming these
     // borrowed canonical-VRAM views.
@@ -8642,6 +9662,7 @@ struct GsVulkanService::Impl final
     size_t activeRequestTriangleCount = 0u;
     size_t activeRequestGouraudTriangleCount = 0u;
     size_t activeRequestT8TriangleCount = 0u;
+    size_t activeRequestFeedbackNearestTriangleCount = 0u;
     bool initialized = false;
     bool healthy = false;
     bool stopping = false;
@@ -9121,6 +10142,61 @@ bool GsVulkanService::executeFeedbackLinearDepthCt32Sprite(
 #endif
 }
 
+bool GsVulkanService::executeFeedbackNearestDepthCt32Triangle(
+    std::span<const uint8_t> input,
+    std::span<const uint8_t> feedbackSnapshot,
+    const GsVulkanFeedbackNearestDepthCt32Triangle &triangle,
+    std::vector<uint8_t> &output,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)input;
+    (void)feedbackSnapshot;
+    (void)triangle;
+    (void)output;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    if (input.size() != GS_VULKAN_VRAM_SIZE ||
+        feedbackSnapshot.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+        {
+            *error =
+                "Vulkan feedback nearest depth CT32 triangle requires exact 4 MiB canonical and snapshot images";
+        }
+        return false;
+    }
+    if (const char *validationError =
+            feedbackNearestDepthCt32TriangleValidationError(triangle))
+    {
+        if (error)
+            *error = validationError;
+        return false;
+    }
+    GsVramPageMask allPages;
+    allPages.setAll();
+    if (!uploadVramPages(input, allPages, error) ||
+        !executeResidentFeedbackNearestDepthCt32Triangles(
+            feedbackSnapshot,
+            GsVulkanFeedbackSnapshotMode::UploadHost,
+            std::span<const GsVulkanFeedbackNearestDepthCt32Triangle>(
+                &triangle, 1u),
+            error))
+    {
+        return false;
+    }
+    std::vector<uint8_t> completed(GS_VULKAN_VRAM_SIZE);
+    if (!downloadVramPages(completed, allPages, error))
+        return false;
+    output = std::move(completed);
+    if (error)
+        error->clear();
+    return true;
+#endif
+}
+
 bool GsVulkanService::executeCt32Triangle(
     std::span<const uint8_t> input,
     const GsVulkanCt32Triangle &triangle,
@@ -9351,6 +10427,34 @@ bool GsVulkanService::downloadVramPages(
 #endif
 }
 
+bool GsVulkanService::downloadFeedbackSnapshot(
+    std::span<uint8_t> destination,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)destination;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    if (destination.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+        {
+            *error =
+                "Vulkan feedback snapshot download requires exactly 4 MiB";
+        }
+        return false;
+    }
+
+    std::vector<uint8_t> unusedOutput;
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::DownloadFeedbackSnapshot,
+        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+        unusedOutput, nullptr, error, {}, {}, {}, destination);
+#endif
+}
+
 bool GsVulkanService::executeResidentCt32Sprite(
     const GsVulkanCt32Sprite &sprite,
     std::string *error)
@@ -9571,6 +10675,73 @@ bool GsVulkanService::executeResidentFeedbackLinearDepthCt32Sprites(
             sprites.begin(), sprites.end()),
         {}, {},
         unusedOutput, nullptr, error);
+#endif
+}
+
+bool GsVulkanService::executeResidentFeedbackNearestDepthCt32Triangles(
+    std::span<const uint8_t> feedbackSnapshot,
+    GsVulkanFeedbackSnapshotMode snapshotMode,
+    std::span<const GsVulkanFeedbackNearestDepthCt32Triangle> triangles,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)feedbackSnapshot;
+    (void)snapshotMode;
+    (void)triangles;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    const bool uploadsHostSnapshot =
+        snapshotMode == GsVulkanFeedbackSnapshotMode::UploadHost;
+    if ((uploadsHostSnapshot &&
+         feedbackSnapshot.size() != GS_VULKAN_VRAM_SIZE) ||
+        (!uploadsHostSnapshot && !feedbackSnapshot.empty()))
+    {
+        if (error)
+        {
+            *error =
+                "Vulkan resident feedback nearest depth CT32 triangles received an invalid snapshot source";
+        }
+        return false;
+    }
+    std::string validationError;
+    if (!validateResidentFeedbackNearestDepthCt32TriangleBatch(
+            triangles, validationError))
+    {
+        if (error)
+            *error = std::move(validationError);
+        return false;
+    }
+    {
+        std::lock_guard lock(m_impl->stateMutex);
+        const GsVulkanDeviceReport *selected =
+            m_impl->capabilities.selectedDevice();
+        if (!selected ||
+            !selected->exactFeedbackNearestDepthCt32Triangle)
+        {
+            if (error)
+            {
+                *error =
+                    "Vulkan device does not support exact feedback nearest depth CT32 triangles";
+            }
+            return false;
+        }
+    }
+
+    std::vector<uint8_t> unusedOutput;
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::
+            ResidentFeedbackNearestDepthCt32Triangles,
+        {},
+        std::vector<uint8_t>(
+            feedbackSnapshot.begin(), feedbackSnapshot.end()),
+        {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+        unusedOutput, nullptr, error,
+        {}, {}, {}, {},
+        std::vector<GsVulkanFeedbackNearestDepthCt32Triangle>(
+            triangles.begin(), triangles.end()),
+        snapshotMode);
 #endif
 }
 

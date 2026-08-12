@@ -339,6 +339,10 @@ namespace
                    << (device.exactFeedbackLinearDepthCt32Sprite
                            ? "true"
                            : "false")
+                   << ",\"exact_feedback_nearest_depth_ct32_triangle\":"
+                   << (device.exactFeedbackNearestDepthCt32Triangle
+                           ? "true"
+                           : "false")
                    << ",\"suitable\":"
                    << (device.suitable ? "true" : "false")
                    << ",\"rejection_reason\":";
@@ -446,6 +450,32 @@ namespace
                << ",\"largest_resident_feedback_linear_depth_ct32_sprite_batch\":"
                << statistics
                       .largestResidentFeedbackLinearDepthCt32SpriteBatch
+               << ",\"feedback_nearest_depth_ct32_triangle_draws_completed\":"
+               << statistics
+                      .feedbackNearestDepthCt32TriangleDrawsCompleted
+               << ",\"feedback_nearest_depth_ct32_triangle_draws_failed\":"
+               << statistics
+                      .feedbackNearestDepthCt32TriangleDrawsFailed
+               << ",\"feedback_nearest_depth_ct32_triangle_candidate_pixels_executed\":"
+               << statistics
+                      .feedbackNearestDepthCt32TriangleCandidatePixelsExecuted
+               << ",\"resident_feedback_nearest_depth_ct32_triangle_batches_completed\":"
+               << statistics
+                      .residentFeedbackNearestDepthCt32TriangleBatchesCompleted
+               << ",\"resident_feedback_nearest_depth_ct32_triangle_batches_failed\":"
+               << statistics
+                      .residentFeedbackNearestDepthCt32TriangleBatchesFailed
+               << ",\"largest_resident_feedback_nearest_depth_ct32_triangle_batch\":"
+               << statistics
+                      .largestResidentFeedbackNearestDepthCt32TriangleBatch
+               << ",\"resident_feedback_snapshots_captured\":"
+               << statistics.residentFeedbackSnapshotsCaptured
+               << ",\"resident_feedback_snapshots_reused\":"
+               << statistics.residentFeedbackSnapshotsReused
+               << ",\"resident_feedback_snapshots_downloaded\":"
+               << statistics.residentFeedbackSnapshotsDownloaded
+               << ",\"resident_feedback_snapshot_downloads_failed\":"
+               << statistics.residentFeedbackSnapshotDownloadsFailed
                << ",\"resident_linear_ct32_sprite_batches_completed\":"
                << statistics.residentLinearCt32SpriteBatchesCompleted
                << ",\"resident_linear_ct32_sprite_batches_failed\":"
