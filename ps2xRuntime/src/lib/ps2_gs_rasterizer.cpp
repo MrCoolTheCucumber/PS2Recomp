@@ -1740,7 +1740,9 @@ namespace
 
     bool rasterizerInstrumentationRequested()
     {
-#if AGRESSIVE_LOGS
+#if !PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+        return false;
+#elif AGRESSIVE_LOGS
         return true;
 #else
         static const bool requested = []
@@ -2028,6 +2030,7 @@ GSRasterizer::GSRasterizer(GS *owner)
 }
 GSRasterizer::~GSRasterizer() = default;
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
 GSRasterizer::DebugProgressScope::DebugProgressScope(
     GSRasterizer &rasterizer, GS *owner, uint64_t drawCount)
     : m_rasterizer(rasterizer)
@@ -2039,6 +2042,7 @@ GSRasterizer::DebugProgressScope::~DebugProgressScope()
 {
     m_rasterizer.endDebugProgress();
 }
+#endif
 
 void GSRasterizer::beginDebugProgress(
     GS *owner, uint64_t drawCount)
@@ -2706,6 +2710,7 @@ void GSRasterizer::recordAcceleratedCommit(
     const GsDrawCommand &command)
 {
     DebugProgressScope progress(*this, gs);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     const GsDrawBounds &bounds = command.bounds();
     if (!bounds.empty())
     {
@@ -2713,6 +2718,7 @@ void GSRasterizer::recordAcceleratedCommit(
             static_cast<uint64_t>(bounds.x1 - bounds.x0) *
             static_cast<uint64_t>(bounds.y1 - bounds.y0);
     }
+#endif
 
     // Snapshot lifetime follows frontend command order rather than completion
     // callbacks: a recursive feedback run must keep sampling the image captured
@@ -2731,7 +2737,9 @@ void GSRasterizer::recordAcceleratedCommitBatch(
     const GsVulkanAcceleratedCommitBatch &batch)
 {
     DebugProgressScope progress(*this, gs, batch.commandCount);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     m_debugCandidatePixelBatch += batch.candidatePixels;
+#endif
 
     // These effects are idempotent across a homogeneous completion batch, so
     // aggregate metadata preserves frontend order without retaining complete
@@ -3510,6 +3518,7 @@ void GSRasterizer::writePixel(GS *gs,
                               bool forceAlphaBlend,
                               bool suppressDepthWrite)
 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     if (m_trackDebugProgress && m_debugProgressOwner)
     {
         ++m_debugCandidatePixelBatch;
@@ -3520,6 +3529,7 @@ void GSRasterizer::writePixel(GS *gs,
             m_debugCandidatePixelBatch = 0u;
         }
     }
+#endif
 
     const auto &ctx = gs->activeContext();
     GSDrawTraceState &trace = drawTrace();

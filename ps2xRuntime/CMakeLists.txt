@@ -17,6 +17,9 @@ option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" OFF)
 option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" OFF)
 option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
+option(PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    "Build optional debugger, trace, and profiling hooks into runtime hot paths"
+    OFF)
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
 option(PS2X_ENABLE_VU_X64_RECOMPILER
@@ -794,6 +797,22 @@ else()
         PS2X_ENABLE_DEBUG_SERVER=0
     )
 endif()
+
+# Tests and interactive debugger surfaces exercise the diagnostic APIs. A
+# production runtime can opt in explicitly, but otherwise should not pay for
+# dormant atomics and out-of-line trace probes at every EE/VU/GS boundary.
+set(PS2X_RUNTIME_DIAGNOSTICS_ENABLED
+    ${PS2X_ENABLE_RUNTIME_DIAGNOSTICS})
+if(PS2X_BUILD_TEST OR
+   PS2X_ENABLE_DEBUG_SERVER OR
+   PS2X_ENABLE_DEBUG_UI OR
+   PS2X_ENABLE_RUNTIME_LOGS OR
+   PS2X_ENABLE_AGRESSIVE_LOGS)
+    set(PS2X_RUNTIME_DIAGNOSTICS_ENABLED ON)
+endif()
+target_compile_definitions(ps2_runtime PUBLIC
+    "PS2X_ENABLE_RUNTIME_DIAGNOSTICS=$<BOOL:${PS2X_RUNTIME_DIAGNOSTICS_ENABLED}>"
+)
 
 # SIF RPC history exists only for the interactive debugger surfaces. Keep the
 # architectural RPC state in production builds without constructing previews

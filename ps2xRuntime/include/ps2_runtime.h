@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 
+#include "runtime/ps2_build_config.h"
 #include "ps2_log.h"
 #include "runtime/cop0_timing.h"
 #include "runtime/ee_cache.h"
@@ -590,10 +591,8 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const char *op,
                                const R5900Context *ctx)
 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     (void)rdram;
-    (void)valueLo;
-    (void)valueHi;
-    (void)op;
     if (g_ps2GsDmaWriteTraceEnabled.load(std::memory_order_relaxed))
     {
         ps2RecordGsDmaWriteTrace(
@@ -605,6 +604,15 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
             guestAddr, size, valueLo, valueHi, op,
             ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u);
     }
+#else
+    (void)rdram;
+    (void)guestAddr;
+    (void)size;
+    (void)valueLo;
+    (void)valueHi;
+    (void)op;
+    (void)ctx;
+#endif
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
@@ -613,8 +621,8 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     const char *op,
                                     const R5900Context *ctx)
 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     (void)rdram;
-    (void)op;
     if (g_ps2GsDmaWriteTraceEnabled.load(std::memory_order_relaxed))
     {
         ps2RecordGsDmaWriteTrace(
@@ -626,6 +634,13 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
             guestAddr, size, 0u, 0u, op,
             ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u);
     }
+#else
+    (void)rdram;
+    (void)guestAddr;
+    (void)size;
+    (void)op;
+    (void)ctx;
+#endif
 }
 
 class PS2Runtime
@@ -1874,10 +1889,24 @@ public:
     uint64_t debugAddWatchpoint(uint32_t start, uint32_t size, DebugMemoryAccess access);
     bool debugRemoveWatchpoint(uint64_t id);
     bool debugWatchpointsEnabled() const;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     void debugObserveMemoryAccess(uint32_t address,
                                   uint32_t size,
                                   DebugMemoryAccess access,
                                   const R5900Context *ctx);
+#else
+    void debugObserveMemoryAccess(
+        uint32_t address,
+        uint32_t size,
+        DebugMemoryAccess access,
+        const R5900Context *ctx)
+    {
+        (void)address;
+        (void)size;
+        (void)access;
+        (void)ctx;
+    }
+#endif
 
     uint32_t guestExecutionWaiterCountForTesting() const
     {
@@ -2161,8 +2190,19 @@ private:
     [[nodiscard]] bool
     invokeEeExecutorTaskAtBoundary(
         std::function<void()> task);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     void debugBeforeGuestStep(R5900Context *ctx);
     void debugAfterGuestStep(R5900Context *ctx);
+#else
+    void debugBeforeGuestStep(R5900Context *ctx)
+    {
+        (void)ctx;
+    }
+    void debugAfterGuestStep(R5900Context *ctx)
+    {
+        (void)ctx;
+    }
+#endif
     void debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason);
     void debugWaitUntilResumed();
     void debugRecordStopLocked(const char *reason, uint32_t pc);
@@ -2176,8 +2216,18 @@ private:
     [[nodiscard]] DebugEeEventDeviceState
     debugEeEventDeviceState(
         ps2x::timing::EeEventSource source) const noexcept;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     void debugArmVu0Traces(const R5900Context *ctx);
     void beginVu0Invocation();
+#else
+    void debugArmVu0Traces(const R5900Context *ctx)
+    {
+        (void)ctx;
+    }
+    void beginVu0Invocation()
+    {
+    }
+#endif
 
     [[noreturn]] void HandleIntegerOverflow(R5900Context *ctx);
 

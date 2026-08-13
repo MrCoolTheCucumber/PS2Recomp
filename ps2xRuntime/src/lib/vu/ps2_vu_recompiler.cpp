@@ -6811,18 +6811,24 @@ bool VuRecompilerBackend::compile(
 bool VuRecompilerBackend::usesNativeInstrumentation(
     const VuExecutionContext &context) const
 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     return
         context.enableInstrumentation &&
         context.enableNativeInstrumentation &&
         m_unit.m_instructionObserverEnabled.load(
             std::memory_order_relaxed) &&
         static_cast<bool>(m_unit.m_instructionObserver);
+#else
+    (void)context;
+    return false;
+#endif
 }
 
 bool VuRecompilerBackend::needsInterpreterInstrumentation(
     const VuExecutionContext &context,
     bool nativeInstrumentation) const
 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     if (!context.enableInstrumentation)
         return false;
     if (!nativeInstrumentation &&
@@ -6837,6 +6843,11 @@ bool VuRecompilerBackend::needsInterpreterInstrumentation(
     return context.memory->isVif1DmaTraceActive() ||
            context.memory->isVu1WorkloadProfileEnabled() ||
            m_unit.m_workloadProfileInvocationActive;
+#else
+    (void)context;
+    (void)nativeInstrumentation;
+    return false;
+#endif
 }
 
 VuExitReason VuRecompilerBackend::publicExit(

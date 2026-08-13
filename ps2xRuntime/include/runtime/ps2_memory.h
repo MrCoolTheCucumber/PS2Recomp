@@ -17,6 +17,7 @@
 #include <iostream>
 #include <mutex>
 
+#include "ps2_build_config.h"
 #include "ee_counters.h"
 #include "ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
@@ -1083,6 +1084,7 @@ public:
     void finishVu1WorkloadProfile();
     [[nodiscard]] Vu1WorkloadProfileSnapshot
     vu1WorkloadProfileSnapshot() const;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     [[nodiscard]] bool isVu1WorkloadProfileEnabled() const;
     void beginVu1WorkloadProfileInvocation(uint32_t startPc);
     void recordVu1WorkloadProfileInstruction(
@@ -1091,6 +1093,30 @@ public:
         uint32_t pc, uint32_t nextPc);
     void endVu1WorkloadProfileInvocation(bool completed);
     void resetVu1WorkloadProfileEpoch();
+#else
+    [[nodiscard]] bool
+    isVu1WorkloadProfileEnabled() const
+    {
+        return false;
+    }
+    void beginVu1WorkloadProfileInvocation(uint32_t)
+    {
+    }
+    void recordVu1WorkloadProfileInstruction(
+        uint32_t, uint32_t, uint32_t)
+    {
+    }
+    void recordVu1WorkloadProfileTransition(
+        uint32_t, uint32_t)
+    {
+    }
+    void endVu1WorkloadProfileInvocation(bool)
+    {
+    }
+    void resetVu1WorkloadProfileEpoch()
+    {
+    }
+#endif
 
     // Read/write memory
     uint8_t read8(
@@ -2211,6 +2237,7 @@ public:
     [[nodiscard]] Vif1DmaStallReason
     currentVif1DmaStall() const;
     static uint64_t nextDmacSequence(uint64_t value) noexcept;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     void beginVif1DmaTrace(uint32_t chcr,
                            uint32_t madr,
                            uint32_t qwc,
@@ -2219,22 +2246,80 @@ public:
                            uint32_t asr1,
                            uint32_t sadr);
     void traceVif1DmaTag(const uint8_t *data);
-    void traceVif1DmaPayload(const uint8_t *data, uint32_t sizeBytes);
-    void traceVif1Input(const uint8_t *data, uint32_t sizeBytes);
-    void traceVif1Command(uint32_t command, const uint8_t *followingData,
-                          uint32_t followingBytes);
-    void tracePath1Packet(const uint8_t *data, uint32_t sizeBytes);
-    bool isVif1DmaTraceActive() const;
-    void traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop, bool resume,
-                            const VuExecutionState &state);
-    void traceVu1Instruction(uint32_t pc, uint32_t lower, uint32_t upper,
-                             const VuExecutionState &state);
+    void traceVif1DmaPayload(
+        const uint8_t *data, uint32_t sizeBytes);
+    void traceVif1Input(
+        const uint8_t *data, uint32_t sizeBytes);
+    void traceVif1Command(
+        uint32_t command,
+        const uint8_t *followingData,
+        uint32_t followingBytes);
+    void tracePath1Packet(
+        const uint8_t *data, uint32_t sizeBytes);
+    [[nodiscard]] bool isVif1DmaTraceActive() const;
+    void traceVu1Invocation(
+        uint32_t startPc, uint32_t top, uint32_t itop,
+        bool resume, const VuExecutionState &state);
+    void traceVu1Instruction(
+        uint32_t pc, uint32_t lower, uint32_t upper,
+        const VuExecutionState &state);
     void traceVu1Xgkick(uint32_t sourceQword);
-    void traceVu1InvocationEnd(uint32_t finalPc, bool ended, bool hitCycleLimit,
-                               const int32_t *viRegisters, size_t viRegisterCount);
+    void traceVu1InvocationEnd(
+        uint32_t finalPc, bool ended, bool hitCycleLimit,
+        const int32_t *viRegisters,
+        size_t viRegisterCount);
     void finishVif1DmaTrace();
+#else
+    void beginVif1DmaTrace(
+        uint32_t, uint32_t, uint32_t, uint32_t,
+        uint32_t, uint32_t, uint32_t)
+    {
+    }
+    void traceVif1DmaTag(const uint8_t *)
+    {
+    }
+    void traceVif1DmaPayload(const uint8_t *, uint32_t)
+    {
+    }
+    void traceVif1Input(const uint8_t *, uint32_t)
+    {
+    }
+    void traceVif1Command(
+        uint32_t, const uint8_t *, uint32_t)
+    {
+    }
+    void tracePath1Packet(const uint8_t *, uint32_t)
+    {
+    }
+    [[nodiscard]] bool
+    isVif1DmaTraceActive() const
+    {
+        return false;
+    }
+    void traceVu1Invocation(
+        uint32_t, uint32_t, uint32_t, bool,
+        const VuExecutionState &)
+    {
+    }
+    void traceVu1Instruction(
+        uint32_t, uint32_t, uint32_t,
+        const VuExecutionState &)
+    {
+    }
+    void traceVu1Xgkick(uint32_t)
+    {
+    }
+    void traceVu1InvocationEnd(
+        uint32_t, bool, bool, const int32_t *, size_t)
+    {
+    }
+    void finishVif1DmaTrace()
+    {
+    }
+#endif
     Ps2GsDmaTraceState *m_gsDmaTrace = nullptr;
     std::atomic<uint64_t> m_vif1DmaTraceSequence{0u};
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     void recordVu1WorkloadProfileCodeUpload(
         uint32_t destination,
         const uint8_t *payload,
@@ -2242,6 +2327,13 @@ public:
         bool identical,
         uint64_t generationBefore,
         uint64_t generationAfter);
+#else
+    void recordVu1WorkloadProfileCodeUpload(
+        uint32_t, const uint8_t *, uint32_t, bool,
+        uint64_t, uint64_t)
+    {
+    }
+#endif
     Ps2Vu1WorkloadProfileState *m_vu1WorkloadProfile = nullptr;
     ps2x::timing::EeCounterBank m_eeCounters{};
     EeCounterCycleCallback m_eeCounterCycleCallback;

@@ -2013,6 +2013,7 @@ PS2Memory::vu1WorkloadProfileSnapshot() const
     return snapshot;
 }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
 bool PS2Memory::isVu1WorkloadProfileEnabled() const
 {
     return m_vu1WorkloadProfile &&
@@ -2078,7 +2079,9 @@ void PS2Memory::recordVu1WorkloadProfileCodeUpload(
             destination, payload, sizeBytes, identical);
     }
 }
+#endif
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
 void PS2Memory::beginVif1DmaTrace(uint32_t chcr,
                                   uint32_t madr,
                                   uint32_t qwc,
@@ -2615,13 +2618,14 @@ void PS2Memory::traceVu1InvocationEnd(
                  trace.vu1CurrentPath1.hash);
 }
 
-#undef PS2X_VU_OBSERVER_NOINLINE
-
 void PS2Memory::finishVif1DmaTrace()
 {
     if (m_gsDmaTrace)
         m_gsDmaTrace->finish();
 }
+#endif
+
+#undef PS2X_VU_OBSERVER_NOINLINE
 
 bool PS2Memory::debugStartVif1DmaTrace(
     const std::string &outputPath,

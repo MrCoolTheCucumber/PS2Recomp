@@ -1,6 +1,7 @@
 #ifndef PS2_GS_RASTERIZER_H
 #define PS2_GS_RASTERIZER_H
 
+#include "runtime/ps2_build_config.h"
 #include "runtime/ps2_gs_backend.h"
 #include "runtime/ps2_gs_replay.h"
 #include "runtime/ps2_gs_vulkan_backend.h"
@@ -84,6 +85,7 @@ public:
 private:
     struct ParallelState;
     struct BackendState;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     class DebugProgressScope
     {
     public:
@@ -98,6 +100,21 @@ private:
     private:
         GSRasterizer &m_rasterizer;
     };
+#else
+    class DebugProgressScope
+    {
+    public:
+        DebugProgressScope(
+            GSRasterizer &rasterizer,
+            GS *owner,
+            uint64_t drawCount = 1u)
+        {
+            (void)rasterizer;
+            (void)owner;
+            (void)drawCount;
+        }
+    };
+#endif
 
     bool tryQueuePrimitive(GS *gs, const GsDrawCommand &command);
     void prepareFeedbackSnapshot(

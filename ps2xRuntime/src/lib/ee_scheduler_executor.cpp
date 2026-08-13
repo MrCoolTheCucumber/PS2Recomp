@@ -1,4 +1,5 @@
 #include "runtime/ee_scheduler_executor.h"
+#include "runtime/ps2_build_config.h"
 
 namespace ps2x::ee
 {
@@ -145,6 +146,7 @@ namespace ps2x::ee
             return;
         }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         if (m_debugPauseRequested.load(
                 std::memory_order_acquire))
         {
@@ -180,6 +182,7 @@ namespace ps2x::ee
                 return;
             }
         }
+#endif
     }
 
     ps2x::timing::EeTick

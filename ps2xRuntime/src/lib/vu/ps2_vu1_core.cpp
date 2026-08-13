@@ -809,7 +809,8 @@ PS2X_VU_ALWAYS_INLINE VuRunResult VuUnit::run(
             .sideEffects = sideEffects,
             .memory = memory,
             .traceBudgetBoundary = traceBudgetBoundary,
-            .enableInstrumentation = true,
+            .enableInstrumentation =
+                PS2X_ENABLE_RUNTIME_DIAGNOSTICS != 0,
         };
 
         // Keep the interpreter call concrete so auto/debug mode retains its
@@ -838,10 +839,12 @@ VuRunResult VuUnit::runRecompiler(
         .sideEffects = sideEffects,
         .memory = memory,
         .traceBudgetBoundary = traceBudgetBoundary,
-        .enableInstrumentation = true,
+        .enableInstrumentation =
+            PS2X_ENABLE_RUNTIME_DIAGNOSTICS != 0,
         .enableNativeInstrumentation =
             m_nativeInstrumentationEnabled,
-        .enableProgressAccounting = true,
+        .enableProgressAccounting =
+            PS2X_ENABLE_RUNTIME_DIAGNOSTICS != 0,
     };
     return runRecompilerContext(
         context, maxCycles, true);
@@ -883,7 +886,9 @@ VuRunResult VuUnit::runRecompilerContext(
     const bool activeBefore = state.active;
     uint32_t executedCycles = 0u;
     ProgressTracker progress(
-        *this, state, trackProgress, executedCycles);
+        *this, state,
+        trackProgress && previousProgressAccounting,
+        executedCycles);
     const auto finish =
         [&](VuRunResult result)
         {
@@ -1412,7 +1417,11 @@ VuRunResult VuInterpreterBackend::run(
     IVuSideEffectSink &sideEffects = context.sideEffects;
     PS2Memory *const memory = context.memory;
     const bool traceBudgetBoundary = context.traceBudgetBoundary;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     const bool instrumentation = context.enableInstrumentation;
+#else
+    constexpr bool instrumentation = false;
+#endif
 
     // The VU performs 24-bit floating-point calculations by truncating toward
     // zero. Keep that host mode local to VU execution so callers retain their

@@ -474,6 +474,7 @@ namespace
         return Policy::None;
     }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     struct Vif0MmioTrace
     {
         std::FILE *output = nullptr;
@@ -583,6 +584,23 @@ namespace
         std::fputs("}\n", trace.output);
         std::fflush(trace.output);
     }
+#else
+    inline void traceVif0MmioWrite(
+        PS2Memory &memory,
+        const R5900Context *ctx,
+        uint32_t address,
+        uint32_t size,
+        uint64_t valueLo,
+        uint64_t valueHi)
+    {
+        (void)memory;
+        (void)ctx;
+        (void)address;
+        (void)size;
+        (void)valueLo;
+        (void)valueHi;
+    }
+#endif
 
     struct ElfAddressRange
     {
@@ -1635,6 +1653,7 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
 
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     m_vu0.setInstructionObserver(
         [this](uint64_t, uint32_t pc, uint32_t lower, uint32_t upper,
                const VuExecutionState &state)
@@ -1704,6 +1723,7 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
                 static_cast<uint16_t>(state.viBackupValue);
             debugRecordVu0Instruction(std::move(entry));
         });
+#endif
     m_vu0.setInstructionObserverEnabled(false);
 #if defined(PS2X_IOP_ENABLE_PLUGINS) && PS2X_IOP_ENABLE_PLUGINS && \
     !defined(PLATFORM_VITA) && (defined(_WIN32) || defined(__linux__))
@@ -6694,10 +6714,12 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(
     pushDispatchPc(address);
 
     const uint32_t normalizedAddress = normalizeGuestFunctionAddress(address);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     if (m_debugControlActive.load(std::memory_order_acquire))
     {
         debugRecordBranch(normalizedAddress);
     }
+#endif
 
     const EeArchitecturalObservationMode mode =
         architecturalObservationMode(ctx);
@@ -6977,10 +6999,12 @@ bool PS2Runtime::dispatchValidatedGuestBranch(
     }
 
     pushDispatchPc(targetPc);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     if (m_debugControlActive.load(std::memory_order_acquire))
     {
         debugRecordBranch(targetPc);
     }
+#endif
     const uint32_t entryPc = ctx->pc;
     const uint64_t dispatcherExitEpoch =
         m_guestExecutionDispatcherExitEpoch.load(
@@ -7791,6 +7815,7 @@ void PS2Runtime::SignalBusError(R5900Context *ctx,
             : EXCEPTION_BUS_ERROR_DATA);
 }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
 void PS2Runtime::debugArmVu0Traces(const R5900Context *ctx)
 {
     if (!ctx)
@@ -7899,6 +7924,7 @@ void PS2Runtime::beginVu0Invocation()
             true, std::memory_order_release);
     }
 }
+#endif
 
 void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
 {
@@ -8280,6 +8306,7 @@ void PS2Runtime::serviceEeEventsAtTick(
             eeCycleTick,
             [&](const ps2x::timing::EeEventService &service)
             {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 const bool traceEnabled =
                     m_debugEeEventTraceEnabled.load(
                         std::memory_order_relaxed);
@@ -8300,9 +8327,11 @@ void PS2Runtime::serviceEeEventsAtTick(
                         debugEeEventDeviceState(
                             service.source);
                 }
+#endif
 
                 dispatchEeEvent(rdram, ctx, service);
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 if (traceEnabled)
                 {
                     entry.deviceAfter =
@@ -8321,6 +8350,7 @@ void PS2Runtime::serviceEeEventsAtTick(
                     debugRecordEeEvent(
                         std::move(entry));
                 }
+#endif
 
                 if (service.source ==
                         ps2x::timing::EeEventSource::
@@ -8636,6 +8666,7 @@ void PS2Runtime::synchronizeVU0MicroprogramAtTick(
 {
     (void)rdram;
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     const bool traceEnabled =
         m_debugVu0SyncTraceEnabled.load(std::memory_order_acquire);
     DebugVu0SyncEntry traceEntry{};
@@ -8691,6 +8722,7 @@ void PS2Runtime::synchronizeVU0MicroprogramAtTick(
             }
         }
     }
+#endif
 
     uint32_t cycleBudget = 0u;
     if (interlocked)
@@ -8746,6 +8778,7 @@ void PS2Runtime::synchronizeVU0MicroprogramAtTick(
             m_vu0CycleTick,
             ps2x::timing::vuCyclesToEeTicks(cycleBudget));
     }
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     if (traceSync)
     {
         const VuExecutionState &state = m_vu0.state();
@@ -8757,6 +8790,7 @@ void PS2Runtime::synchronizeVU0MicroprogramAtTick(
         traceEntry.activeAfter = m_vu0.isActive();
         debugRecordVu0Sync(std::move(traceEntry));
     }
+#endif
 }
 
 void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
@@ -9498,9 +9532,12 @@ void PS2Runtime::executeGuestStep(uint8_t *rdram,
     // Outer dispatch is an architectural publication boundary. Generated
     // fast code may return with a completed straight-line retirement run, so
     // materialize Random before either debugger hook can snapshot the context.
+    // Address normalization is architectural dispatch work, not debugger
+    // bookkeeping, and must remain in diagnostics-free builds.
     if (ctx)
     {
         ctx->finishEeInstruction();
+        ctx->pc = normalizeGuestFunctionAddress(ctx->pc);
     }
     debugBeforeGuestStep(ctx);
     if (isStopRequested())
@@ -9571,10 +9608,12 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             lastPc = pc;
         }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         m_debugPc.store(pc, std::memory_order_relaxed);
         m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)), std::memory_order_relaxed);
         m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)), std::memory_order_relaxed);
         m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)), std::memory_order_relaxed);
+#endif
 
         RecompiledFunction fn = lookupFunction(pc, ctx);
         const uint32_t dispatchedPc = pc;
@@ -9873,9 +9912,11 @@ R5900Context *PS2Runtime::enterGuestExecution(
         return previousContext;
     }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     if (!m_debugControlActive.load(
             std::memory_order_acquire))
     {
+#endif
         m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
         lockGuestExecutionMutex(true);
         m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
@@ -9893,6 +9934,7 @@ R5900Context *PS2Runtime::enterGuestExecution(
         switchGuestExecutionContext(
             context, selectionHint);
         return previousContext;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     }
 
     for (;;)
@@ -9931,6 +9973,7 @@ R5900Context *PS2Runtime::enterGuestExecution(
     switchGuestExecutionContext(
         context, selectionHint);
     return previousContext;
+#endif
 }
 
 bool PS2Runtime::tryEnterGuestExecution(
@@ -9973,11 +10016,13 @@ bool PS2Runtime::tryEnterGuestExecution(
         return true;
     }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     if (m_debugControlActive.load(std::memory_order_acquire) &&
         m_debugPauseRequested.load(std::memory_order_acquire))
     {
         return false;
     }
+#endif
 
     m_guestExecutionWaiters.fetch_add(
         1u, std::memory_order_acq_rel);
@@ -9992,12 +10037,14 @@ bool PS2Runtime::tryEnterGuestExecution(
 
     // Close the same debugger-pause race as the blocking acquisition path.
     // The caller owns no guest state until after this check.
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     if (m_debugControlActive.load(std::memory_order_acquire) &&
         m_debugPauseRequested.load(std::memory_order_acquire))
     {
         m_guestExecutionMutex.unlock();
         return false;
     }
+#endif
 
     g_guestExecutionDepths[this] = 1u;
     recordOuterGuestExecutionAcquisition(context);
@@ -10760,6 +10807,7 @@ void PS2Runtime::debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason
     }
 }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
 void PS2Runtime::debugBeforeGuestStep(R5900Context *ctx)
 {
     if (!ctx)
@@ -10767,8 +10815,7 @@ void PS2Runtime::debugBeforeGuestStep(R5900Context *ctx)
         return;
     }
 
-    const uint32_t pc = normalizeGuestFunctionAddress(ctx->pc);
-    ctx->pc = pc;
+    const uint32_t pc = ctx->pc;
     const bool controlActive =
         m_debugControlActive.load(std::memory_order_acquire);
     if (!controlActive)
@@ -10884,6 +10931,7 @@ void PS2Runtime::debugAfterGuestStep(R5900Context *ctx)
         debugBlockGuestAtBoundary(ctx, "step");
     }
 }
+#endif
 
 bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
 {
@@ -11812,6 +11860,7 @@ void PS2Runtime::recordEeThreadQueueRotation(
 void PS2Runtime::recordMpegPictureServed(
     R5900Context *ctx, bool repeated)
 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     bool stopBeforeUniquePicture = false;
     if (!repeated && m_debugControlActive.load(std::memory_order_acquire))
     {
@@ -11838,6 +11887,10 @@ void PS2Runtime::recordMpegPictureServed(
         m_debugMpegUniquePicturesServed.fetch_add(
             1u, std::memory_order_relaxed);
     }
+#else
+    (void)ctx;
+    (void)repeated;
+#endif
 }
 
 PS2Runtime::DebugRuntimeProgress PS2Runtime::debugRuntimeProgress() const
@@ -12515,6 +12568,7 @@ bool PS2Runtime::debugWatchpointsEnabled() const
     return m_debugWatchpointsActive.load(std::memory_order_acquire);
 }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
 void PS2Runtime::debugObserveMemoryAccess(uint32_t address,
                                           uint32_t size,
                                           DebugMemoryAccess access,
@@ -12565,6 +12619,7 @@ void PS2Runtime::debugObserveMemoryAccess(uint32_t address,
         debugBlockGuestAtBoundary(mutableContext, "watchpoint");
     }
 }
+#endif
 
 PS2Runtime::DeferredGuestYieldScope::DeferredGuestYieldScope(bool &pendingOut) noexcept
     : m_pendingOut(pendingOut)
