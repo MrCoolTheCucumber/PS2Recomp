@@ -8166,11 +8166,35 @@ void PS2Runtime::serviceEeEventsAtGeneratedBlockBoundary(
         return;
     }
 
+    // Fast generated code cannot create a pending precise issue pair, but a
+    // mode transition may hand one to it. Keep that publication path out of
+    // the overwhelmingly common no-event boundary.
+    if (ctx->ee_performance_issue_pending) [[unlikely]]
+    {
+        serviceEeEventsAtGeneratedPendingIssueBoundary(
+            rdram, ctx);
+        return;
+    }
+
     // Generated Fast-mode code may carry a counted Random retirement run
     // across an internal control-flow edge. Block timing and issue state are
     // still published at every edge; Random becomes observable only when a
     // due event can enter callbacks/exceptions or another explicit
     // publication barrier is reached.
+    const ps2x::timing::EeTick eeCycleTick =
+        publishEeElapsed(ctx->finishEeBasicBlock());
+    if (!m_eeEventScheduler.deadlineDue(eeCycleTick))
+    {
+        return;
+    }
+
+    serviceEeEventsAtGeneratedDeadline(
+        rdram, ctx, eeCycleTick);
+}
+
+void PS2Runtime::serviceEeEventsAtGeneratedPendingIssueBoundary(
+    uint8_t *rdram, R5900Context *ctx)
+{
     flushEeInstructionIssue(ctx);
     const ps2x::timing::EeTick eeCycleTick =
         publishEeElapsed(ctx->finishEeBasicBlock());
@@ -8179,6 +8203,15 @@ void PS2Runtime::serviceEeEventsAtGeneratedBlockBoundary(
         return;
     }
 
+    ctx->finishEeInstruction();
+    serviceEeEventsAtTick(rdram, ctx, eeCycleTick);
+}
+
+void PS2Runtime::serviceEeEventsAtGeneratedDeadline(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    ps2x::timing::EeTick eeCycleTick)
+{
     ctx->finishEeInstruction();
     serviceEeEventsAtTick(rdram, ctx, eeCycleTick);
 }

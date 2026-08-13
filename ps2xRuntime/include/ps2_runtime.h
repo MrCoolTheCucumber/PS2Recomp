@@ -154,25 +154,29 @@ static_assert(sizeof(EeObservationInstructionDescriptor) == 24u);
 
 #if defined(_MSC_VER)
 #define PS2X_EE_OBSERVATION_POLICY_INLINE __forceinline
-#define PS2X_EE_MEMORY_POLICY_NOINLINE __declspec(noinline)
+#define PS2X_EE_RUNTIME_NOINLINE __declspec(noinline)
+#define PS2X_EE_MEMORY_POLICY_NOINLINE PS2X_EE_RUNTIME_NOINLINE
 #define PS2X_EE_OBSERVATION_PRECISE_BODY __declspec(noinline)
 #elif defined(__GNUC__) && !defined(__clang__)
 #define PS2X_EE_OBSERVATION_POLICY_INLINE                              \
     inline __attribute__((always_inline))
-#define PS2X_EE_MEMORY_POLICY_NOINLINE                                 \
+#define PS2X_EE_RUNTIME_NOINLINE                                       \
     __attribute__((noinline, noipa))
+#define PS2X_EE_MEMORY_POLICY_NOINLINE PS2X_EE_RUNTIME_NOINLINE
 #define PS2X_EE_OBSERVATION_PRECISE_BODY                               \
     __attribute__((noinline, noipa, cold, optimize("Oz"),             \
                    section(".text.unlikely.ee_observation")))
 #elif defined(__clang__)
 #define PS2X_EE_OBSERVATION_POLICY_INLINE                              \
     inline __attribute__((always_inline))
-#define PS2X_EE_MEMORY_POLICY_NOINLINE __attribute__((noinline))
+#define PS2X_EE_RUNTIME_NOINLINE __attribute__((noinline))
+#define PS2X_EE_MEMORY_POLICY_NOINLINE PS2X_EE_RUNTIME_NOINLINE
 #define PS2X_EE_OBSERVATION_PRECISE_BODY                               \
     __attribute__((noinline, cold, minsize,                            \
                    section(".text.unlikely.ee_observation")))
 #else
 #define PS2X_EE_OBSERVATION_POLICY_INLINE inline
+#define PS2X_EE_RUNTIME_NOINLINE
 #define PS2X_EE_MEMORY_POLICY_NOINLINE
 #define PS2X_EE_OBSERVATION_PRECISE_BODY
 #endif
@@ -2253,6 +2257,15 @@ private:
         ps2x::timing::EeTick eeCycleTick,
         ps2x::timing::EeTick nextEventTick);
     void serviceEeEventsAtTick(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        ps2x::timing::EeTick eeCycleTick);
+    PS2X_EE_RUNTIME_NOINLINE
+    void serviceEeEventsAtGeneratedPendingIssueBoundary(
+        uint8_t *rdram,
+        R5900Context *ctx);
+    PS2X_EE_RUNTIME_NOINLINE
+    void serviceEeEventsAtGeneratedDeadline(
         uint8_t *rdram,
         R5900Context *ctx,
         ps2x::timing::EeTick eeCycleTick);

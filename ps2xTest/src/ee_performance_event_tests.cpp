@@ -278,6 +278,75 @@ void register_ee_performance_event_tests()
                     ctx.cop0_pcr1, 0u,
                     "Config.DIE clear must suppress dual issue events");
             }
+
+            {
+                PS2Runtime runtime;
+                R5900Context ctx{};
+                ctx.cop0_config |= kConfigDie;
+                configurePerformance(
+                    runtime, ctx, 2u, 2u);
+
+                runtime.recordEeInstructionIssue(
+                    &ctx,
+                    {kIssuePipe0, 0u,
+                     1u << 8u, 0u});
+                ctx.advanceEeCycleTicks(8u);
+                runtime.serviceEeEventsAtGeneratedBlockBoundary(
+                    nullptr, &ctx);
+
+                t.Equals(
+                    ctx.cop0_pcr0, 1u,
+                    "a generated boundary should publish a pending precise issue");
+                t.Equals(
+                    ctx.cop0_pcr1, 0u,
+                    "an unpaired precise issue must remain single issue");
+                t.IsFalse(
+                    ctx.ee_performance_issue_pending,
+                    "the generated boundary should clear pending precise issue state");
+                t.IsFalse(
+                    ctx.ee_block_cycle_active,
+                    "the generated pending-issue path should finish its timing block");
+            }
+
+            {
+                PS2Runtime runtime;
+                R5900Context ctx{};
+                ctx.pc = 0x00103700u;
+                ctx.cop0_config |= kConfigDie;
+                configurePerformance(
+                    runtime, ctx, 2u, 2u,
+                    0x7fffffffu, 0u);
+
+                runtime.recordEeInstructionIssue(
+                    &ctx,
+                    {kIssuePipe0, 0u,
+                     1u << 9u, 0u});
+                ctx.advanceEeCycleTicks(8u);
+                bool raised = false;
+                try
+                {
+                    runtime.serviceEeEventsAtGeneratedBlockBoundary(
+                        nullptr, &ctx);
+                }
+                catch (const PS2GuestException &)
+                {
+                    raised = true;
+                }
+
+                t.IsTrue(
+                    raised,
+                    "a generated pending issue should service its new overflow event");
+                t.Equals(
+                    ctx.pc, 0x80000080u,
+                    "the generated issue overflow should use the performance vector");
+                t.Equals(
+                    ctx.cop0_cause & 0x00070000u,
+                    0x00020000u,
+                    "the generated issue overflow should publish the performance cause");
+                t.IsFalse(
+                    ctx.ee_performance_issue_pending,
+                    "overflow delivery should leave no pending precise issue");
+            }
         });
 
         tc.Run("branch hooks count predicted forms and conditional misses", [](TestCase &t)
