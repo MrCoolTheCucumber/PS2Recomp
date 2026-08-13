@@ -5809,7 +5809,15 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+#if defined(PLATFORM_VITA)
         SetTargetFPS(60);
+#else
+        // The desktop runtime applies a blocking steady-clock deadline after
+        // EndDrawing. Raylib's default limiter spins through the final 5% of
+        // every wait, which needlessly consumes host CPU while the guest
+        // executor is the bottleneck.
+        SetTargetFPS(0);
+#endif
         setRealtimeVSyncPacingEnabled(true);
         if (m_debugUiInitCallback)
         {
@@ -13613,6 +13621,14 @@ void PS2Runtime::run()
     uint64_t windowTitleSamplePeriodCycles =
         m_debugVSyncPeriodCycles.load(
             std::memory_order_relaxed);
+#if !defined(PLATFORM_VITA)
+    const WindowRateClock::duration hostFramePeriod =
+        std::chrono::duration_cast<
+            WindowRateClock::duration>(
+            std::chrono::duration<double>(1.0 / 60.0));
+    WindowRateClock::time_point hostFrameDeadline =
+        WindowRateClock::now();
+#endif
     while (
         !isStopRequested() &&
         (dedicatedExecutor
@@ -13785,6 +13801,23 @@ void PS2Runtime::run()
             requestStop();
             break;
         }
+
+#if !defined(PLATFORM_VITA)
+        hostFrameDeadline += hostFramePeriod;
+        const WindowRateClock::time_point hostFrameNow =
+            WindowRateClock::now();
+        if (hostFrameNow < hostFrameDeadline)
+        {
+            std::this_thread::sleep_until(
+                hostFrameDeadline);
+        }
+        else if (hostFrameNow - hostFrameDeadline >=
+                 hostFramePeriod)
+        {
+            // Do not replay missed presentation slots after a slow frame.
+            hostFrameDeadline = hostFrameNow;
+        }
+#endif
     }
 
     requestStop();
