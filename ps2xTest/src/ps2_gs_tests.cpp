@@ -2272,6 +2272,71 @@ void register_ps2_gs_tests()
                 "the resumed transfer should complete at the fourth pixel");
         });
 
+        tc.Run("GS replay restore flushes queued work before replacing frontend state", [](TestCase &t)
+        {
+            ScopedEnvironmentVariable rasterThreads(
+                "PS2X_GS_RASTER_THREADS", "4");
+            ScopedEnvironmentVariable parallelEnabled(
+                "PS2X_GS_DISABLE_PARALLEL_RASTERIZER", "0");
+
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(
+                vram.data(),
+                static_cast<uint32_t>(vram.size()),
+                nullptr);
+            gs.setProgressTrackingEnabled(true);
+
+            constexpr uint32_t kRestoredColor = 0x80445566u;
+            constexpr uint32_t kQueuedColor = 0x80112233u;
+            gs.writeRegister(GS_REG_FRAME_1, 1ull << 16u);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32u);
+            gs.writeRegister(
+                GS_REG_SCISSOR_1,
+                (127ull << 16u) | (127ull << 48u));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(
+                GS_REG_PRIM,
+                static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, kRestoredColor);
+            const GsReplayState restored =
+                gs.captureReplayState();
+
+            gs.writeRegister(GS_REG_RGBAQ, kQueuedColor);
+            gs.beginRenderBatch();
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(
+                GS_REG_XYZ2,
+                (64ull * 16ull) |
+                    ((64ull * 16ull) << 16u));
+            t.Equals(gs.getProgressSnapshot().drawsStarted, 0ull,
+                     "the pre-restore draw should remain queued");
+
+            t.IsTrue(
+                gs.restoreReplayState(restored),
+                "restoring frontend state should synchronize queued work");
+            t.Equals(gs.getProgressSnapshot().drawsCompleted, 1ull,
+                     "restore should finish preceding raster work");
+            t.Equals(
+                gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u),
+                kQueuedColor,
+                "work ordered before restore should remain committed");
+
+            gs.beginRenderBatch();
+            gs.writeRegister(
+                GS_REG_XYZ2,
+                64ull * 16ull);
+            gs.writeRegister(
+                GS_REG_XYZ2,
+                (65ull * 16ull) | (1ull << 16u));
+            gs.endRenderBatch();
+            t.Equals(
+                gs.ReadVram(GS_PSM_CT32, 0u, 1u, 64u, 0u),
+                kRestoredColor,
+                "work after restore should observe restored frontend state");
+        });
+
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;
@@ -4025,7 +4090,7 @@ void register_ps2_gs_tests()
             t.IsTrue(imageOk, "NREG=0 REGLIST should consume 16 data words and keep following tag aligned");
         });
 
-        tc.Run("GS SIGNAL and FINISH set CSR bits that clear by CSR write-one acknowledge", [](TestCase &t)
+        tc.Run("GS SIGNAL FINISH and LABEL retain GIF order and CSR acknowledgement", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -4033,13 +4098,41 @@ void register_ps2_gs_tests()
             GS gs;
             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
 
-            const uint64_t signalValue = (0xFFFFFFFFull << 32) | 0x11223344ull;
-            gs.writeRegister(GS_REG_SIGNAL, signalValue);
-            gs.writeRegister(GS_REG_FINISH, 0u);
+            std::vector<uint8_t> packet;
+            appendU64(packet, makeGifTag(5u, GIF_FMT_PACKED, 1u));
+            appendU64(packet, 0x0Eull); // A+D.
+            appendGifAd(
+                packet,
+                (0xFFFFFFFFull << 32u) | 0x11223344ull,
+                GS_REG_SIGNAL);
+            appendGifAd(
+                packet,
+                (0xFFFFFFFFull << 32u) | 0x55667788ull,
+                GS_REG_LABEL);
+            appendGifAd(
+                packet,
+                (0x0000FFFFull << 32u) | 0x0000A5A5ull,
+                GS_REG_SIGNAL);
+            appendGifAd(packet, 0u, GS_REG_FINISH);
+            appendGifAd(
+                packet,
+                (0xFFFF0000ull << 32u) | 0xCCDD0000ull,
+                GS_REG_LABEL);
+            gs.processGIFPacket(
+                packet.data(),
+                static_cast<uint32_t>(packet.size()));
 
             t.IsTrue((mem.gs().csr & 0x1ull) != 0ull, "SIGNAL should raise CSR.SIGNAL");
             t.IsTrue((mem.gs().csr & 0x2ull) != 0ull, "FINISH should raise CSR.FINISH");
-            t.Equals(static_cast<uint32_t>(mem.gs().siglblid & 0xFFFFFFFFull), 0x11223344u, "SIGNAL should update SIGLBLID low dword");
+            t.Equals(
+                static_cast<uint32_t>(
+                    mem.gs().siglblid & 0xFFFFFFFFull),
+                0x1122A5A5u,
+                "later masked SIGNAL should update the low dword in packet order");
+            t.Equals(
+                static_cast<uint32_t>(mem.gs().siglblid >> 32u),
+                0xCCDD7788u,
+                "later masked LABEL should update the high dword in packet order");
 
             mem.write64(0x12001000u, 0x1ull);
             t.IsTrue((mem.gs().csr & 0x1ull) == 0ull, "writing CSR bit0 should acknowledge SIGNAL");
@@ -4047,6 +4140,66 @@ void register_ps2_gs_tests()
 
             mem.write32(0x12001000u, 0x2u);
             t.IsTrue((mem.gs().csr & 0x2ull) == 0ull, "writing CSR bit1 should acknowledge FINISH");
+        });
+
+        tc.Run("GS local-to-host observation drains queued raster work", [](TestCase &t)
+        {
+            ScopedEnvironmentVariable rasterThreads(
+                "PS2X_GS_RASTER_THREADS", "4");
+            ScopedEnvironmentVariable parallelEnabled(
+                "PS2X_GS_DISABLE_PARALLEL_RASTERIZER", "0");
+
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(
+                vram.data(),
+                static_cast<uint32_t>(vram.size()),
+                nullptr);
+            gs.setProgressTrackingEnabled(true);
+
+            constexpr uint32_t kColor = 0x80112233u;
+            gs.writeRegister(GS_REG_FRAME_1, 1ull << 16u);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32u);
+            gs.writeRegister(
+                GS_REG_SCISSOR_1,
+                (63ull << 16u) | (63ull << 48u));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(
+                GS_REG_PRIM,
+                static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, kColor);
+
+            gs.beginRenderBatch();
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(
+                GS_REG_XYZ2,
+                (64ull * 16ull) |
+                    ((64ull * 16ull) << 16u));
+            t.Equals(gs.getProgressSnapshot().drawsStarted, 0ull,
+                     "the sprite should remain queued before observation");
+
+            gs.writeRegister(
+                GS_REG_BITBLTBUF,
+                1ull << 16u); // SBP=0, SBW=1, SPSM=CT32.
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(
+                GS_REG_TRXREG,
+                1ull | (1ull << 32u));
+            gs.writeRegister(GS_REG_TRXDIR, 1ull);
+
+            uint32_t observed = 0u;
+            t.Equals(
+                gs.consumeLocalToHostBytes(
+                    reinterpret_cast<uint8_t *>(&observed),
+                    sizeof(observed)),
+                static_cast<uint32_t>(sizeof(observed)),
+                "the local-to-host FIFO should expose one queued pixel");
+            t.Equals(observed, kColor,
+                     "VRAM observation should include preceding queued raster work");
+            t.Equals(gs.getProgressSnapshot().drawsCompleted, 1ull,
+                     "the observation barrier should complete the queued draw");
+            gs.endRenderBatch();
         });
 
         tc.Run("GIF IMAGE packet writes host-to-local data into GS VRAM", [](TestCase &t)

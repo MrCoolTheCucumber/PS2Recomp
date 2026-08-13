@@ -5640,6 +5640,275 @@ void register_ps2_runtime_expansion_tests()
                 0x10003C10u, 1u);
         });
 
+        tc.Run("equal-tick VIF1 completion publishes before VU1 service", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "equal-tick VIF1/VU1 memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "equal-tick VIF1/VU1 subsystems should bind");
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            uint8_t *const code = runtime.memory().getVU1Code();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            writeVuInstructionPair(code, 0u, 0u, kVuUpperEnd);
+            writeVuInstructionPair(code, 8u, 0u, kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kSource = 0x00030000u;
+            constexpr uint32_t kPayloadQwc = 8u;
+            std::array<uint32_t, kPayloadQwc * 4u> payload{};
+            payload[0] = makeVifCmd(0x14u, 0u, 0u); // MSCAL.
+            std::memcpy(
+                runtime.memory().getRDRAM() + kSource,
+                payload.data(), sizeof(payload));
+
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x10u, kSource),
+                     "VIF1 MADR write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x20u, kPayloadQwc),
+                     "VIF1 QWC write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1, 0x100u),
+                     "VIF1 normal start should succeed");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            const PS2Runtime::DebugEeScheduler armed =
+                runtime.debugEeSchedulerSnapshot();
+            const auto &vifSlot =
+                armed.slots[ps2x::timing::eeEventSourceIndex(
+                    ps2x::timing::EeEventSource::DmacVif1)];
+            const auto &vuSlot =
+                armed.slots[ps2x::timing::eeEventSourceIndex(
+                    ps2x::timing::EeEventSource::VifVu1Finish)];
+            t.IsTrue(vifSlot.pending && vuSlot.pending,
+                     "VIF1 finalization and VU1 should both remain pending");
+            t.Equals(vifSlot.deadlineTick, 160ull,
+                     "eight VIF1 QWC should finalize at tick 160");
+            t.Equals(vuSlot.deadlineTick, 160ull,
+                     "the sixteen-cycle VU1 startup slice should share tick 160");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            const std::array<ps2x::timing::EeEventSource, 4u>
+                expectedSources = {
+                    ps2x::timing::EeEventSource::DmacVif1,
+                    ps2x::timing::EeEventSource::DmacVif1,
+                    ps2x::timing::EeEventSource::DmacCompletion,
+                    ps2x::timing::EeEventSource::VifVu1Finish,
+                };
+            t.Equals(trace.entries.size(), expectedSources.size(),
+                     "the boundary should retain initial VIF1 plus three equal-tick services");
+            if (trace.entries.size() == expectedSources.size())
+            {
+                bool sourcesMatch = true;
+                for (size_t index = 0u;
+                     index < expectedSources.size(); ++index)
+                {
+                    sourcesMatch =
+                        sourcesMatch &&
+                        trace.entries[index].source ==
+                            expectedSources[index];
+                }
+                t.IsTrue(sourcesMatch,
+                         "VIF1 finalization and its completion publication must precede VU1");
+                t.Equals(trace.entries[1].serviceTick, 160ull,
+                         "VIF1 finalization should service at the shared tick");
+                t.Equals(trace.entries[2].serviceTick, 160ull,
+                         "DMAC publication should service at the shared tick");
+                t.Equals(trace.entries[3].serviceTick, 160ull,
+                         "VU1 should service last at the shared tick");
+            }
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) & 0x2u) != 0u,
+                "VIF1 DMAC state should be published at the shared boundary");
+            t.IsFalse(runtime.vu1().isActive(),
+                      "the equal-tick VU1 slice should complete afterward");
+        });
+
+        tc.Run("event VU1 publishes XGKICK before waking stalled VIF1", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VU1 publication fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VU1 publication fixture subsystems should bind");
+
+            bool callbackSawVuActive = false;
+            bool callbackSawVifWait = false;
+            bool callbackSawDeferredCommand = false;
+            size_t packetCount = 0u;
+            runtime.gifArbiter().setProcessPacketFn(
+                [&](const uint8_t *, uint32_t)
+                {
+                    ++packetCount;
+                    callbackSawVuActive = runtime.vu1().isActive();
+                    callbackSawVifWait =
+                        runtime.memory().vif1WaitingForVu() &&
+                        (runtime.memory().vif1_regs.stat &
+                         (1u << 2u)) != 0u;
+                    callbackSawDeferredCommand =
+                        runtime.memory().vif1_regs.mode == 0u;
+                });
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            uint8_t *const code = runtime.memory().getVU1Code();
+            uint8_t *const data = runtime.memory().getVU1Data();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            std::memset(data, 0, PS2_VU1_DATA_SIZE);
+            writeVuInstructionPair(
+                code, 0u,
+                makeVuLowerSpecial(0x6Cu, 0u),
+                kVuUpperEnd);
+            writeVuInstructionPair(code, 8u, 0u, kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+            const uint64_t path1Tag =
+                makeGifTag(0u, GIF_FMT_PACKED, 1u);
+            std::memcpy(data, &path1Tag, sizeof(path1Tag));
+
+            const std::array<uint32_t, 3u> commands = {
+                makeVifCmd(0x14u, 0u, 0u), // MSCAL.
+                makeVifCmd(0x11u, 0u, 0u), // FLUSH waits for VU1.
+                makeVifCmd(0x05u, 0u, 3u), // Deferred STMOD.
+            };
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(commands.data()),
+                static_cast<uint32_t>(sizeof(commands)));
+
+            t.IsTrue(runtime.memory().vif1WaitingForVu(),
+                     "FLUSH should hold the later VIF1 command");
+            t.Equals(packetCount, size_t{0u},
+                     "MSCAL submission must not publish XGKICK early");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            t.Equals(packetCount, size_t{1u},
+                     "the scheduled VU1 slice should publish one PATH1 packet");
+            t.IsTrue(callbackSawVuActive,
+                     "XGKICK should publish from inside VU1 execution");
+            t.IsTrue(callbackSawVifWait,
+                     "XGKICK should publish before VIF1 wait state is cleared");
+            t.IsTrue(callbackSawDeferredCommand,
+                     "XGKICK should publish before the deferred VIF1 command executes");
+            t.IsFalse(runtime.memory().vif1WaitingForVu(),
+                      "VU1 completion should wake VIF1 after publication");
+            t.Equals(runtime.memory().vif1_regs.mode, 3u,
+                     "the deferred VIF1 command should execute after publication");
+        });
+
+        tc.Run("EE VU1 micro and data writes are ordered before MSCAL", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "direct VU1 write fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "direct VU1 write fixture subsystems should bind");
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            const auto pair = [](uint32_t lower, uint32_t upper)
+            {
+                return static_cast<uint64_t>(lower) |
+                       (static_cast<uint64_t>(upper) << 32u);
+            };
+            runtime.memory().write64(
+                PS2_VU1_CODE_BASE,
+                pair(makeVuLq(0xFu, 1u, 0u, 0), kVuUpperEnd));
+            runtime.memory().write64(
+                PS2_VU1_CODE_BASE + 8u,
+                pair(0u, kVuUpperNop));
+            const __m128 data = _mm_set_ps(4.0f, 3.0f, 2.0f, 1.0f);
+            runtime.memory().write128(
+                PS2_VU1_DATA_BASE,
+                _mm_castps_si128(data));
+
+            const uint32_t mscal = makeVifCmd(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            const VuExecutionState &state = runtime.vu1().state();
+            t.Equals(state.vf[1][0], 1.0f,
+                     "MSCAL should observe the preceding EE data write in x");
+            t.Equals(state.vf[1][1], 2.0f,
+                     "MSCAL should observe the preceding EE data write in y");
+            t.Equals(state.vf[1][2], 3.0f,
+                     "MSCAL should observe the preceding EE data write in z");
+            t.Equals(state.vf[1][3], 4.0f,
+                     "MSCAL should observe the preceding EE data write in w");
+        });
+
+        tc.Run("VIF1 UNPACK data is visible to the following VU1 execution", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VIF1 UNPACK fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VIF1 UNPACK fixture subsystems should bind");
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            const auto pair = [](uint32_t lower, uint32_t upper)
+            {
+                return static_cast<uint64_t>(lower) |
+                       (static_cast<uint64_t>(upper) << 32u);
+            };
+            runtime.memory().write64(
+                PS2_VU1_CODE_BASE,
+                pair(makeVuLq(0xFu, 1u, 0u, 0), kVuUpperEnd));
+            runtime.memory().write64(
+                PS2_VU1_CODE_BASE + 8u,
+                pair(0u, kVuUpperNop));
+
+            const std::array<uint32_t, 6u> stream = {
+                makeVifCmd(0x6Cu, 1u, 0u), // UNPACK V4-32 to qword 0.
+                0x3F800000u,
+                0x40000000u,
+                0x40400000u,
+                0x40800000u,
+                makeVifCmd(0x14u, 0u, 0u), // MSCAL.
+            };
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(stream.data()),
+                static_cast<uint32_t>(sizeof(stream)));
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            const VuExecutionState &state = runtime.vu1().state();
+            t.Equals(state.vf[1][0], 1.0f,
+                     "VU1 should load UNPACK x before executing");
+            t.Equals(state.vf[1][1], 2.0f,
+                     "VU1 should load UNPACK y before executing");
+            t.Equals(state.vf[1][2], 3.0f,
+                     "VU1 should load UNPACK z before executing");
+            t.Equals(state.vf[1][3], 4.0f,
+                     "VU1 should load UNPACK w before executing");
+        });
+
         tc.Run("event SPR_TO normal DMA retains busy state for its reference bus cost", [](TestCase &t)
         {
             PS2Runtime runtime;
