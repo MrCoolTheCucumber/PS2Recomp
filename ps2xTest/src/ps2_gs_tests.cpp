@@ -16,6 +16,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
@@ -1886,6 +1887,196 @@ void register_ps2_gs_tests()
                 nativeGs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u),
                 0u,
                 "native packet decoding should not execute the packet suffix");
+        });
+
+        tc.Run("GS packed ST RGBA XYZF2 tuples match scalar register decoding", [](TestCase &t)
+        {
+            const auto configure = [](GS &gs)
+            {
+                gs.writeRegister(GS_REG_FRAME_1, 1ull << 16u);
+                gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32u);
+                gs.writeRegister(
+                    GS_REG_SCISSOR_1,
+                    (63ull << 16u) | (63ull << 48u));
+                gs.writeRegister(GS_REG_TEST_1, 0u);
+                gs.writeRegister(
+                    GS_REG_PRIM,
+                    static_cast<uint64_t>(GS_PRIM_TRISTRIP) |
+                        (1ull << 3u));
+            };
+            const auto appendPackedTuple = [](
+                std::vector<uint8_t> &packet,
+                float s,
+                float textureT,
+                float q,
+                uint32_t rgba,
+                uint16_t x,
+                uint16_t y,
+                uint32_t z,
+                uint8_t fog,
+                bool adc)
+            {
+                appendU64(
+                    packet,
+                    static_cast<uint64_t>(std::bit_cast<uint32_t>(s)) |
+                        (static_cast<uint64_t>(
+                             std::bit_cast<uint32_t>(textureT)) << 32u));
+                appendU64(packet, std::bit_cast<uint32_t>(q));
+                appendU64(
+                    packet,
+                    static_cast<uint64_t>(rgba & 0xFFu) |
+                        (static_cast<uint64_t>((rgba >> 8u) & 0xFFu) << 32u));
+                appendU64(
+                    packet,
+                    static_cast<uint64_t>((rgba >> 16u) & 0xFFu) |
+                        (static_cast<uint64_t>((rgba >> 24u) & 0xFFu) << 32u));
+                appendU64(
+                    packet,
+                    static_cast<uint64_t>(x) |
+                        (static_cast<uint64_t>(y) << 32u));
+                appendU64(
+                    packet,
+                    (static_cast<uint64_t>(z & 0xFFFFFFu) << 4u) |
+                        (static_cast<uint64_t>(fog) << 36u) |
+                        (static_cast<uint64_t>(adc) << 47u));
+            };
+            const auto appendScalarTuple = [](
+                std::vector<uint8_t> &packet,
+                float s,
+                float textureT,
+                float q,
+                uint32_t rgba,
+                uint16_t x,
+                uint16_t y,
+                uint32_t z,
+                uint8_t fog,
+                bool adc)
+            {
+                const uint64_t st =
+                    static_cast<uint64_t>(std::bit_cast<uint32_t>(s)) |
+                    (static_cast<uint64_t>(
+                         std::bit_cast<uint32_t>(textureT)) << 32u);
+                const uint64_t rgbaq =
+                    static_cast<uint64_t>(rgba) |
+                    (static_cast<uint64_t>(
+                         std::bit_cast<uint32_t>(q)) << 32u);
+                const uint64_t xyzf =
+                    static_cast<uint64_t>(x) |
+                    (static_cast<uint64_t>(y) << 16u) |
+                    (static_cast<uint64_t>(z & 0xFFFFFFu) << 32u) |
+                    (static_cast<uint64_t>(fog) << 56u);
+                appendGifAd(packet, st, GS_REG_ST);
+                appendGifAd(packet, rgbaq, GS_REG_RGBAQ);
+                appendGifAd(
+                    packet,
+                    xyzf,
+                    adc ? GS_REG_XYZF3 : GS_REG_XYZF2);
+            };
+
+            constexpr size_t kVertexCount = 7u;
+            const std::array<float, kVertexCount> s{{
+                0.25f, 1.5f, -0.75f, 2.0f, 4.25f, 0.0f, -2.5f}};
+            const std::array<float, kVertexCount> textureT{{
+                -1.0f, 0.5f, 2.25f, 1.0f, -3.0f, 5.5f, 0.125f}};
+            const std::array<float, kVertexCount> q{{
+                1.0f, 0.5f, 0.0f, 2.0f, 1.25f, 0.75f, 4.0f}};
+            const std::array<uint32_t, kVertexCount> rgba{{
+                0x80402010u, 0x90705030u, 0xA06080C0u, 0x703090E0u,
+                0xC0A04020u, 0x604080A0u, 0xB0906030u}};
+            const std::array<uint16_t, kVertexCount> x{{
+                16u, 160u, 32u, 192u, 64u, 224u, 96u}};
+            const std::array<uint16_t, kVertexCount> y{{
+                16u, 32u, 192u, 176u, 48u, 208u, 80u}};
+            const std::array<uint32_t, kVertexCount> z{{
+                0x1000u, 0x2000u, 0x3000u, 0x4000u,
+                0x5000u, 0x6000u, 0x7000u}};
+            const std::array<uint8_t, kVertexCount> fog{{
+                10u, 40u, 70u, 100u, 130u, 160u, 190u}};
+            const std::array<bool, kVertexCount> adc{{
+                false, false, true, false, false, false, false}};
+
+            std::vector<uint8_t> packedPacket;
+            appendU64(
+                packedPacket,
+                makeGifTag(kVertexCount, GIF_FMT_PACKED, 3u));
+            appendU64(packedPacket, 0x412ull);
+            std::vector<uint8_t> scalarPacket;
+            appendU64(
+                scalarPacket,
+                makeGifTag(kVertexCount * 3u, GIF_FMT_PACKED, 1u));
+            appendU64(scalarPacket, 0xEull);
+            for (size_t index = 0u; index < kVertexCount; ++index)
+            {
+                appendPackedTuple(
+                    packedPacket, s[index], textureT[index], q[index],
+                    rgba[index], x[index], y[index], z[index],
+                    fog[index], adc[index]);
+                appendScalarTuple(
+                    scalarPacket, s[index], textureT[index], q[index],
+                    rgba[index], x[index], y[index], z[index],
+                    fog[index], adc[index]);
+            }
+
+            const auto run = [&](bool stopAfterFirstDraw)
+            {
+                std::vector<uint8_t> packedVram(PS2_GS_VRAM_SIZE, 0u);
+                std::vector<uint8_t> scalarVram(PS2_GS_VRAM_SIZE, 0u);
+                GS packedGs;
+                GS scalarGs;
+                packedGs.init(
+                    packedVram.data(),
+                    static_cast<uint32_t>(packedVram.size()), nullptr);
+                scalarGs.init(
+                    scalarVram.data(),
+                    static_cast<uint32_t>(scalarVram.size()), nullptr);
+                packedGs.setDebugHistoryPaused(true);
+                scalarGs.setDebugHistoryPaused(true);
+                configure(packedGs);
+                configure(scalarGs);
+                if (stopAfterFirstDraw)
+                {
+                    packedGs.setDrawCommandLimit(1u);
+                    scalarGs.setDrawCommandLimit(1u);
+                }
+                packedGs.processGIFPacket(
+                    packedPacket.data(),
+                    static_cast<uint32_t>(packedPacket.size()));
+                scalarGs.processGIFPacket(
+                    scalarPacket.data(),
+                    static_cast<uint32_t>(scalarPacket.size()));
+                packedGs.flushRenderBatch();
+                scalarGs.flushRenderBatch();
+
+                t.IsTrue(
+                    packedVram == scalarVram,
+                    stopAfterFirstDraw
+                        ? "bounded packed tuple decoding must match scalar VRAM"
+                        : "packed tuple decoding must match scalar VRAM");
+                std::vector<uint8_t> packedState;
+                std::vector<uint8_t> scalarState;
+                std::string stateError;
+                t.IsTrue(
+                    encodeGsReplayState(
+                        packedGs.captureReplayState(),
+                        packedState, &stateError),
+                    "packed tuple state should encode");
+                t.IsTrue(
+                    encodeGsReplayState(
+                        scalarGs.captureReplayState(),
+                        scalarState, &stateError),
+                    "scalar tuple state should encode");
+                t.IsTrue(
+                    packedState == scalarState,
+                    stopAfterFirstDraw
+                        ? "bounded packed tuple decoding must preserve exact frontend state"
+                        : "packed tuple decoding must preserve exact frontend state");
+                t.Equals(
+                    packedGs.submittedDrawCommandCount(),
+                    scalarGs.submittedDrawCommandCount(),
+                    "packed and scalar tuple paths should submit the same draws");
+            };
+            run(false);
+            run(true);
         });
 
         tc.Run("GS replay state preserves partial primitive assembly", [](TestCase &t)

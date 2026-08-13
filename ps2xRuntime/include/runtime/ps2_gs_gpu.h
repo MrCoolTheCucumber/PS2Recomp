@@ -217,6 +217,9 @@ public:
                             u32 y) const;
 
 private:
+    [[nodiscard]] bool processPackedStRgbaXyzf2(
+        const uint8_t *data,
+        uint32_t vertexCount);
     void snapshotVRAM();
     void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);
     void vertexKick(bool drawing);

@@ -1984,6 +1984,23 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
         if (flg == GIF_FMT_PACKED)
         {
+            // ST/RGBA/XYZF2 is the conventional packed triangle stream. Once
+            // the complete payload is known to be present, decode the fixed
+            // tuple directly instead of redispatching all three descriptors
+            // for every vertex. Truncated packets retain the scalar decoder's
+            // prefix-processing behavior below.
+            const uint64_t packedTupleBytes =
+                static_cast<uint64_t>(nloop) * 48ull;
+            if (nreg == 3u &&
+                (tagHi & 0xFFFu) == 0x412u &&
+                packedTupleBytes <= sizeBytes - offset)
+            {
+                if (!processPackedStRgbaXyzf2(
+                        data + offset, nloop))
+                    return;
+                offset += static_cast<uint32_t>(packedTupleBytes);
+                continue;
+            }
             for (uint32_t loop = 0; loop < nloop; ++loop)
             {
                 for (uint32_t r = 0; r < nreg; ++r)
@@ -2025,6 +2042,83 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             offset += imageBytes;
         }
     }
+}
+
+bool GS::processPackedStRgbaXyzf2(
+    const uint8_t *data,
+    uint32_t vertexCount)
+{
+    for (uint32_t index = 0u; index < vertexCount; ++index)
+    {
+        const uint8_t *tuple = data + static_cast<size_t>(index) * 48u;
+        const uint64_t stLo = loadLE64(tuple);
+        const uint64_t stHi = loadLE64(tuple + 8u);
+        const uint64_t rgbaLo = loadLE64(tuple + 16u);
+        const uint64_t rgbaHi = loadLE64(tuple + 24u);
+        const uint64_t xyzfLo = loadLE64(tuple + 32u);
+        const uint64_t xyzfHi = loadLE64(tuple + 40u);
+
+        const uint32_t sBits = static_cast<uint32_t>(stLo);
+        const uint32_t tBits = static_cast<uint32_t>(stLo >> 32u);
+        const uint32_t qBits = static_cast<uint32_t>(stHi);
+        m_curS = std::bit_cast<float>(sBits);
+        m_curT = std::bit_cast<float>(tBits);
+        m_curQ = std::bit_cast<float>(qBits);
+        if (m_curQ == 0.0f)
+            m_curQ = 1.0f;
+
+        m_curR = static_cast<uint8_t>(rgbaLo);
+        m_curG = static_cast<uint8_t>(rgbaLo >> 32u);
+        m_curB = static_cast<uint8_t>(rgbaHi);
+        m_curA = static_cast<uint8_t>(rgbaHi >> 32u);
+
+        const uint16_t x = static_cast<uint16_t>(xyzfLo);
+        const uint16_t y = static_cast<uint16_t>(xyzfLo >> 32u);
+        const uint32_t z =
+            static_cast<uint32_t>((xyzfHi >> 4u) & 0xFFFFFFu);
+        const uint8_t fog =
+            static_cast<uint8_t>((xyzfHi >> 36u) & 0xFFu);
+        const bool adc = ((xyzfHi >> 47u) & 1u) != 0u;
+        PS2_IF_AGRESSIVE_LOGS({
+            const uint32_t debugIndex =
+                s_debugGsPackedVertexCount.fetch_add(
+                    1u, std::memory_order_relaxed);
+            if (debugIndex < 64u)
+            {
+                RUNTIME_LOG("[gs:packed-xyzf] idx=" << debugIndex
+                                                    << " x=" << x
+                                                    << " y=" << y
+                                                    << " z=0x" << std::hex << z
+                                                    << std::dec
+                                                    << " fog=" << static_cast<uint32_t>(fog)
+                                                    << " kick=" << static_cast<uint32_t>(!adc ? 1u : 0u)
+                                                    << " prim=" << static_cast<uint32_t>(m_prim.type)
+                                                    << std::endl);
+            }
+        });
+
+        GSVertex &vertex = m_vtxQueue[m_vtxCount % kMaxVerts];
+        vertex.x12_4 = x;
+        vertex.y12_4 = y;
+        vertex.zInteger = z;
+        vertex.x = static_cast<float>(x) / 16.0f;
+        vertex.y = static_cast<float>(y) / 16.0f;
+        vertex.z = static_cast<double>(z);
+        vertex.r = m_curR;
+        vertex.g = m_curG;
+        vertex.b = m_curB;
+        vertex.a = m_curA;
+        vertex.q = m_curQ;
+        vertex.s = m_curS;
+        vertex.t = m_curT;
+        vertex.u = m_curU;
+        vertex.v = m_curV;
+        vertex.fog = fog;
+        vertexKick(!adc);
+        if (m_drawCommandLimitReached)
+            return false;
+    }
+    return true;
 }
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
