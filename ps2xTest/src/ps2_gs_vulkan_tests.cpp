@@ -5686,6 +5686,39 @@ void register_ps2_gs_vulkan_tests()
         {
             const GsDrawCommand command =
                 makeT8GouraudSourceOverDepthCt32TriangleCommand(34u);
+            GsDrawResourceCache resourceCache;
+            const GsDrawResources *resourceView = nullptr;
+            const GsBackendDecision viewDecision =
+                classifyGsT8GouraudDepthCt32Triangle(
+                    command, nullptr, &resourceCache, &resourceView);
+            t.IsTrue(viewDecision.supported,
+                     "the measured T8 state should classify through a cached resource view");
+            t.IsNotNull(resourceView,
+                        "successful view classification should publish cached resources");
+            if (resourceView)
+            {
+                t.IsTrue(*resourceView == command.resources(),
+                         "the cached resource view should match canonical description");
+            }
+
+            GSContext aliasedContext = command.context();
+            aliasedContext.tex0.tbp0 =
+                static_cast<uint16_t>(aliasedContext.frame.fbp << 5u);
+            const GsDrawCommand aliased = buildGsDrawCommand(
+                35u, command.primitive(), aliasedContext,
+                std::span<const GSVertex>(command.vertices()),
+                command.globalState());
+            const GsDrawResources sentinelResources = command.resources();
+            resourceView = &sentinelResources;
+            const GsBackendDecision aliasDecision =
+                classifyGsT8GouraudDepthCt32Triangle(
+                    aliased, nullptr, &resourceCache, &resourceView);
+            t.Equals(aliasDecision.reason,
+                     GsFallbackReason::ResourceAlias,
+                     "an aliased cached view must remain outside the T8 contract");
+            t.IsNotNull(resourceView,
+                        "resource rejection should still expose the exact classified view");
+
             std::array<uint32_t, 256> palette{};
             for (uint32_t index = 0u; index < palette.size(); ++index)
             {

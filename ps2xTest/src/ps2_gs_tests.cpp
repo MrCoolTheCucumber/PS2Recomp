@@ -667,9 +667,13 @@ void register_ps2_gs_tests()
             const auto expectCachedExact =
                 [&](const GsDrawCommand &command, const char *message)
             {
+                const GsDrawResources expected = command.resources();
+                const GsDrawResources &view =
+                    cache.describeView(command);
+                t.IsTrue(view == expected, message);
                 GsDrawResources cached;
                 cache.describe(command, cached);
-                t.IsTrue(cached == command.resources(), message);
+                t.IsTrue(cached == expected, message);
             };
 
             expectCachedExact(

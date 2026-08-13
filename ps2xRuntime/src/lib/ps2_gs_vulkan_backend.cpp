@@ -841,7 +841,7 @@ struct GsVulkanRasterBackend::Impl final
     bool residentFeedbackSnapshotValid = false;
     const GsDrawCommand *classifiedT8Command = nullptr;
     uint64_t classifiedT8Sequence = 0u;
-    GsDrawResources classifiedT8Resources;
+    const GsDrawResources *classifiedT8ResourceView = nullptr;
     const GsDrawCommand *classifiedFeedbackNearestCommand = nullptr;
     uint64_t classifiedFeedbackNearestSequence = 0u;
     GsDrawResources classifiedFeedbackNearestResources;
@@ -1363,6 +1363,7 @@ GsBackendDecision GsVulkanRasterBackend::classify(
     const GsDrawCommand &command) const
 {
     m_impl->classifiedT8Command = nullptr;
+    m_impl->classifiedT8ResourceView = nullptr;
     m_impl->classifiedFeedbackNearestCommand = nullptr;
     if (m_impl->shutDown || m_impl->failed ||
         !m_impl->executor->healthy())
@@ -1558,8 +1559,9 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         const GsBackendDecision t8Decision =
             classifyGsT8GouraudDepthCt32Triangle(
                 command,
-                &m_impl->classifiedT8Resources,
-                &m_impl->drawResourceCache);
+                nullptr,
+                &m_impl->drawResourceCache,
+                &m_impl->classifiedT8ResourceView);
         if (t8Decision.supported)
         {
             m_impl->classifiedT8Command = &command;
@@ -1830,7 +1832,8 @@ void GsVulkanRasterBackend::submit(
             }
             else
             {
-                commandResources[index] = m_impl->classifiedT8Resources;
+                commandResources[index] =
+                    *m_impl->classifiedT8ResourceView;
                 commandIsT8[index] = 1u;
             }
         }
@@ -1839,7 +1842,10 @@ void GsVulkanRasterBackend::submit(
         else
             commandResources[index] = command.resources();
     }
+    const GsDrawResources *singletonT8ResourceView =
+        m_impl->classifiedT8ResourceView;
     m_impl->classifiedT8Command = nullptr;
+    m_impl->classifiedT8ResourceView = nullptr;
     m_impl->classifiedFeedbackNearestCommand = nullptr;
 
     for (size_t commandIndex = 0u;
@@ -1866,7 +1872,7 @@ void GsVulkanRasterBackend::submit(
             ? (singletonIsFeedbackNearest
                    ? m_impl->classifiedFeedbackNearestResources
                : singletonIsT8
-                   ? m_impl->classifiedT8Resources
+                   ? *singletonT8ResourceView
                    : singletonResources)
             : commandResources[commandIndex];
         const bool isTriangle =

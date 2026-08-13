@@ -160,6 +160,11 @@ private:
 class GsDrawResourceCache final
 {
 public:
+    // The returned view remains valid until the next describe/reset call on
+    // this cache. Immediate accelerated submission can consume it without
+    // copying all nine page masks.
+    [[nodiscard]] const GsDrawResources &describeView(
+        const GsDrawCommand &command) noexcept;
     void describe(const GsDrawCommand &command,
                   GsDrawResources &resources) noexcept;
     void reset() noexcept;
@@ -567,7 +572,8 @@ classifyGsGouraudSourceOverDepthCt32Triangle(
 classifyGsT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
     GsDrawResources *supportedResources = nullptr,
-    GsDrawResourceCache *resourceCache = nullptr) noexcept;
+    GsDrawResourceCache *resourceCache = nullptr,
+    const GsDrawResources **supportedResourceView = nullptr) noexcept;
 
 [[nodiscard]] std::string_view gsFallbackReasonName(
     GsFallbackReason reason) noexcept;

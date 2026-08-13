@@ -964,11 +964,17 @@ void GsDrawResourceCache::describe(
     const GsDrawCommand &command,
     GsDrawResources &resources) noexcept
 {
+    resources = describeView(command);
+}
+
+const GsDrawResources &GsDrawResourceCache::describeView(
+    const GsDrawCommand &command) noexcept
+{
     const GsDrawBounds &bounds = command.bounds();
     if (bounds.empty())
     {
-        resources = {};
-        return;
+        static const GsDrawResources emptyResources;
+        return emptyResources;
     }
 
     const GSContext &context = command.context();
@@ -985,8 +991,7 @@ void GsDrawResourceCache::describe(
         m_depthExtent == depthExtent &&
         m_resourceState == resourceState)
     {
-        resources = m_resources;
-        return;
+        return m_resources;
     }
 
     if (!m_textureState ||
@@ -1007,16 +1012,16 @@ void GsDrawResourceCache::describe(
         command.context(),
         command.globalState(),
         command.bounds(),
-        resources,
+        m_resources,
         &m_texturePages,
         &m_mipPages,
         &m_clutPages,
         m_unknownTextureLayout);
     m_resourceState = resourceState;
-    m_resources = resources;
     m_framebufferExtent = framebufferExtent;
     m_depthExtent = depthExtent;
     m_resourceStateValid = true;
+    return m_resources;
 }
 
 void GsDrawResourceCache::reset() noexcept
@@ -1709,8 +1714,11 @@ GsBackendDecision classifyGsGouraudSourceOverDepthCt32Triangle(
 GsBackendDecision classifyGsT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
     GsDrawResources *supportedResources,
-    GsDrawResourceCache *resourceCache) noexcept
+    GsDrawResourceCache *resourceCache,
+    const GsDrawResources **supportedResourceView) noexcept
 {
+    if (supportedResourceView)
+        *supportedResourceView = nullptr;
     const GSPrimReg &primitive = command.primitive();
     const GSContext &context = command.context();
     const GsDrawGlobalState &global = command.globalState();
@@ -1847,16 +1855,41 @@ GsBackendDecision classifyGsT8GouraudDepthCt32Triangle(
         }
     }
 
+    if (resourceCache && supportedResourceView)
+    {
+        const GsDrawResources &resources =
+            resourceCache->describeView(command);
+        *supportedResourceView = &resources;
+        if (resources.unknownMemoryLayout)
+            return {false, GsFallbackReason::UnknownMemoryLayout};
+        if (resources.aliasesAnotherView())
+            return {false, GsFallbackReason::ResourceAlias};
+        return {true, GsFallbackReason::Supported};
+    }
+    if (supportedResources)
+    {
+        if (resourceCache)
+            resourceCache->describe(command, *supportedResources);
+        else
+            command.describeResources(*supportedResources);
+        if (supportedResources->unknownMemoryLayout)
+            return {false, GsFallbackReason::UnknownMemoryLayout};
+        if (supportedResources->aliasesAnotherView())
+            return {false, GsFallbackReason::ResourceAlias};
+        return {true, GsFallbackReason::Supported};
+    }
+
+    // Most accelerated backends retain their resource description for the
+    // immediately following submission. Construct fallback storage only for
+    // callers which actually request classification without an output.
     GsDrawResources localResources;
-    GsDrawResources &resources =
-        supportedResources ? *supportedResources : localResources;
     if (resourceCache)
-        resourceCache->describe(command, resources);
+        resourceCache->describe(command, localResources);
     else
-        command.describeResources(resources);
-    if (resources.unknownMemoryLayout)
+        command.describeResources(localResources);
+    if (localResources.unknownMemoryLayout)
         return {false, GsFallbackReason::UnknownMemoryLayout};
-    if (resources.aliasesAnotherView())
+    if (localResources.aliasesAnotherView())
         return {false, GsFallbackReason::ResourceAlias};
     return {true, GsFallbackReason::Supported};
 }
