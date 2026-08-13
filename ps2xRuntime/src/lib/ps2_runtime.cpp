@@ -9656,6 +9656,10 @@ int PS2Runtime::threadIdForEeContext(
     {
         return 0;
     }
+    if (context == &m_cpuContext)
+    {
+        return 1;
+    }
 
     std::lock_guard<std::mutex> lock(
         m_eeThreadRuntimeState->threadMapMutex);
@@ -9756,15 +9760,13 @@ void PS2Runtime::switchGuestExecutionContext(
 
     R5900Context *const previous =
         m_boundEeContext;
-    int selectedThreadId =
-        threadIdForEeContext(context);
+    int selectedThreadId = selectionHint > 0
+                               ? selectionHint
+                               : threadIdForEeContext(
+                                     context);
     if (selectedThreadId <= 0)
     {
-        if (selectionHint >= 0)
-        {
-            selectedThreadId = selectionHint;
-        }
-        else if (previous)
+        if (previous)
         {
             selectedThreadId = m_boundEeThreadId;
         }

@@ -1561,7 +1561,7 @@ namespace ps2_syscalls
                     bool returnedAtBoundary = false;
                     {
                         PS2Runtime::GuestExecutionScope guestExecution(
-                            runtime, threadCtx);
+                            runtime, threadCtx, tid);
                         admissionDeferred =
                             !dedicatedExecutor &&
                             !admitLegacyReadyThread(
