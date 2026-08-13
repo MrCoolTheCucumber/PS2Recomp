@@ -583,6 +583,20 @@ namespace ps2x::ee
             Publication publication;
         };
 
+        struct LoopSnapshot
+        {
+            uint64_t wakeGeneration = 0u;
+            bool stopRequested = false;
+            EeSchedulerReschedulePolicy boundaryPolicy =
+                EeSchedulerReschedulePolicy::
+                    HigherPriorityOnly;
+        };
+
+        struct PublishedBoundaryState
+        {
+            bool stopRequested = false;
+        };
+
         [[nodiscard]] size_t
         queuedPublicationCountLocked() const noexcept
         {
@@ -622,11 +636,26 @@ namespace ps2x::ee
                          std::chrono::steady_clock::now()));
         }
 
-        [[nodiscard]]
-        EeSchedulerReschedulePolicy
-        initialBoundaryPolicy() const
+        [[nodiscard]] LoopSnapshot snapshotLoopState(
+            bool dispatched,
+            bool continuationDestroyed)
         {
             std::lock_guard<std::mutex> lock(m_mutex);
+            if (dispatched)
+            {
+                ++m_statistics.dispatches;
+                if (continuationDestroyed)
+                {
+                    ++m_statistics
+                          .continuationsDestroyed;
+                }
+            }
+            LoopSnapshot snapshot{
+                m_wakeGeneration,
+                m_stopRequested,
+                EeSchedulerReschedulePolicy::
+                    HigherPriorityOnly,
+            };
             if (!m_stopRequested &&
                 (!m_publications.empty() ||
                  (!m_delayedPublications.empty() &&
@@ -640,10 +669,10 @@ namespace ps2x::ee
                 // atomicity and prevents an equal-priority ordinary rotation
                 // from selecting a peer both before and after rotating the
                 // named queue.
-                return EeSchedulerReschedulePolicy::None;
+                snapshot.boundaryPolicy =
+                    EeSchedulerReschedulePolicy::None;
             }
-            return EeSchedulerReschedulePolicy::
-                HigherPriorityOnly;
+            return snapshot;
         }
 
         [[nodiscard]] std::optional<
@@ -692,25 +721,18 @@ namespace ps2x::ee
             return publication.policy;
         }
 
-        void cacheBoundary(
+        [[nodiscard]] PublishedBoundaryState
+        publishBoundary(
             const EeSchedulerBoundaryResult &result)
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_statistics.modeledTick = result.tick;
             m_statistics.boundary =
                 m_boundaryExecutor.statistics();
-        }
-
-        void recordDispatch(
-            bool continuationDestroyed)
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            ++m_statistics.dispatches;
-            if (continuationDestroyed)
-            {
-                ++m_statistics
-                      .continuationsDestroyed;
-            }
+            m_pausedAtBoundary =
+                result.disposition ==
+                EeSchedulerExecutorDisposition::Paused;
+            return {m_stopRequested};
         }
 
         [[nodiscard]] bool stopRequested() const
@@ -741,12 +763,6 @@ namespace ps2x::ee
                     m_delayedPublications.front().deadline,
                     wakePredicate);
             }
-        }
-
-        [[nodiscard]] uint64_t wakeGeneration() const
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            return m_wakeGeneration;
         }
 
         void publishStartComplete()
@@ -791,11 +807,17 @@ namespace ps2x::ee
                 std::optional<int> priorThreadId;
                 ps2x::timing::EeTickDelta elapsed{};
                 std::exception_ptr pendingGuestFailure;
+                bool dispatched = false;
+                bool continuationDestroyed = false;
                 for (;;)
                 {
-                    const uint64_t observedWakeGeneration =
-                        wakeGeneration();
-                    if (stopRequested() &&
+                    const LoopSnapshot loop =
+                        snapshotLoopState(
+                            dispatched,
+                            continuationDestroyed);
+                    dispatched = false;
+                    continuationDestroyed = false;
+                    if (loop.stopRequested &&
                         !priorThreadId.has_value())
                     {
                         break;
@@ -807,18 +829,11 @@ namespace ps2x::ee
                             *this,
                             priorThreadId,
                             elapsed,
-                            initialBoundaryPolicy());
+                            loop.boundaryPolicy);
                     priorThreadId.reset();
                     elapsed = {};
-                    cacheBoundary(boundary);
-                    {
-                        std::lock_guard<std::mutex> lock(
-                            m_mutex);
-                        m_pausedAtBoundary =
-                            boundary.disposition ==
-                            EeSchedulerExecutorDisposition::
-                                Paused;
-                    }
+                    const PublishedBoundaryState published =
+                        publishBoundary(boundary);
                     m_cv.notify_all();
 
                     if (boundary.limitExceeded)
@@ -856,10 +871,10 @@ namespace ps2x::ee
                              .has_value())
                     {
                         waitForWork(
-                            observedWakeGeneration);
+                            loop.wakeGeneration);
                         continue;
                     }
-                    if (stopRequested())
+                    if (published.stopRequested)
                     {
                         break;
                     }
@@ -914,7 +929,8 @@ namespace ps2x::ee
                         m_backend.destroy(
                             dispatch->resumedThreadId);
                     }
-                    recordDispatch(terminal);
+                    dispatched = true;
+                    continuationDestroyed = terminal;
 
                     if (dispatch->result.reason ==
                         EeSchedulerExitReason::Exception)
