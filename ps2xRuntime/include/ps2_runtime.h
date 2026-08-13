@@ -328,11 +328,30 @@ struct alignas(16) R5900Context
         if (retirementCount != 0u)
         {
             const uint32_t offset = random - lowerBound;
-            const uint32_t decrement =
-                static_cast<uint32_t>(
-                    retirementCount % interval);
-            random = lowerBound +
-                     ((offset + interval - decrement) % interval);
+            if (retirementCount <= offset)
+            {
+                random -= static_cast<uint32_t>(retirementCount);
+            }
+            else
+            {
+                // Consuming offset + 1 retirements wraps Random from the
+                // lower bound to 47. Generated basic blocks normally end
+                // within the following interval, so handle that common case
+                // without either of the dynamic divisions used by the
+                // general modulo expression.
+                retirementCount -=
+                    static_cast<uint64_t>(offset) + 1u;
+                if (retirementCount >= interval)
+                {
+                    retirementCount -= interval;
+                    if (retirementCount >= interval)
+                    {
+                        retirementCount %= interval;
+                    }
+                }
+                random = upperBound -
+                         static_cast<uint32_t>(retirementCount);
+            }
         }
         cop0_random = random;
     }
