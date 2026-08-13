@@ -546,6 +546,76 @@ namespace
                firstTexClut.cov == secondTexClut.cov;
     }
 
+    std::array<uint64_t, 13u> resourceDescriptionState(
+        const GsDrawCommand &command) noexcept
+    {
+        const GSPrimReg &primitive = command.primitive();
+        const GSContext &context = command.context();
+        const GSTex0Reg &tex0 = context.tex0;
+        const GSTexClutReg &texclut = command.globalState().texclut;
+        std::array<uint64_t, 13u> state{
+            static_cast<uint64_t>(primitive.tme) |
+                (static_cast<uint64_t>(primitive.abe) << 1u) |
+                (static_cast<uint64_t>(primitive.aa1) << 2u),
+            static_cast<uint64_t>(context.frame.fbp) |
+                (static_cast<uint64_t>(context.frame.fbw) << 32u),
+            static_cast<uint64_t>(context.frame.psm) |
+                (static_cast<uint64_t>(context.frame.fbmsk) << 8u),
+            static_cast<uint64_t>(context.zbuf.zbp) |
+                (static_cast<uint64_t>(context.zbuf.psm) << 32u) |
+                (static_cast<uint64_t>(context.zbuf.zmask) << 40u),
+            context.test,
+            context.alpha,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+        };
+        if (primitive.tme)
+        {
+            state[6] = static_cast<uint64_t>(tex0.tbp0) |
+                       (static_cast<uint64_t>(tex0.tbw) << 32u) |
+                       (static_cast<uint64_t>(tex0.psm) << 40u) |
+                       (static_cast<uint64_t>(tex0.tw) << 48u) |
+                       (static_cast<uint64_t>(tex0.th) << 56u);
+            state[7] = static_cast<uint64_t>(tex0.cbp) |
+                       (static_cast<uint64_t>(tex0.cpsm) << 32u) |
+                       (static_cast<uint64_t>(tex0.csm) << 40u);
+            state[8] = context.tex1;
+            state[9] = context.miptbp1;
+            state[10] = context.miptbp2;
+            state[11] = context.clamp;
+            state[12] = static_cast<uint64_t>(texclut.cbw) |
+                        (static_cast<uint64_t>(texclut.cou) << 8u) |
+                        (static_cast<uint64_t>(texclut.cov) << 16u);
+        }
+        return state;
+    }
+
+    uint64_t surfaceExtent(
+        uint32_t widthUnits,
+        uint8_t psm,
+        uint32_t maximumX,
+        uint32_t maximumY) noexcept
+    {
+        PageGeometry geometry{};
+        if (!pageGeometry(psm, geometry))
+            return kGsBlockCount;
+
+        const uint64_t bufferWidth =
+            static_cast<uint64_t>(std::max(widthUnits, 1u)) * 64u;
+        const uint64_t pagesPerRow = std::max<uint64_t>(
+            (bufferWidth + geometry.width - 1u) / geometry.width, 1u);
+        const uint64_t maximumPage =
+            static_cast<uint64_t>(maximumY / geometry.height) * pagesPerRow +
+            maximumX / geometry.width;
+        return std::min<uint64_t>(
+            (maximumPage + 1u) * 32u, kGsBlockCount);
+    }
+
     class StableHash
     {
     public:
@@ -894,6 +964,31 @@ void GsDrawResourceCache::describe(
     const GsDrawCommand &command,
     GsDrawResources &resources) noexcept
 {
+    const GsDrawBounds &bounds = command.bounds();
+    if (bounds.empty())
+    {
+        resources = {};
+        return;
+    }
+
+    const GSContext &context = command.context();
+    const uint32_t maximumX = static_cast<uint32_t>(bounds.x1 - 1);
+    const uint32_t maximumY = static_cast<uint32_t>(bounds.y1 - 1);
+    const uint64_t framebufferExtent = surfaceExtent(
+        context.frame.fbw, context.frame.psm, maximumX, maximumY);
+    const uint64_t depthExtent = surfaceExtent(
+        context.frame.fbw, context.zbuf.psm, maximumX, maximumY);
+    const std::array<uint64_t, 13u> resourceState =
+        resourceDescriptionState(command);
+    if (m_resourceStateValid &&
+        m_framebufferExtent == framebufferExtent &&
+        m_depthExtent == depthExtent &&
+        m_resourceState == resourceState)
+    {
+        resources = m_resources;
+        return;
+    }
+
     if (!m_textureState ||
         !sameTextureResourceState(*m_textureState, command))
     {
@@ -917,10 +1012,20 @@ void GsDrawResourceCache::describe(
         &m_mipPages,
         &m_clutPages,
         m_unknownTextureLayout);
+    m_resourceState = resourceState;
+    m_resources = resources;
+    m_framebufferExtent = framebufferExtent;
+    m_depthExtent = depthExtent;
+    m_resourceStateValid = true;
 }
 
 void GsDrawResourceCache::reset() noexcept
 {
+    m_resourceState = {};
+    m_resources = {};
+    m_framebufferExtent = 0u;
+    m_depthExtent = 0u;
+    m_resourceStateValid = false;
     m_textureState.reset();
     m_texturePages.clear();
     m_mipPages.clear();

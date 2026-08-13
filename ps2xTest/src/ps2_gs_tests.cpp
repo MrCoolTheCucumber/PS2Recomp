@@ -622,11 +622,11 @@ void register_ps2_gs_tests()
                       "opaque CT32 draw with disabled depth should not claim a read dependency");
         });
 
-        tc.Run("GS draw resource cache retains only invariant texture views", [](TestCase &t)
+        tc.Run("GS draw resource cache retains exact adjacent descriptions", [](TestCase &t)
         {
             GSContext context{};
             context.frame = {400u, 2u, GS_PSM_CT32, 0u};
-            context.scissor = {0u, 63u, 0u, 63u};
+            context.scissor = {0u, 127u, 0u, 127u};
             context.zbuf = {300u, GS_PSM_Z24, false};
             context.test = 0x50001u;
             context.tex0.tbp0 = 32u;
@@ -675,30 +675,80 @@ void register_ps2_gs_tests()
                 makeCommand(1u, context, 16u * 16u),
                 "a cold cached description should match the canonical path");
             expectCachedExact(
-                makeCommand(2u, context, 48u * 16u),
-                "varying target bounds must rebuild exact framebuffer and depth pages");
+                makeCommand(2u, context, 24u * 16u),
+                "bounds within the same page extent should retain the exact description");
+            expectCachedExact(
+                makeCommand(3u, context, 48u * 16u),
+                "crossing a target page boundary must rebuild the description");
+
+            const auto expectChangedStateExact =
+                [&](const GSContext &changedContext,
+                    uint64_t sequence,
+                    const char *message)
+            {
+                cache.reset();
+                expectCachedExact(
+                    makeCommand(sequence, context, 48u * 16u),
+                    "a reset baseline should match the canonical path");
+                expectCachedExact(
+                    makeCommand(sequence + 1u, changedContext, 48u * 16u),
+                    message);
+            };
+
+            GSContext changedFramebuffer = context;
+            changedFramebuffer.frame.fbp += 1u;
+            expectChangedStateExact(
+                changedFramebuffer,
+                4u,
+                "a framebuffer base change must invalidate the full description");
+
+            GSContext changedDepth = context;
+            changedDepth.zbuf.zbp += 1u;
+            expectChangedStateExact(
+                changedDepth,
+                6u,
+                "a depth base change must invalidate the full description");
+
+            GSContext changedBlend = context;
+            changedBlend.alpha = 0x44u;
+            expectChangedStateExact(
+                changedBlend,
+                8u,
+                "a destination-reading blend change must invalidate the full description");
+
+            GSContext changedTest = context;
+            changedTest.test = 1u;
+            expectChangedStateExact(
+                changedTest,
+                10u,
+                "a depth-test change must invalidate the full description");
 
             GSContext changedTexture = context;
             changedTexture.tex0.tbp0 += 64u;
-            expectCachedExact(
-                makeCommand(3u, changedTexture, 48u * 16u),
+            expectChangedStateExact(
+                changedTexture,
+                12u,
                 "a texture base change must invalidate cached texture pages");
 
-            GSContext changedWrap = changedTexture;
-            changedWrap.clamp = 1u | (1ull << 2u);
-            expectCachedExact(
-                makeCommand(4u, changedWrap, 48u * 16u),
+            GSContext changedWrap = context;
+            changedWrap.clamp =
+                2u | (2ull << 2u) |
+                (15ull << 4u) | (31ull << 14u) |
+                (15ull << 24u) | (31ull << 34u);
+            expectChangedStateExact(
+                changedWrap,
+                14u,
                 "a wrap-mode change must invalidate cached texture bounds");
 
             GSContext unknownTexture = changedWrap;
             unknownTexture.tex0.psm = 0x3Fu;
             expectCachedExact(
-                makeCommand(5u, unknownTexture, 48u * 16u),
+                makeCommand(16u, unknownTexture, 48u * 16u),
                 "an unknown cached texture layout must remain fail-closed");
 
             cache.reset();
             expectCachedExact(
-                makeCommand(6u, context, 32u * 16u),
+                makeCommand(17u, context, 32u * 16u),
                 "reset should force a fresh canonical texture description");
         });
 

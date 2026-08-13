@@ -153,10 +153,10 @@ private:
     GsDrawGlobalState m_globalState{};
 };
 
-// Resource bounds vary per primitive, while texture, mip, and CLUT surfaces
-// commonly remain identical for thousands of adjacent strip triangles. This
-// descriptor retains only those bounds-independent views and always rebuilds
-// framebuffer/depth masks from the current immutable command.
+// Resource bounds vary per primitive, but adjacent strip triangles commonly
+// resolve to the same framebuffer/depth page extents and texture surfaces.
+// Retain the complete description while those resource-defining inputs match;
+// the texture-only view remains reusable when just the target extent changes.
 class GsDrawResourceCache final
 {
 public:
@@ -165,6 +165,11 @@ public:
     void reset() noexcept;
 
 private:
+    std::array<uint64_t, 13u> m_resourceState{};
+    GsDrawResources m_resources;
+    uint64_t m_framebufferExtent = 0u;
+    uint64_t m_depthExtent = 0u;
+    bool m_resourceStateValid = false;
     std::optional<GsDrawCommand> m_textureState;
     GsVramPageMask m_texturePages;
     GsVramPageMask m_mipPages;
