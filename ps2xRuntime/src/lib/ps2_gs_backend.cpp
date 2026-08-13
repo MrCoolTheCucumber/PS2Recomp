@@ -1040,13 +1040,17 @@ GsDrawCommand buildGsDrawCommand(
     std::span<const GSVertex> vertices,
     const GsDrawGlobalState &globalState)
 {
-    std::array<GSVertex, 3> copiedVertices{};
+    std::array<GSVertex, 3> copiedVertices;
     const uint8_t vertexCount = static_cast<uint8_t>(std::min<size_t>(
         {vertices.size(), copiedVertices.size(), expectedVertexCount(primitive.type)}));
     std::copy_n(vertices.begin(), vertexCount, copiedVertices.begin());
+    std::fill(
+        copiedVertices.begin() + vertexCount,
+        copiedVertices.end(),
+        GSVertex{});
 
-    std::array<int32_t, 3> fixedX{};
-    std::array<int32_t, 3> fixedY{};
+    std::array<int32_t, 3> fixedX;
+    std::array<int32_t, 3> fixedY;
     for (uint8_t i = 0u; i < vertexCount; ++i)
     {
         fixedX[i] = static_cast<int32_t>(copiedVertices[i].x12_4) -
@@ -1054,6 +1058,8 @@ GsDrawCommand buildGsDrawCommand(
         fixedY[i] = static_cast<int32_t>(copiedVertices[i].y12_4) -
                     static_cast<int32_t>(context.xyoffset.ofy);
     }
+    std::fill(fixedX.begin() + vertexCount, fixedX.end(), 0);
+    std::fill(fixedY.begin() + vertexCount, fixedY.end(), 0);
     if (primitive.type == GS_PRIM_SPRITE && vertexCount == 2u)
     {
         fixedX[2] = fixedX[1];
