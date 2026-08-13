@@ -1283,7 +1283,12 @@ public:
     }
     void setTlbTranslationCacheEnabled(bool enabled) noexcept
     {
+        if (m_tlbTranslationCacheEnabled == enabled)
+        {
+            return;
+        }
         m_tlbTranslationCacheEnabled = enabled;
+        m_eeInstructionFetchPageCache = {};
     }
     bool tlbTranslationCacheEnabled() const noexcept
     {
@@ -1292,11 +1297,37 @@ public:
     void setTlbTranslationCacheDiagnosticsEnabled(
         bool enabled) noexcept
     {
+        if (m_tlbTranslationCacheDiagnosticsEnabled == enabled)
+        {
+            return;
+        }
         m_tlbTranslationCacheDiagnosticsEnabled = enabled;
+        m_eeInstructionFetchPageCache = {};
     }
     bool tlbTranslationCacheDiagnosticsEnabled() const noexcept
     {
         return m_tlbTranslationCacheDiagnosticsEnabled;
+    }
+    bool tryReuseValidatedInstructionFetchRdramPage(
+        uint32_t translationPageKey) const noexcept
+    {
+        return m_eeInstructionFetchPageCache.tlbMappingGeneration ==
+                   m_tlbMappingGeneration &&
+               m_eeInstructionFetchPageCache.translationPageKey ==
+                   translationPageKey;
+    }
+    void rememberValidatedInstructionFetchRdramPage(
+        uint32_t translationPageKey) noexcept
+    {
+        if (!m_tlbTranslationCacheEnabled ||
+            m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            return;
+        }
+        m_eeInstructionFetchPageCache = {
+            m_tlbMappingGeneration,
+            translationPageKey,
+        };
     }
     void resetTlbTranslationCacheStats() noexcept
     {
@@ -1800,6 +1831,16 @@ public:
     uint64_t m_tlbMappingGeneration = 1u;
     bool m_tlbTranslationCacheEnabled = true;
     bool m_tlbTranslationCacheDiagnosticsEnabled = false;
+    // A successful aligned instruction fetch authorizes its complete minimum
+    // 4 KiB translation page. Keeping this beside the TLB caches lets the
+    // generation-wrap clear invalidate every translation cache together.
+    struct EeInstructionFetchPageCache
+    {
+        uint64_t tlbMappingGeneration = 0u;
+        uint32_t translationPageKey = 0u;
+    };
+    EeInstructionFetchPageCache
+        m_eeInstructionFetchPageCache{};
     EeTlbTranslationCacheStats m_tlbTranslationCacheStats{};
     std::array<
         std::array<

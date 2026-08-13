@@ -425,6 +425,23 @@ namespace
                    : EeAddressTranslationContext::unchecked();
     }
 
+    uint32_t eeInstructionFetchPageKey(
+        const R5900Context *ctx,
+        uint32_t virtualAddress) noexcept
+    {
+        constexpr uint32_t kPageMask = 0xfffff000u;
+        constexpr uint32_t kStatusAddressModeMask =
+            0x0000001eu;
+        constexpr uint32_t kStatusAddressModeShift = 7u;
+        // The page base occupies bits 12..31, leaving bits 8..11 for the
+        // four relevant Status bits and bits 0..7 for EntryHi.ASID.
+        return (virtualAddress & kPageMask) |
+               ((ctx->cop0_status &
+                 kStatusAddressModeMask)
+                << kStatusAddressModeShift) |
+               static_cast<uint8_t>(ctx->cop0_entryhi);
+    }
+
     struct DispatchHistory
     {
         std::array<uint32_t, 64> pcs{};
@@ -7349,7 +7366,24 @@ void PS2Runtime::ValidateInstructionFetchWithoutObservation(
     R5900Context *ctx,
     uint32_t virtualAddress)
 {
+    if (ctx && (virtualAddress & 3u) == 0u)
+    {
+        if (m_memory.tryReuseValidatedInstructionFetchRdramPage(
+                eeInstructionFetchPageKey(
+                    ctx, virtualAddress))) [[likely]]
+        {
+            return;
+        }
+    }
 
+    validateInstructionFetchPageMissWithoutObservation(
+        ctx, virtualAddress);
+}
+
+void PS2Runtime::validateInstructionFetchPageMissWithoutObservation(
+    R5900Context *ctx,
+    uint32_t virtualAddress)
+{
     if (!ctx)
     {
         throw PS2GuestException{};
@@ -7364,25 +7398,40 @@ void PS2Runtime::ValidateInstructionFetchWithoutObservation(
             virtualAddress);
     }
 
+    const uint32_t translationPageKey =
+        eeInstructionFetchPageKey(
+            ctx, virtualAddress);
+    constexpr uint32_t kFetchSize =
+        sizeof(uint32_t);
+
     uint32_t physicalOffset = 0u;
     if (Ps2ResolveFastGuestRdramOffset(
             m_memory,
             guestAddressTranslation(ctx),
             virtualAddress,
-            sizeof(uint32_t),
+            kFetchSize,
             false,
             physicalOffset))
     {
+        m_memory.rememberValidatedInstructionFetchRdramPage(
+            translationPageKey);
         return;
     }
 
     try
     {
-        (void)m_memory.translateAddress(
-            virtualAddress,
-            guestAddressTranslation(ctx),
-            false,
-            sizeof(uint32_t));
+        const uint32_t physicalAddress =
+            m_memory.translateAddress(
+                virtualAddress,
+                guestAddressTranslation(ctx),
+                false,
+                kFetchSize);
+        if (physicalAddress <=
+            PS2_RAM_SIZE - kFetchSize)
+        {
+            m_memory.rememberValidatedInstructionFetchRdramPage(
+                translationPageKey);
+        }
     }
     catch (const PS2AddressErrorException &fault)
     {

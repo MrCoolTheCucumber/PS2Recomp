@@ -1499,6 +1499,7 @@ public:
     void ValidateInstructionFetch(
         R5900Context *ctx,
         uint32_t virtualAddress);
+    PS2X_EE_MEMORY_POLICY_NOINLINE
     void ValidateInstructionFetchWithoutObservation(
         R5900Context *ctx,
         uint32_t virtualAddress);
@@ -2429,6 +2430,10 @@ private:
         R5900Context *ctx,
         const PS2TlbFaultException &fault,
         bool storeAccess);
+    PS2X_EE_MEMORY_POLICY_NOINLINE
+    void validateInstructionFetchPageMissWithoutObservation(
+        R5900Context *ctx,
+        uint32_t virtualAddress);
     [[noreturn]] void raiseCop0PerformanceException(
         R5900Context *ctx);
     [[noreturn]] void raiseCop0DebugException(

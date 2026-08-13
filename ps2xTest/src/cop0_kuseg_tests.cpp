@@ -225,10 +225,17 @@ void register_cop0_kuseg_tests()
                 (oddPfn << 12u) + 0x44u,
                 "the mapped fast resolver must return the non-identity odd PFN");
 
-            runtime.memory().resetTlbTranslationCacheStats();
+            runtime.memory().setTlbTranslationCacheDiagnosticsEnabled(
+                false);
             runtime.validateEeInstructionFetchPolicy<
                 EeArchitecturalObservationMode::Fast>(
                 &ctx, virtualBase + 0x40u);
+            runtime.memory().setTlbTranslationCacheDiagnosticsEnabled(
+                true);
+            runtime.memory().resetTlbTranslationCacheStats();
+            runtime.validateEeInstructionFetchPolicy<
+                EeArchitecturalObservationMode::Fast>(
+                &ctx, virtualBase + 0x44u);
             const EeTlbTranslationCacheStats fetchStats =
                 runtime.memory().tlbTranslationCacheStats();
             t.Equals(
@@ -386,6 +393,132 @@ void register_cop0_kuseg_tests()
                  << 2u) &
                     kCauseExcCodeMask,
                 "the invalid fetch should publish the architectural TLBL code");
+        });
+
+        tc.Run("instruction fetch page cache tracks page ASID and TLB generation", [](TestCase &t)
+        {
+            constexpr uint32_t virtualBase = 0x01400000u;
+            constexpr uint32_t physicalPfn = 0x00600u;
+            constexpr uint32_t asid = 0x3cu;
+            constexpr uint32_t evenFetch =
+                virtualBase + 0x40u;
+            constexpr uint32_t oddFetch =
+                virtualBase + 0x1040u;
+
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "the fetch-page fixture should allocate RDRAM");
+            clearTlb(
+                t,
+                runtime,
+                "the fetch-page fixture should clear every TLB entry");
+            t.IsTrue(
+                runtime.memory().tlbWrite(
+                    15u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEntryLo(
+                            physicalPfn, true, true, false),
+                        makeEntryLo(
+                            physicalPfn + 1u, true, false, false),
+                    }),
+                "the fetch-page fixture should install one valid page");
+
+            R5900Context asidCtx{};
+            asidCtx.cop0_status = kStatusUser;
+            asidCtx.cop0_entryhi = asid;
+            runtime.validateEeInstructionFetchPolicy<
+                EeArchitecturalObservationMode::Fast>(
+                &asidCtx, evenFetch);
+            asidCtx.cop0_entryhi = asid ^ 1u;
+            const bool asidRaised = raisesGuestException([&]()
+            {
+                runtime.validateEeInstructionFetchPolicy<
+                    EeArchitecturalObservationMode::Fast>(
+                    &asidCtx, evenFetch + 4u);
+            });
+            t.IsTrue(
+                asidRaised,
+                "an ASID change must reject a cached non-global page");
+            t.Equals(
+                asidCtx.cop0_badvaddr,
+                evenFetch + 4u,
+                "the ASID fault should retain the requested fetch address");
+            t.Equals(
+                asidCtx.cop0_cause & kCauseExcCodeMask,
+                (static_cast<uint32_t>(
+                     EXCEPTION_TLB_REFILL_LOAD)
+                 << 2u) &
+                    kCauseExcCodeMask,
+                "the ASID fault should publish TLBL");
+
+            R5900Context pageCtx{};
+            pageCtx.cop0_status = kStatusUser;
+            pageCtx.cop0_entryhi = asid;
+            runtime.validateEeInstructionFetchPolicy<
+                EeArchitecturalObservationMode::Fast>(
+                &pageCtx, evenFetch);
+            const bool pageRaised = raisesGuestException([&]()
+            {
+                runtime.validateEeInstructionFetchPolicy<
+                    EeArchitecturalObservationMode::Fast>(
+                    &pageCtx, oddFetch);
+            });
+            t.IsTrue(
+                pageRaised,
+                "an adjacent invalid page must not reuse the cached page");
+            t.Equals(
+                pageCtx.cop0_badvaddr,
+                oddFetch,
+                "the adjacent-page fault should retain its fetch address");
+            t.Equals(
+                pageCtx.cop0_cause & kCauseExcCodeMask,
+                (static_cast<uint32_t>(
+                     EXCEPTION_TLB_REFILL_LOAD)
+                 << 2u) &
+                    kCauseExcCodeMask,
+                "the adjacent-page fault should publish TLBL");
+
+            R5900Context generationCtx{};
+            generationCtx.cop0_status = kStatusUser;
+            generationCtx.cop0_entryhi = asid;
+            runtime.validateEeInstructionFetchPolicy<
+                EeArchitecturalObservationMode::Fast>(
+                &generationCtx, evenFetch);
+            t.IsTrue(
+                runtime.memory().tlbWrite(
+                    15u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEntryLo(
+                            physicalPfn, true, false, false),
+                        makeEntryLo(
+                            physicalPfn + 1u, true, false, false),
+                    }),
+                "the fetch-page fixture should invalidate the cached mapping");
+            const bool generationRaised = raisesGuestException([&]()
+            {
+                runtime.validateEeInstructionFetchPolicy<
+                    EeArchitecturalObservationMode::Fast>(
+                    &generationCtx, evenFetch + 8u);
+            });
+            t.IsTrue(
+                generationRaised,
+                "a TLB write must invalidate a same-context fetch page");
+            t.Equals(
+                generationCtx.cop0_badvaddr,
+                evenFetch + 8u,
+                "the generation fault should retain its fetch address");
+            t.Equals(
+                generationCtx.cop0_cause & kCauseExcCodeMask,
+                (static_cast<uint32_t>(
+                     EXCEPTION_TLB_REFILL_LOAD)
+                 << 2u) &
+                    kCauseExcCodeMask,
+                "the generation fault should publish TLBL");
         });
 
         tc.Run("ERL and explicit compatibility aliases remain direct", [](TestCase &t)

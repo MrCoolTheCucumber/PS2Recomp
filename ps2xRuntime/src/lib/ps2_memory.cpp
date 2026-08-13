@@ -3042,6 +3042,7 @@ void PS2Memory::clearTlbTranslationCache() noexcept
     m_tlbTranslationCache = {};
     m_tlbTranslationCacheNextWay = {};
     m_tlbFastCache = {};
+    m_eeInstructionFetchPageCache = {};
 }
 
 void PS2Memory::advanceTlbMappingGeneration() noexcept

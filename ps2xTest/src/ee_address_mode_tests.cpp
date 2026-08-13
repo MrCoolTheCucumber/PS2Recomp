@@ -570,6 +570,60 @@ void register_ee_address_mode_tests()
                 "a rejected instruction fetch must not execute the alias target");
         });
 
+        tc.Run("instruction fetch page cache rechecks mode and alignment", [](TestCase &t)
+        {
+            constexpr uint32_t alignedAddress =
+                0x80001000u;
+            constexpr uint32_t unalignedAddress =
+                alignedAddress + 2u;
+
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "the fetch-cache fixture should allocate RDRAM");
+
+            R5900Context modeCtx{};
+            runtime.validateEeInstructionFetchPolicy<
+                EeArchitecturalObservationMode::Fast>(
+                &modeCtx, alignedAddress);
+            modeCtx.cop0_status = kStatusUser;
+            const bool modeRaised = raisesGuestException([&]()
+            {
+                runtime.validateEeInstructionFetchPolicy<
+                    EeArchitecturalObservationMode::Fast>(
+                    &modeCtx, alignedAddress);
+            });
+            expectAddressError(
+                t,
+                modeCtx,
+                modeRaised,
+                EXCEPTION_ADDRESS_ERROR_LOAD,
+                alignedAddress,
+                alignedAddress,
+                false,
+                "cached mode change: ");
+
+            R5900Context alignmentCtx{};
+            runtime.validateEeInstructionFetchPolicy<
+                EeArchitecturalObservationMode::Fast>(
+                &alignmentCtx, alignedAddress);
+            const bool alignmentRaised = raisesGuestException([&]()
+            {
+                runtime.validateEeInstructionFetchPolicy<
+                    EeArchitecturalObservationMode::Fast>(
+                    &alignmentCtx, unalignedAddress);
+            });
+            expectAddressError(
+                t,
+                alignmentCtx,
+                alignmentRaised,
+                EXCEPTION_ADDRESS_ERROR_LOAD,
+                unalignedAddress,
+                unalignedAddress,
+                false,
+                "cached unaligned fetch: ");
+        });
+
         tc.Run("CACHE address translation observes the current mode", [](TestCase &t)
         {
             PS2Runtime runtime;
