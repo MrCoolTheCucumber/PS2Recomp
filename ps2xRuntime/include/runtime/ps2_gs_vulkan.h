@@ -1088,13 +1088,16 @@ inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED =
     1u << 4u;
 inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED =
     1u << 5u;
+inline constexpr uint32_t
+GS_VULKAN_T8_GOURAUD_FLAG_ADDITIVE_SOURCE_ALPHA = 1u << 6u;
 inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_VALID_FLAGS =
     GS_VULKAN_T8_GOURAUD_FLAG_FOG |
     GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
     GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE |
     GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY |
     GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED |
-    GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED;
+    GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED |
+    GS_VULKAN_T8_GOURAUD_FLAG_ADDITIVE_SOURCE_ALPHA;
 
 // Compact resident record for the same exact T8 contract. Palettes are
 // captured once per distinct consecutive CLUT image and indexed explicitly
@@ -1164,14 +1167,14 @@ static_assert(offsetof(
     textureBaseBlocks) == 224u);
 
 [[nodiscard]] GsBackendDecision
-prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+prepareGsVulkanT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
     std::span<const uint32_t> decodedPalette,
     GsVulkanT8GouraudDepthCt32Triangle &triangle,
     const GsDrawResources *classifiedResources = nullptr) noexcept;
 
 [[nodiscard]] GsBackendDecision
-prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
+prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
     uint32_t paletteIndex,
     GsVulkanResidentT8GouraudDepthCt32Triangle &triangle,

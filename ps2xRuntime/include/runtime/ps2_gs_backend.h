@@ -530,12 +530,13 @@ classifyGsGouraudSourceOverDepthCt32Triangle(
 
 // Exact perspective T8 Gouraud/fog triangle slice used by the dominant RAC1
 // pipeline. The contract consumes the frontend's decoded CSM1 CT32 palette,
-// supports REPEAT/CLAMP and nearest-mip linear filtering, and retains the
-// standard source-over, alpha GEQUAL/RGB_ONLY, and Z GEQUAL/write semantics.
-// TRIANGLE, TRISTRIP, and TRIFAN commands share the same assembled three-
-// vertex raster operation and are classified identically.
+// supports REPEAT/CLAMP and nearest-mip linear filtering, and retains exact
+// source-over or additive-source-alpha blending, alpha GEQUAL with FB_ONLY or
+// RGB_ONLY failure, and Z ALWAYS/GEQUAL semantics with optional writes.
+// TRIANGLE, TRISTRIP, and TRIFAN commands share the same assembled
+// three-vertex raster operation and are classified identically.
 [[nodiscard]] GsBackendDecision
-classifyGsT8GouraudSourceOverDepthCt32Triangle(
+classifyGsT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
     GsDrawResources *supportedResources = nullptr) noexcept;
 

@@ -46,6 +46,20 @@ namespace
                !global.pabe && global.colorClamp;
     }
 
+    bool isAdditiveSourceAlphaBlend(
+        const GSPrimReg &primitive,
+        const GSContext &context,
+        const GsDrawGlobalState &global) noexcept
+    {
+        // A=Cs, B=0, C=As, D=Cd. This is the common GS additive-alpha
+        // equation Cd + Cs*As/128. Keep the same PABE and color-clamp
+        // restrictions as source-over so the device operation has one exact
+        // signed-integer interpretation.
+        return primitive.abe &&
+               (context.alpha & 0xFFu) == 0x48u &&
+               !global.pabe && global.colorClamp;
+    }
+
     bool isFixedAlphaBlend(const GSPrimReg &primitive,
                            const GSContext &context,
                            const GsDrawGlobalState &global) noexcept
@@ -1459,7 +1473,7 @@ GsBackendDecision classifyGsGouraudSourceOverDepthCt32Triangle(
     return decision;
 }
 
-GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
+GsBackendDecision classifyGsT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
     GsDrawResources *supportedResources) noexcept
 {
@@ -1486,7 +1500,8 @@ GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
         return {false, GsFallbackReason::UnsupportedFramebufferFormat};
     if (context.frame.fbmsk != 0u)
         return {false, GsFallbackReason::FramebufferMask};
-    if (!isSourceOverAlphaBlend(primitive, context, global))
+    if (!isSourceOverAlphaBlend(primitive, context, global) &&
+        !isAdditiveSourceAlphaBlend(primitive, context, global))
         return {false, GsFallbackReason::AlphaBlend};
 
     const bool alphaTestEnabled = (context.test & 1u) != 0u;

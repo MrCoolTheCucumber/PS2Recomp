@@ -1554,7 +1554,7 @@ GsBackendDecision GsVulkanRasterBackend::classify(
 
         GsDrawResources t8Resources;
         const GsBackendDecision t8Decision =
-            classifyGsT8GouraudSourceOverDepthCt32Triangle(
+            classifyGsT8GouraudDepthCt32Triangle(
                 command, &t8Resources);
         if (t8Decision.supported)
         {
@@ -1885,7 +1885,7 @@ void GsVulkanRasterBackend::submit(
                 }
             }
             const GsBackendDecision prepared =
-                prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
+                prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
                     command, 0u, t8GouraudDepthTriangle,
                     &resources);
             if (!prepared.supported)
@@ -1896,7 +1896,7 @@ void GsVulkanRasterBackend::submit(
                     "frontend did not provide a valid decoded palette or setup record");
             }
             if (m_impl->config.mode == GsRendererMode::Verify &&
-                !prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                !prepareGsVulkanT8GouraudDepthCt32Triangle(
                     command, t8Palette.colors,
                     verifiedT8GouraudDepthTriangle,
                     &resources).supported)

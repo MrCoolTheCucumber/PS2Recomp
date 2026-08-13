@@ -2544,7 +2544,7 @@ prepareGsVulkanFeedbackNearestDepthCt32Triangle(
 }
 
 GsBackendDecision
-prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
+prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
     uint32_t paletteIndex,
     GsVulkanResidentT8GouraudDepthCt32Triangle &triangle,
@@ -2552,7 +2552,7 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
 {
     const GsBackendDecision decision = classifiedResources
         ? GsBackendDecision{true, GsFallbackReason::Supported}
-        : classifyGsT8GouraudSourceOverDepthCt32Triangle(command);
+        : classifyGsT8GouraudDepthCt32Triangle(command);
     if (!decision.supported)
         return decision;
     const GSPrimReg &primitive = command.primitive();
@@ -2874,6 +2874,9 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
              : 0u) |
         (!textured
              ? GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED
+             : 0u) |
+        (((context.alpha & 0xFFu) == 0x48u)
+             ? GS_VULKAN_T8_GOURAUD_FLAG_ADDITIVE_SOURCE_ALPHA
              : 0u);
 
     // The classifier already proved exact non-aliasing resource masks for
@@ -2889,7 +2892,7 @@ prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
 }
 
 GsBackendDecision
-prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+prepareGsVulkanT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
     std::span<const uint32_t> decodedPalette,
     GsVulkanT8GouraudDepthCt32Triangle &triangle,
@@ -2902,7 +2905,7 @@ prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
 
     GsVulkanResidentT8GouraudDepthCt32Triangle compact{};
     const GsBackendDecision decision =
-        prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
+        prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
             command, 0u, compact, classifiedResources);
     if (!decision.supported)
         return decision;
@@ -3728,7 +3731,7 @@ namespace
     static_assert(
         kGsGouraudDepthCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(
-        sizeof(kGsT8GouraudDepthCt32TriangleShaderSpv) == 218356u);
+        sizeof(kGsT8GouraudDepthCt32TriangleShaderSpv) == 218876u);
     static_assert(
         kGsT8GouraudDepthCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);

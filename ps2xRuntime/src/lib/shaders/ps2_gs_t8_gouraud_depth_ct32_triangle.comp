@@ -758,8 +758,12 @@ void rasterize_pixel(uint record_index, uint x, uint y)
     uint destination =
         atomicAdd(gs_vram.words[framebuffer_word_index], 0u);
     ivec4 destination_color = unpack_color(destination);
+    ivec3 blend_source =
+        (triangle.raster_flags & 64u) != 0u
+            ? source.rgb
+            : source.rgb - destination_color.rgb;
     ivec3 blended = destination_color.rgb +
-        ((source.rgb - destination_color.rgb) * source.a >> 7);
+        (blend_source * source.a >> 7);
     source.rgb = clamp(blended, ivec3(0), ivec3(255));
     if (!alpha_pass && (triangle.raster_flags & 8u) != 0u)
         source.a = destination_color.a;

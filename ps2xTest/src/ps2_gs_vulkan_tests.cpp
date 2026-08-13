@@ -5700,7 +5700,7 @@ void register_ps2_gs_vulkan_tests()
             triangle.framebufferBaseBlock = 0xDEADu;
             triangle.palette.fill(0xA5A5A5A5u);
             const GsBackendDecision decision =
-                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
                     command, palette, triangle);
             t.IsTrue(decision.supported,
                      "the measured perspective T8 strip state should be eligible");
@@ -5779,7 +5779,7 @@ void register_ps2_gs_vulkan_tests()
             // three independent parts.
             framebufferOnlyContext.tex1 =
                 (1ull << 5u) | (1ull << 6u) | (1ull << 9u);
-            // ATE=1, ATST=NEVER, AFAIL=FB_ONLY, DATE=0,
+            // ATE=1, ATST=GEQUAL, AFAIL=FB_ONLY, DATE=0,
             // ZTE=1, ZTST=ALWAYS.
             framebufferOnlyContext.test = 0x3180Bull;
             std::array<GSVertex, 3> constantQVertices = command.vertices();
@@ -5793,7 +5793,7 @@ void register_ps2_gs_vulkan_tests()
                 command.globalState());
             GsVulkanT8GouraudDepthCt32Triangle framebufferOnlyRecord{};
             const GsBackendDecision framebufferOnlyDecision =
-                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
                     framebufferOnly, palette, framebufferOnlyRecord);
             t.IsTrue(framebufferOnlyDecision.supported,
                      "the exact constant-Q framebuffer-only variant should be eligible");
@@ -5809,9 +5809,46 @@ void register_ps2_gs_vulkan_tests()
                     32768.0f),
                 "constant-Q setup should capture the pre-biased fixed S seed");
 
+            GSPrimReg additivePrimitive = framebufferOnlyPrimitive;
+            additivePrimitive.iip = false;
+            GSContext additiveContext = framebufferOnlyContext;
+            additiveContext.alpha = 0x48u;
+            additiveContext.clamp = 5u;
+            const GsDrawCommand additive = buildGsDrawCommand(
+                36u,
+                additivePrimitive,
+                additiveContext,
+                std::span<const GSVertex>(constantQVertices),
+                command.globalState());
+            GsVulkanT8GouraudDepthCt32Triangle additiveRecord{};
+            const GsBackendDecision additiveDecision =
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
+                    additive, palette, additiveRecord);
+            t.IsTrue(
+                additiveDecision.supported,
+                "flat constant-Q additive-alpha T8 strips should be eligible");
+            t.Equals(
+                additiveRecord.rasterFlags,
+                GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED |
+                    GS_VULKAN_T8_GOURAUD_FLAG_ADDITIVE_SOURCE_ALPHA,
+                "additive-alpha preparation should publish its exact per-record operation");
+
+            additiveContext.alpha = 0x49u;
+            const GsDrawCommand rejectedBlend = buildGsDrawCommand(
+                37u,
+                additivePrimitive,
+                additiveContext,
+                std::span<const GSVertex>(constantQVertices),
+                command.globalState());
+            t.Equals(
+                classifyGsT8GouraudDepthCt32Triangle(
+                    rejectedBlend).reason,
+                GsFallbackReason::AlphaBlend,
+                "unimplemented GS blend equations must remain in software fallback");
+
             const GsVulkanT8GouraudDepthCt32Triangle sentinel = triangle;
             const GsBackendDecision shortPalette =
-                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
                     command,
                     std::span<const uint32_t>(palette).first(255u),
                     triangle);
@@ -5852,7 +5889,7 @@ void register_ps2_gs_vulkan_tests()
                 command.globalState());
             GsVulkanT8GouraudDepthCt32Triangle fixedUvFlatRecord{};
             const GsBackendDecision fixedUvFlatDecision =
-                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
                     fixedUvFlat, palette, fixedUvFlatRecord);
             t.IsTrue(
                 fixedUvFlatDecision.supported,
@@ -5910,7 +5947,7 @@ void register_ps2_gs_vulkan_tests()
                 command.globalState());
             GsVulkanT8GouraudDepthCt32Triangle untexturedRecord{};
             const GsBackendDecision untexturedDecision =
-                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
                     untexturedFlat, std::span<const uint32_t>{},
                     untexturedRecord);
             t.IsTrue(
@@ -5946,7 +5983,7 @@ void register_ps2_gs_vulkan_tests()
                 std::span<const GSVertex>(fixedVertices),
                 command.globalState());
             t.Equals(
-                classifyGsT8GouraudSourceOverDepthCt32Triangle(
+                classifyGsT8GouraudDepthCt32Triangle(
                     rejectedFixedMip).reason,
                 GsFallbackReason::UnsupportedTextureFilter,
                 "fixed UV with mipmaps must remain in software fallback");
@@ -5959,7 +5996,7 @@ void register_ps2_gs_vulkan_tests()
                 std::span<const GSVertex>(command.vertices()),
                 command.globalState());
             t.Equals(
-                classifyGsT8GouraudSourceOverDepthCt32Triangle(
+                classifyGsT8GouraudDepthCt32Triangle(
                     rejectedFilter).reason,
                 GsFallbackReason::UnsupportedTextureFilter,
                 "a different MMIN mode should remain in software fallback");
@@ -19865,6 +19902,7 @@ void register_ps2_gs_vulkan_tests()
             GSContext fixedContext = first.context();
             fixedContext.tex1 =
                 (1ull << 5u) | (1ull << 6u) | (1ull << 9u);
+            fixedContext.alpha = 0x48u;
             // ATE=1, ATST=GEQUAL, AREF=128, AFAIL=RGB_ONLY,
             // DATE=0, ZTE=1, ZTST=GEQUAL.
             fixedContext.test = 0x5380Bull;
@@ -19975,7 +20013,7 @@ void register_ps2_gs_vulkan_tests()
                         ? std::span<const uint32_t>(palette)
                         : std::span<const uint32_t>{};
                 const GsBackendDecision decision =
-                    prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                    prepareGsVulkanT8GouraudDepthCt32Triangle(
                         commands[index], decodedPalette, prepared[index]);
                 if (!decision.supported)
                 {
@@ -19985,9 +20023,13 @@ void register_ps2_gs_vulkan_tests()
                     return;
                 }
             }
+            t.IsTrue(
+                (prepared[2].rasterFlags &
+                 GS_VULKAN_T8_GOURAUD_FLAG_ADDITIVE_SOURCE_ALPHA) != 0u,
+                "the resident fixture should include one additive-alpha record");
             GsVulkanT8GouraudDepthCt32Triangle thirdPrepared{};
             const GsBackendDecision thirdDecision =
-                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
                     third, palette, thirdPrepared);
             if (!thirdDecision.supported)
             {
