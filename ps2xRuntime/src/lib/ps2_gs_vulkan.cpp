@@ -2543,6 +2543,15 @@ prepareGsVulkanFeedbackNearestDepthCt32Triangle(
     return decision;
 }
 
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    defined(__GNUC__) && !defined(__clang__) && \
+    !defined(__SANITIZE_THREAD__)
+// This setup uses explicit std::fma operations to match the shader's exact
+// planes. Select hardware FMA where available, but keep every other product
+// and sum uncontracted so feature dispatch cannot change the GS record.
+__attribute__((target_clones("fma", "default"),
+               optimize("fp-contract=off")))
+#endif
 GsBackendDecision
 prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
