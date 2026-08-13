@@ -122,8 +122,10 @@ struct VuNativeChainRuntime
     uint64_t linkedEdges = 0u;
     uint64_t preciseTailEntries = 0u;
     uint64_t preciseTailPairs = 0u;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     uint64_t preciseNonRetiredChecks = 0u;
     uint64_t returnBoundaryChecks = 0u;
+#endif
 };
 
 enum class VuRecompilerOpcodeDisposition : uint8_t
@@ -231,7 +233,11 @@ public:
 
     [[nodiscard]] VuRecompilerDiagnostics diagnostics() const
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         return m_diagnostics;
+#else
+        return {};
+#endif
     }
     [[nodiscard]] const std::string &lastDiagnostic() const
     {
@@ -334,7 +340,9 @@ private:
 
     VuUnit &m_unit;
     VuInterpreterBackend m_semantics;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     VuRecompilerDiagnostics m_diagnostics{};
+#endif
     std::array<
         VuProgramHandle,
         kMaximumDispatchEntries> m_dispatchHandles{};

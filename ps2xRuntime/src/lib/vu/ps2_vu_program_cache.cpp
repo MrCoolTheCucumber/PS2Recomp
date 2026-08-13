@@ -69,9 +69,11 @@ VuProgramCache::VuProgramCache(
     VuUnitId unit, VuProgramCacheLimits limits)
     : m_unit(unit), m_limits(limits)
 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     m_diagnostics.maximumPrograms = limits.maximumPrograms;
     m_diagnostics.maximumExecutableBytes =
         limits.maximumExecutableBytes;
+#endif
 }
 
 VuProgramCache::~VuProgramCache()
@@ -85,18 +87,24 @@ VuProgramHandle VuProgramCache::lookup(
     requireOwnerThread();
     if (!activateScope(key))
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.misses;
+#endif
         return {};
     }
 
     const auto found = m_lookup.find(key);
     if (found == m_lookup.end())
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.misses;
+#endif
         return {};
     }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     ++m_diagnostics.hits;
+#endif
     ProgramSlot &slot = m_programs[found->second];
     if (!slot.program)
     {
@@ -105,7 +113,9 @@ VuProgramHandle VuProgramCache::lookup(
     }
     if (slot.program->key.codeGeneration != key.codeGeneration)
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.crossGenerationHits;
+#endif
     }
     touchProgram(found->second);
     return {
@@ -121,14 +131,18 @@ VuProgramHandle VuProgramCache::insert(
     requireOwnerThread();
     if (!activateScope(program.key, diagnostic))
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.rejectedPrograms;
+#endif
         return {};
     }
 
     VuIrVerificationError verificationError;
     if (!verifyVuIrBlock(program.block, &verificationError))
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.rejectedPrograms;
+#endif
         fail(
             "refusing malformed VU IR block at PC " +
                 std::to_string(verificationError.pc) +
@@ -138,7 +152,9 @@ VuProgramHandle VuProgramCache::insert(
     }
     if (program.block.entryPc != program.key.entryPc)
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.rejectedPrograms;
+#endif
         fail(
             "compiled block entry does not match its cache key",
             diagnostic);
@@ -151,7 +167,9 @@ VuProgramHandle VuProgramCache::insert(
         (program.outgoingLinks &&
          !program.nativeLinkedEntry()))
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.rejectedPrograms;
+#endif
         fail(
             "compiled program has no executable entry points",
             diagnostic);
@@ -176,22 +194,26 @@ VuProgramHandle VuProgramCache::insert(
         m_limits.maximumExecutableBytes == 0u ||
         residentBytes > m_limits.maximumExecutableBytes)
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.rejectedPrograms;
+#endif
         fail(
             "compiled program exceeds the cache limits",
             diagnostic);
         return {};
     }
 
-    while (m_diagnostics.residentPrograms >=
+    while (m_residentPrograms >=
                m_limits.maximumPrograms ||
            residentBytes >
                m_limits.maximumExecutableBytes -
-                   m_diagnostics.residentExecutableBytes)
+                   m_residentExecutableBytes)
     {
         if (!evictLeastRecentlyUsed())
         {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
             ++m_diagnostics.rejectedPrograms;
+#endif
             fail(
                 "VU program cache could not reclaim a resident program",
                 diagnostic);
@@ -204,7 +226,9 @@ VuProgramHandle VuProgramCache::insert(
             static_cast<size_t>(
                 std::numeric_limits<uint32_t>::max()))
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.rejectedPrograms;
+#endif
         fail(
             "VU program cache handle space is exhausted",
             diagnostic);
@@ -222,10 +246,11 @@ VuProgramHandle VuProgramCache::insert(
         index = m_freeProgramIndices.back();
         m_freeProgramIndices.pop_back();
     }
-    const size_t generatedBytes =
-        program.nativeCode.usedSize();
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    const size_t generatedBytes = program.nativeCode.usedSize();
     const uint64_t compilationNanoseconds =
         program.compilationNanoseconds;
+#endif
     if (program.outgoingLinks)
     {
         program.outgoingLinks->ownerCacheIdentity =
@@ -238,18 +263,19 @@ VuProgramHandle VuProgramCache::insert(
     m_lookup.emplace(slot.program->key, index);
     touchProgram(index);
 
+    ++m_residentPrograms;
+    m_residentExecutableBytes += residentBytes;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     ++m_diagnostics.compilations;
     m_diagnostics.generatedBytes += generatedBytes;
-    m_diagnostics.compilationNanoseconds +=
-        compilationNanoseconds;
-    ++m_diagnostics.residentPrograms;
-    m_diagnostics.residentExecutableBytes += residentBytes;
+    m_diagnostics.compilationNanoseconds += compilationNanoseconds;
     m_diagnostics.highWaterPrograms = std::max(
         m_diagnostics.highWaterPrograms,
-        m_diagnostics.residentPrograms);
+        m_residentPrograms);
     m_diagnostics.highWaterExecutableBytes = std::max(
         m_diagnostics.highWaterExecutableBytes,
-        m_diagnostics.residentExecutableBytes);
+        m_residentExecutableBytes);
+#endif
     if (diagnostic)
         diagnostic->clear();
     return {
@@ -294,7 +320,9 @@ const VuCompiledProgram *VuProgramCache::resolveCurrent(
     {
         return nullptr;
     }
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     ++m_diagnostics.hits;
+#endif
     touchProgram(handle.index);
     return m_programs[handle.index].program.get();
 }
@@ -330,7 +358,9 @@ VuProgramLinkResult VuProgramCache::populateLink(
     const auto reject =
         [&](VuProgramLinkResult result)
         {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
             ++m_diagnostics.linkResolutionFailures;
+#endif
             return result;
         };
     if (!source)
@@ -439,7 +469,9 @@ VuProgramLinkResult VuProgramCache::populateLink(
             target.nativeLinkedEntry());
     touchProgram(sourceIndex);
     touchProgram(targetHandle.index);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     ++m_diagnostics.linkResolutions;
+#endif
     return VuProgramLinkResult::Linked;
 }
 
@@ -455,13 +487,13 @@ void VuProgramCache::flush()
 VuProgramCacheDiagnostics VuProgramCache::diagnostics() const
 {
     requireOwnerThread();
-    return m_diagnostics;
+    return diagnosticsSnapshot();
 }
 
 VuProgramCacheDiagnostics
 VuProgramCache::diagnosticsWhileExecutionQuiescent() const
 {
-    return m_diagnostics;
+    return diagnosticsSnapshot();
 }
 
 bool VuProgramCache::validKey(
@@ -672,20 +704,21 @@ bool VuProgramCache::activateScope(
 
 void VuProgramCache::retainProgramsForGeneration()
 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     ++m_diagnostics.invalidations;
     ++m_diagnostics.generationRetentions;
     m_diagnostics.retainedPrograms +=
-        static_cast<uint64_t>(
-            m_diagnostics.residentPrograms);
+        static_cast<uint64_t>(m_residentPrograms);
+#endif
     m_epoch = nextEpoch(m_epoch);
 }
 
 void VuProgramCache::discardPrograms(FlushReason reason)
 {
     invalidateAllLinks();
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     const uint64_t programCount =
-        static_cast<uint64_t>(
-            m_diagnostics.residentPrograms);
+        static_cast<uint64_t>(m_residentPrograms);
     switch (reason)
     {
     case FlushReason::Invalidation:
@@ -696,12 +729,15 @@ void VuProgramCache::discardPrograms(FlushReason reason)
         ++m_diagnostics.manualFlushes;
         break;
     }
+#else
+    (void)reason;
+#endif
 
     m_lookup.clear();
     m_programs.clear();
     m_freeProgramIndices.clear();
-    m_diagnostics.residentPrograms = 0u;
-    m_diagnostics.residentExecutableBytes = 0u;
+    m_residentPrograms = 0u;
+    m_residentExecutableBytes = 0u;
     m_epoch = nextEpoch(m_epoch);
 }
 
@@ -711,9 +747,13 @@ void VuProgramCache::invalidateAllLinks()
     {
         if (slot.program && slot.program->outgoingLinks)
         {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
             m_diagnostics.linkInvalidations +=
                 slot.program->outgoingLinks->
                     invalidateTargets();
+#else
+            (void)slot.program->outgoingLinks->invalidateTargets();
+#endif
             slot.program->outgoingLinks->
                 ownerCacheIdentity = 0u;
             slot.program->outgoingLinks->
@@ -728,6 +768,23 @@ void VuProgramCache::touchProgram(uint32_t index)
 {
     m_accessClock = nextEpoch(m_accessClock);
     m_programs[index].lastUse = m_accessClock;
+}
+
+VuProgramCacheDiagnostics
+VuProgramCache::diagnosticsSnapshot() const
+{
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    VuProgramCacheDiagnostics snapshot = m_diagnostics;
+#else
+    VuProgramCacheDiagnostics snapshot{};
+#endif
+    snapshot.residentPrograms = m_residentPrograms;
+    snapshot.residentExecutableBytes =
+        m_residentExecutableBytes;
+    snapshot.maximumPrograms = m_limits.maximumPrograms;
+    snapshot.maximumExecutableBytes =
+        m_limits.maximumExecutableBytes;
+    return snapshot;
 }
 
 bool VuProgramCache::evictLeastRecentlyUsed()
@@ -767,16 +824,25 @@ bool VuProgramCache::evictLeastRecentlyUsed()
         {
             if (slot.program && slot.program->outgoingLinks)
             {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 m_diagnostics.linkInvalidations +=
                     slot.program->outgoingLinks->
                         invalidateTarget(targetEntry);
+#else
+                (void)slot.program->outgoingLinks->
+                    invalidateTarget(targetEntry);
+#endif
             }
         }
     }
     if (victim.outgoingLinks)
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         m_diagnostics.linkInvalidations +=
             victim.outgoingLinks->invalidateTargets();
+#else
+        (void)victim.outgoingLinks->invalidateTargets();
+#endif
         victim.outgoingLinks->ownerCacheIdentity = 0u;
         victim.outgoingLinks->ownerProgramIndex =
             VuNativeLinkState::kUnboundProgramIndex;
@@ -786,10 +852,12 @@ bool VuProgramCache::evictLeastRecentlyUsed()
     victimSlot.program.reset();
     victimSlot.lastUse = 0u;
     m_freeProgramIndices.push_back(victimIndex);
-    --m_diagnostics.residentPrograms;
-    m_diagnostics.residentExecutableBytes -= residentBytes;
+    --m_residentPrograms;
+    m_residentExecutableBytes -= residentBytes;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     ++m_diagnostics.selectiveEvictions;
     ++m_diagnostics.evictedPrograms;
+#endif
     m_epoch = nextEpoch(m_epoch);
     return true;
 }

@@ -3785,6 +3785,7 @@ namespace
             {
                 m_code.jmp(pairAccounted);
                 m_code.L(pairNotExecuted);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 m_code.mov(
                     m_code.rax,
                     reinterpret_cast<uint64_t>(
@@ -3795,6 +3796,7 @@ namespace
                         offsetof(
                             VuNativeChainRuntime,
                             preciseNonRetiredChecks)]);
+#endif
             }
             m_code.L(pairAccounted);
             m_code.and_(
@@ -3853,6 +3855,7 @@ namespace
                             VuNativeChainRuntime,
                             preciseTailPairs)],
                     0u);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 m_code.mov(
                     m_code.qword[
                         m_code.rax +
@@ -3867,6 +3870,7 @@ namespace
                             VuNativeChainRuntime,
                             returnBoundaryChecks)],
                     0u);
+#endif
                 m_code.mov(
                     m_code.qword[
                         m_code.rsp +
@@ -4186,6 +4190,7 @@ namespace
             if (m_blockBudgetGuardsEnabled)
             {
                 Label blockComplete;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 m_code.mov(
                     m_code.rax,
                     reinterpret_cast<uint64_t>(
@@ -4196,11 +4201,18 @@ namespace
                         offsetof(
                             VuNativeChainRuntime,
                             returnBoundaryChecks)]);
+#endif
                 m_code.cmp(
                     m_code.r14d, m_code.r13d);
                 m_code.jb(blockComplete);
                 if (m_chainRuntime)
                 {
+#if !PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+                    m_code.mov(
+                        m_code.rax,
+                        reinterpret_cast<uint64_t>(
+                            m_chainRuntime));
+#endif
                     m_code.mov(
                         m_code.qword[
                             m_code.rax +
@@ -5582,7 +5594,9 @@ uint64_t VuRecompilerBackend::codeContentIdentity(
                 context.codeSize) == 0)
         {
             identity = image.identity;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
             ++m_diagnostics.codeImageReuses;
+#endif
             break;
         }
     }
@@ -5593,7 +5607,9 @@ uint64_t VuRecompilerBackend::codeContentIdentity(
             kMaximumRememberedCodeImages)
         {
             m_codeImages.erase(m_codeImages.begin());
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
             ++m_diagnostics.codeImageCatalogEvictions;
+#endif
         }
         if (m_nextCodeContentIdentity == 0u)
         {
@@ -5602,7 +5618,9 @@ uint64_t VuRecompilerBackend::codeContentIdentity(
             m_nextCodeContentIdentity = 1u;
         }
         identity = m_nextCodeContentIdentity++;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.codeImageIdentities;
+#endif
         m_codeImages.push_back({
             .memoryIdentity = memoryIdentity,
             .codeIdentity = codeIdentity,
@@ -5649,7 +5667,9 @@ VuRunResult VuRecompilerBackend::run(
         m_lastDiagnostic = built()
                                ? "x86-64 VU recompiler unsupported on this host"
                                : "x86-64 VU recompiler not built";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.faultExits;
+#endif
         return finish(0u, VuExitReason::Fault);
     }
     uint32_t totalExecuted = 0u;
@@ -5663,7 +5683,9 @@ VuRunResult VuRecompilerBackend::run(
     if (needsInterpreterInstrumentation(
             context, nativeInstrumentation))
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.interpreterInstrumentationFallbacks;
+#endif
         VuRunResult result = runInterpreterFallback(
             context, maximumCycles);
         totalExecuted = result.executedCycles;
@@ -5672,7 +5694,9 @@ VuRunResult VuRecompilerBackend::run(
     }
     if (maximumCycles == 0u)
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.cycleBudgetExits;
+#endif
         return finish(0u, VuExitReason::CycleBudget);
     }
 
@@ -5686,7 +5710,9 @@ VuRunResult VuRecompilerBackend::run(
             context, compilationMode,
             key, &m_lastDiagnostic))
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.faultExits;
+#endif
         return finish(totalExecuted, VuExitReason::Fault);
     }
     const NativeContextView nativeContextView{
@@ -5725,7 +5751,9 @@ VuRunResult VuRecompilerBackend::run(
             {
                 m_lastDiagnostic =
                     "native VU block entry PC is outside its code extent";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.faultExits;
+#endif
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             }
@@ -5755,7 +5783,9 @@ VuRunResult VuRecompilerBackend::run(
                     m_lastDiagnostic =
                         "compiled VU program handle did not resolve";
                 }
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.faultExits;
+#endif
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             }
@@ -5777,8 +5807,10 @@ VuRunResult VuRecompilerBackend::run(
             m_chainRuntime.linkedEdges = 0u;
             m_chainRuntime.preciseTailEntries = 0u;
             m_chainRuntime.preciseTailPairs = 0u;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
             m_chainRuntime.preciseNonRetiredChecks = 0u;
             m_chainRuntime.returnBoundaryChecks = 0u;
+#endif
             const VuNativeBlockResult native =
                 VuNativeBlockResult::decode(
                     entry(
@@ -5806,6 +5838,7 @@ VuRunResult VuRecompilerBackend::run(
                     ? m_chainRuntime.
                           preciseTailPairs
                     : native.executedCycles;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
             const uint64_t
                 preciseNonRetiredChecks =
                     m_chainRuntime.
@@ -5826,12 +5859,15 @@ VuRunResult VuRecompilerBackend::run(
                      VuNativeBlockExit::BlockComplete &&
                  native.executedCycles == remaining);
             ++m_diagnostics.nativeEntries;
+#endif
             if (linkedEdges >
                 native.executedCycles)
             {
                 m_lastDiagnostic =
                     "native VU chain reported more links than retired pairs";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.faultExits;
+#endif
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             }
@@ -5839,7 +5875,9 @@ VuRunResult VuRecompilerBackend::run(
             {
                 m_lastDiagnostic =
                     "native VU chain reported too many precise entries";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.faultExits;
+#endif
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             }
@@ -5848,7 +5886,9 @@ VuRunResult VuRecompilerBackend::run(
             {
                 m_lastDiagnostic =
                     "native VU chain reported too many precise pairs";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.faultExits;
+#endif
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             }
@@ -5858,10 +5898,13 @@ VuRunResult VuRecompilerBackend::run(
             {
                 m_lastDiagnostic =
                     "native VU chain retained a slow link on a terminal exit";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.faultExits;
+#endif
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             }
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
             m_diagnostics.nativeBlocks +=
                 nativeBlocks;
             m_diagnostics.linkedEdges +=
@@ -5938,11 +5981,14 @@ VuRunResult VuRecompilerBackend::run(
                 m_diagnostics.instrumentedNativeBlocks +=
                     nativeBlocks;
             }
+#endif
             if (native.executedCycles > remaining)
             {
                 m_lastDiagnostic =
                     "native VU block exceeded its cycle budget";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.faultExits;
+#endif
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             }
@@ -5950,13 +5996,16 @@ VuRunResult VuRecompilerBackend::run(
             {
                 m_lastDiagnostic =
                     "native VU block reported fewer cycles than its helpers";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.faultExits;
+#endif
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             }
 
             totalExecuted += native.executedCycles;
             state.issuedCycles += native.executedCycles;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
             m_diagnostics.nativePairs +=
                 native.executedCycles;
             if (nativeInstrumentation)
@@ -5967,6 +6016,7 @@ VuRunResult VuRecompilerBackend::run(
             m_diagnostics.helperPairs += helperPairs;
             m_diagnostics.inlinePairs +=
                 native.executedCycles - helperPairs;
+#endif
             progress.publish();
 
             const uint64_t currentGeneration =
@@ -5983,7 +6033,9 @@ VuRunResult VuRecompilerBackend::run(
                     currentGeneration;
                 (void)m_unit.programCache().lookup(
                     currentKey);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.codeInvalidationExits;
+#endif
                 return finish(
                     totalExecuted,
                     VuExitReason::CodeInvalidated);
@@ -5992,26 +6044,34 @@ VuRunResult VuRecompilerBackend::run(
             switch (native.exit)
             {
             case VuNativeBlockExit::BlockComplete:
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.blockCompletes;
+#endif
                 if (native.executedCycles == 0u)
                 {
                     m_lastDiagnostic =
                         "native VU block completed without progress";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                     ++m_diagnostics.faultExits;
+#endif
                     return finish(
                         totalExecuted,
                         VuExitReason::Fault);
                 }
                 if (slowLinkSource)
                 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                     ++m_diagnostics.slowLinkExits;
+#endif
                     if (slowLinkTargetPc != state.pc ||
                         (slowLinkTargetPc & 7u) != 0u ||
                         slowLinkTargetPc >= key.codeSize)
                     {
                         m_lastDiagnostic =
                             "native VU slow link target is invalid";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                         ++m_diagnostics.faultExits;
+#endif
                         return finish(
                             totalExecuted,
                             VuExitReason::Fault);
@@ -6036,7 +6096,9 @@ VuRunResult VuRecompilerBackend::run(
                             m_lastDiagnostic =
                                 "native VU slow link target did not compile";
                         }
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                         ++m_diagnostics.faultExits;
+#endif
                         return finish(
                             totalExecuted,
                             VuExitReason::Fault);
@@ -6048,6 +6110,7 @@ VuRunResult VuRecompilerBackend::run(
                         cache.populateLink(
                             pinnedLinkSource.get(),
                             targetHandle, targetKey);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                     switch (linked)
                     {
                     case VuProgramLinkResult::Linked:
@@ -6066,21 +6129,30 @@ VuRunResult VuRecompilerBackend::run(
                             abandonedLinkResolutions;
                         break;
                     }
+#else
+                    (void)linked;
+#endif
                 }
                 continue;
             case VuNativeBlockExit::CycleBudget:
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.cycleBudgetExits;
+#endif
                 return finish(
                     totalExecuted,
                     VuExitReason::CycleBudget);
             case VuNativeBlockExit::XgkickBoundary:
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.xgkickExits;
+#endif
                 return finish(
                     totalExecuted,
                     VuExitReason::XgkickBoundary);
             case VuNativeBlockExit::
                 UnsupportedInstruction:
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.unsupportedExits;
+#endif
                 return finish(
                     totalExecuted,
                     VuExitReason::
@@ -6088,7 +6160,9 @@ VuRunResult VuRecompilerBackend::run(
             case VuNativeBlockExit::Fault:
                 m_lastDiagnostic =
                     "native VU pair helper reported a fault";
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
                 ++m_diagnostics.faultExits;
+#endif
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             default:
@@ -6098,7 +6172,9 @@ VuRunResult VuRecompilerBackend::run(
             }
         }
 
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.cycleBudgetExits;
+#endif
         return finish(
             totalExecuted, VuExitReason::CycleBudget);
     };
@@ -6113,8 +6189,10 @@ VuRunResult VuRecompilerBackend::runInterpreterFallback(
     fallbackContext.enableProgressAccounting = false;
     VuRunResult result =
         m_semantics.run(fallbackContext, maximumCycles);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     m_diagnostics.interpreterFallbackPairs +=
         result.executedCycles;
+#endif
     return result;
 }
 
@@ -6378,7 +6456,9 @@ uint32_t VuRecompilerBackend::executeInstrumentedPairThunk(
 uint32_t VuRecompilerBackend::advanceXgkick(
     VuExecutionContext &context) noexcept
 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     ++m_diagnostics.xgkickAdvanceHelperCalls;
+#endif
     VuExecutionState &state = context.state;
     if (!state.pipeline.xgkick.active)
     {
@@ -6495,7 +6575,9 @@ void VuRecompilerBackend::ensureJitRegistration(
         program.nativeCode.usedSize();
     if (!code || sizeBytes == 0u)
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.jitDumpFailures;
+#endif
         m_lastJitDiagnostic =
             "compiled VU program has no code to register";
         return;
@@ -6511,13 +6593,17 @@ void VuRecompilerBackend::ensureJitRegistration(
             code, sizeBytes, symbol,
             &codeIndex, &diagnostic))
     {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         ++m_diagnostics.jitDumpFailures;
+#endif
         m_lastJitDiagnostic = std::move(diagnostic);
         return;
     }
 
     program.jitCodeIndex = codeIndex;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     ++m_diagnostics.jitDumpRegistrations;
+#endif
     m_lastJitDiagnostic.clear();
     if (program.blockProfile)
     {
@@ -6537,7 +6623,9 @@ bool VuRecompilerBackend::compile(
     std::string &diagnostic)
 {
 #if PS2X_HAS_VU_X64_RECOMPILER
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     const Clock::time_point start = Clock::now();
+#endif
     VuIrBlock block = decodeVuIrBlock(
         context.code, context.codeSize,
         key.entryPc, kMaximumBlockPairs,
@@ -6752,12 +6840,16 @@ bool VuRecompilerBackend::compile(
                 static_cast<uint64_t>(
                     nativeCode.usedSize());
         }
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
         const uint64_t nanoseconds =
             static_cast<uint64_t>(
                 std::chrono::duration_cast<
                     std::chrono::nanoseconds>(
                     Clock::now() - start)
                     .count());
+#else
+        constexpr uint64_t nanoseconds = 0u;
+#endif
         if (m_blockProfilingEnabled &&
             !blockProfile)
         {

@@ -389,9 +389,13 @@ VuProgramCache &VuUnit::programCache()
 const VuRecompilerDiagnostics *
 VuUnit::recompilerDiagnosticsIfCreated() const
 {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     return m_recompiler
                ? &m_recompiler->m_diagnostics
                : nullptr;
+#else
+    return nullptr;
+#endif
 }
 
 VuInterpreterBackend::VuInterpreterBackend(VuUnit &unit)

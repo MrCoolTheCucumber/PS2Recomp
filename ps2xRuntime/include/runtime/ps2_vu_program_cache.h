@@ -1,6 +1,7 @@
 #ifndef PS2_VU_PROGRAM_CACHE_H
 #define PS2_VU_PROGRAM_CACHE_H
 
+#include "runtime/ps2_build_config.h"
 #include "runtime/ps2_vu_executable_memory.h"
 #include "runtime/ps2_vu_ir.h"
 
@@ -278,6 +279,8 @@ private:
     void discardPrograms(FlushReason reason);
     void invalidateAllLinks();
     void touchProgram(uint32_t index);
+    [[nodiscard]] VuProgramCacheDiagnostics
+    diagnosticsSnapshot() const;
     [[nodiscard]] bool evictLeastRecentlyUsed();
     [[nodiscard]] static bool sameProgramIdentity(
         const VuProgramKey &left,
@@ -296,11 +299,17 @@ private:
     uint64_t m_codeGeneration = 0u;
     uint64_t m_epoch = 1u;
     uint64_t m_accessClock = 0u;
+    // These are cache state, not optional diagnostics: admission and eviction
+    // must enforce the configured limits in every build.
+    size_t m_residentPrograms = 0u;
+    size_t m_residentExecutableBytes = 0u;
     std::vector<ProgramSlot> m_programs;
     std::vector<uint32_t> m_freeProgramIndices;
     std::unordered_map<
         VuProgramKey, uint32_t, KeyHash, KeyEqual> m_lookup;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     VuProgramCacheDiagnostics m_diagnostics{};
+#endif
     mutable bool m_ownerBound = false;
     mutable std::thread::id m_ownerThread;
 };
