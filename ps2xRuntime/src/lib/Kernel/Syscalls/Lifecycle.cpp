@@ -207,6 +207,7 @@ namespace ps2_syscalls
                 state.initialized = false;
                 state.servers.clear();
                 state.clients.clear();
+                state.clearClientBusyState();
                 state.debugHistory.fill(
                     SifRpcDebugEvent{});
                 state.nextDebugSequence = 0u;

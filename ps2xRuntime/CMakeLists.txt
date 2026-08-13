@@ -795,6 +795,19 @@ else()
     )
 endif()
 
+# SIF RPC history exists only for the interactive debugger surfaces. Keep the
+# architectural RPC state in production builds without constructing previews
+# or taking a history-publication lock for every guest call.
+if(PS2X_ENABLE_DEBUG_SERVER OR PS2X_ENABLE_DEBUG_UI)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY=1
+    )
+else()
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY=0
+    )
+endif()
+
 if(PS2X_HAS_VU_X64_RECOMPILER)
     target_link_libraries(ps2_runtime PRIVATE xbyak::xbyak)
     target_compile_definitions(ps2_runtime PUBLIC

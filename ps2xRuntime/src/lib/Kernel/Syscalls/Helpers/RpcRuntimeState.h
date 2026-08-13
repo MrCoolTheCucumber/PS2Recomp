@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -76,11 +77,51 @@ struct SifModuleRecord
 // concurrently while retaining recursive calls within one runtime.
 struct EeRpcRuntimeState
 {
+    void publishClientBusyState(
+        uint32_t clientPtr,
+        bool busy) noexcept
+    {
+        const uint64_t packed =
+            (static_cast<uint64_t>(clientPtr) << 2u) |
+            0x2u |
+            (busy ? 0x1u : 0u);
+        latestClientBusyState.store(
+            packed, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool cachedClientBusyState(
+        uint32_t clientPtr,
+        bool &busy) const noexcept
+    {
+        const uint64_t packed =
+            latestClientBusyState.load(
+                std::memory_order_acquire);
+        if ((packed & 0x2u) == 0u ||
+            static_cast<uint32_t>(packed >> 2u) !=
+                clientPtr)
+        {
+            return false;
+        }
+        busy = (packed & 0x1u) != 0u;
+        return true;
+    }
+
+    void clearClientBusyState() noexcept
+    {
+        latestClientBusyState.store(
+            0u, std::memory_order_release);
+    }
+
     std::mutex rpcMutex;
     std::recursive_mutex callMutex;
     bool initialized = false;
     std::unordered_map<uint32_t, RpcServerState> servers;
     std::unordered_map<uint32_t, RpcClientState> clients;
+    // sceSifCheckStatRpc commonly polls the client just touched by CallRpc.
+    // Publish that one exact state in a single atomic word so the poll does
+    // not need to lock and hash-probe the registry. Other clients retain the
+    // locked map fallback.
+    std::atomic<uint64_t> latestClientBusyState{0u};
     std::array<SifRpcDebugEvent, kSifRpcDebugHistoryCount>
         debugHistory{};
     uint64_t nextDebugSequence = 0;

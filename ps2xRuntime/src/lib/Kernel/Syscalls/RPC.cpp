@@ -2,10 +2,20 @@
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
+#ifndef PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY
+#define PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY 0
+#endif
+
+#ifndef PS2X_ENABLE_IOP_RPC_TRACE
+#define PS2X_ENABLE_IOP_RPC_TRACE 1
+#endif
+
 namespace ps2_syscalls
 {
     namespace
     {
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY || \
+    PS2X_ENABLE_IOP_RPC_TRACE
         SifRpcDebugEvent makeRpcDebugEvent(
             const char *op,
             R5900Context *ctx,
@@ -19,7 +29,9 @@ namespace ps2_syscalls
                 getCurrentThreadId(runtime));
             return event;
         }
+#endif
 
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY
         void pushSifRpcDebugEventLocked(
             EeRpcRuntimeState &state,
             SifRpcDebugEvent event)
@@ -45,7 +57,10 @@ namespace ps2_syscalls
                 state.rpcMutex);
             pushSifRpcDebugEventLocked(state, event);
         }
+#endif
 
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY || \
+    PS2X_ENABLE_IOP_RPC_TRACE
         void fillRpcDebugPreview(const uint8_t *rdram, uint32_t addr, uint32_t size, uint8_t *preview, uint32_t &previewSize)
         {
             previewSize = 0u;
@@ -66,7 +81,9 @@ namespace ps2_syscalls
                 ++previewSize;
             }
         }
+#endif
 
+#if PS2X_ENABLE_IOP_RPC_TRACE
         std::string formatRpcTraceBytes(const uint8_t *bytes, uint32_t count)
         {
             std::string out;
@@ -88,11 +105,6 @@ namespace ps2_syscalls
             return out;
         }
 
-#ifndef PS2X_ENABLE_IOP_RPC_TRACE
-#define PS2X_ENABLE_IOP_RPC_TRACE 1
-#endif
-
-#if PS2X_ENABLE_IOP_RPC_TRACE
         std::string loadedIopModuleTraceSummary(
             PS2Runtime *runtime)
         {
@@ -337,6 +349,7 @@ namespace ps2_syscalls
         {
             rpcState.servers.clear();
             rpcState.clients.clear();
+            rpcState.clearClientBusyState();
             rpcState.nextRequestId = 1;
             rpcState.packetIndex = 0;
             rpcState.serverIndex = 0;
@@ -348,10 +361,12 @@ namespace ps2_syscalls
             RUNTIME_LOG("[SifInitRpc] Initialized");
         }
 
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY
         SifRpcDebugEvent event =
             makeRpcDebugEvent("InitRpc", ctx, runtime);
         event.result = 0;
         pushSifRpcDebugEventLocked(rpcState, event);
+#endif
         setReturnS32(ctx, 0);
     }
 
@@ -373,6 +388,7 @@ namespace ps2_syscalls
 
         if (!client)
         {
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY
             SifRpcDebugEvent event =
                 makeRpcDebugEvent("BindRpc", ctx, runtime);
             event.clientPtr = clientPtr;
@@ -381,6 +397,7 @@ namespace ps2_syscalls
             event.flags = kSifRpcDebugFlagMissingClient;
             event.result = -1;
             pushSifRpcDebugEvent(runtime, event);
+#endif
             setReturnS32(ctx, -1);
             return;
         }
@@ -408,6 +425,8 @@ namespace ps2_syscalls
             }
             rpcState.clients[clientPtr] = {};
             rpcState.clients[clientPtr].sid = rpcId;
+            rpcState.publishClientBusyState(
+                clientPtr, false);
         }
 
         if (!serverState.sd_ptr)
@@ -444,6 +463,7 @@ namespace ps2_syscalls
             client->cbuf = 0;
         }
 
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY
         SifRpcDebugEvent event =
             makeRpcDebugEvent("BindRpc", ctx, runtime);
         event.clientPtr = clientPtr;
@@ -452,6 +472,7 @@ namespace ps2_syscalls
         event.mode = mode;
         event.result = 0;
         pushSifRpcDebugEvent(runtime, event);
+#endif
         setReturnS32(ctx, 0);
     }
 
@@ -587,6 +608,7 @@ namespace ps2_syscalls
         auto *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
         if (!client)
         {
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY
             SifRpcDebugEvent event =
                 makeRpcDebugEvent("CallRpc", ctx, runtime);
             event.clientPtr = clientPtr;
@@ -602,6 +624,7 @@ namespace ps2_syscalls
             event.flags = kSifRpcDebugFlagMissingClient | ((mode & kSifRpcModeNowait) ? kSifRpcDebugFlagNowait : 0u);
             event.result = -1;
             pushSifRpcDebugEvent(runtime, event);
+#endif
             setReturnS32(ctx, -1);
             return;
         }
@@ -628,6 +651,8 @@ namespace ps2_syscalls
             }
             auto &clientState = clientIt->second;
             clientState.busy = true;
+            rpcState.publishClientBusyState(
+                clientPtr, true);
             clientState.last_rpc = rpcNum;
             sid = clientState.sid;
             if (hasClientState)
@@ -835,8 +860,12 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(
                 rpcState.rpcMutex);
             rpcState.clients[clientPtr].busy = false;
+            rpcState.publishClientBusyState(
+                clientPtr, false);
         }
 
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY || \
+    PS2X_ENABLE_IOP_RPC_TRACE
         SifRpcDebugEvent event =
             makeRpcDebugEvent("CallRpc", ctx, runtime);
         event.clientPtr = clientPtr;
@@ -851,25 +880,40 @@ namespace ps2_syscalls
         event.resultPtr = resultPointer;
         event.endFunc = endFunction;
         event.endParam = endParameter;
-        event.semaId = static_cast<uint32_t>(client->hdr.sema_id);
+        event.semaId =
+            static_cast<uint32_t>(client->hdr.sema_id);
         event.flags =
-            ((mode & kSifRpcModeNowait) ? kSifRpcDebugFlagNowait : 0u) |
-            (handledByIop ? kSifRpcDebugFlagHandledByHle : 0u) |
-            (callbackCompleted ? kSifRpcDebugFlagCallback : 0u) |
-            (serverDispatched ? kSifRpcDebugFlagServerDispatch : 0u) |
+            ((mode & kSifRpcModeNowait)
+                 ? kSifRpcDebugFlagNowait
+                 : 0u) |
+            (handledByIop
+                 ? kSifRpcDebugFlagHandledByHle
+                 : 0u) |
+            (callbackCompleted
+                 ? kSifRpcDebugFlagCallback
+                 : 0u) |
+            (serverDispatched
+                 ? kSifRpcDebugFlagServerDispatch
+                 : 0u) |
             (!handled ? kSifRpcDebugFlagUnhandled : 0u) |
-            (copiedFallback ? kSifRpcDebugFlagFallbackCopy : 0u) |
-            (zeroedFallback ? kSifRpcDebugFlagFallbackZero : 0u);
-        fillRpcDebugPreview(rdram,
-                            sendBuf,
-                            sendSize,
-                            event.sendPreview,
-                            event.sendPreviewSize);
-        fillRpcDebugPreview(rdram,
-                            receiveBuffer,
-                            receiveSize,
-                            event.recvPreview,
-                            event.recvPreviewSize);
+            (copiedFallback
+                 ? kSifRpcDebugFlagFallbackCopy
+                 : 0u) |
+            (zeroedFallback
+                 ? kSifRpcDebugFlagFallbackZero
+                 : 0u);
+        fillRpcDebugPreview(
+            rdram,
+            sendBuf,
+            sendSize,
+            event.sendPreview,
+            event.sendPreviewSize);
+        fillRpcDebugPreview(
+            rdram,
+            receiveBuffer,
+            receiveSize,
+            event.recvPreview,
+            event.recvPreviewSize);
         event.result = 0;
 
 #if PS2X_ENABLE_IOP_RPC_TRACE
@@ -878,7 +922,10 @@ namespace ps2_syscalls
             logUnhandledRpcTrace(runtime, event);
         }
 #endif
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY
         pushSifRpcDebugEvent(runtime, event);
+#endif
+#endif
 
         setReturnS32(ctx, 0);
     }
@@ -909,6 +956,7 @@ namespace ps2_syscalls
         t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, sdPtr));
         if (!sd)
         {
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY
             SifRpcDebugEvent event =
                 makeRpcDebugEvent(
                     "RegisterRpc", ctx, runtime);
@@ -921,6 +969,7 @@ namespace ps2_syscalls
             event.flags = kSifRpcDebugFlagMissingClient;
             event.result = -1;
             pushSifRpcDebugEvent(runtime, event);
+#endif
             setReturnS32(ctx, -1);
             return;
         }
@@ -994,6 +1043,7 @@ namespace ps2_syscalls
         }
 
         RUNTIME_LOG("[SifRegisterRpc] sid=0x" << std::hex << sid << " sd=0x" << sdPtr << std::dec);
+#if PS2X_ENABLE_SIF_RPC_DEBUG_HISTORY
         SifRpcDebugEvent event =
             makeRpcDebugEvent(
                 "RegisterRpc", ctx, runtime);
@@ -1005,6 +1055,7 @@ namespace ps2_syscalls
         event.endFunc = cfunc;
         event.result = 0;
         pushSifRpcDebugEvent(runtime, event);
+#endif
         setReturnS32(ctx, 0);
     }
 
@@ -1019,6 +1070,13 @@ namespace ps2_syscalls
         EeRpcRuntimeState &rpcState =
             runtime->eeRpcRuntimeState();
         uint32_t clientPtr = getRegU32(ctx, 4);
+        bool busy = false;
+        if (rpcState.cachedClientBusyState(
+                clientPtr, busy))
+        {
+            setReturnS32(ctx, busy ? 1 : 0);
+            return;
+        }
         std::lock_guard<std::mutex> lock(
             rpcState.rpcMutex);
         auto it = rpcState.clients.find(clientPtr);
@@ -1027,7 +1085,10 @@ namespace ps2_syscalls
             setReturnS32(ctx, 0);
             return;
         }
-        setReturnS32(ctx, it->second.busy ? 1 : 0);
+        busy = it->second.busy;
+        rpcState.publishClientBusyState(
+            clientPtr, busy);
+        setReturnS32(ctx, busy ? 1 : 0);
     }
 
     void SifSetRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

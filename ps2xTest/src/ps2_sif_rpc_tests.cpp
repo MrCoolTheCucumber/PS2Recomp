@@ -3,6 +3,7 @@
 #include "ps2_iop_transport.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "Kernel/Syscalls/Helpers/RpcRuntimeState.h"
 
 #include <array>
 #include <atomic>
@@ -277,6 +278,70 @@ void register_ps2_sif_rpc_tests()
 {
     MiniTest::Case("PS2SifRpc", [](TestCase &tc)
     {
+        tc.Run("RPC busy snapshot preserves multi-client fallback and reset", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kBusyClient = 0x00021000u;
+            constexpr uint32_t kIdleClient = 0x00021100u;
+
+            EeRpcRuntimeState &state =
+                env.runtime.eeRpcRuntimeState();
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.rpcMutex);
+                state.clients[kBusyClient].busy = true;
+                state.clients[kIdleClient].busy = false;
+                state.publishClientBusyState(
+                    kIdleClient, false);
+            }
+
+            setRegU32(env.ctx, 4, kBusyClient);
+            SifCheckStatRpc(
+                env.rdram.data(),
+                &env.ctx,
+                &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                1,
+                "a non-cached busy client should use the registry fallback");
+
+            bool cachedBusy = false;
+            t.IsTrue(
+                state.cachedClientBusyState(
+                    kBusyClient, cachedBusy) &&
+                    cachedBusy,
+                "the registry fallback should publish the queried busy client");
+
+            setRegU32(env.ctx, 4, kIdleClient);
+            SifCheckStatRpc(
+                env.rdram.data(),
+                &env.ctx,
+                &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                0,
+                "switching clients should preserve the idle registry state");
+
+            SifInitRpc(
+                env.rdram.data(),
+                &env.ctx,
+                &env.runtime);
+            t.IsTrue(
+                !state.cachedClientBusyState(
+                    kIdleClient, cachedBusy),
+                "RPC initialization should invalidate the busy snapshot");
+
+            setRegU32(env.ctx, 4, kBusyClient);
+            SifCheckStatRpc(
+                env.rdram.data(),
+                &env.ctx,
+                &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                0,
+                "RPC initialization should clear the client registry");
+        });
+
         tc.Run("RPC registries opaque handles and callback stacks are isolated per runtime", [](TestCase &t)
         {
             TestEnv first;
