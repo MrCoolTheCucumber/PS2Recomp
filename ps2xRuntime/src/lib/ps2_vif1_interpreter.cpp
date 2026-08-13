@@ -71,6 +71,84 @@ namespace
         }
         return true;
     }
+
+    bool tryUnpackContiguousV4(
+        uint8_t *destination, uint32_t destinationSize,
+        uint32_t destinationVector, const uint8_t *source,
+        uint32_t vectorCount, uint8_t componentWidth,
+        bool zeroExtend, uint32_t mode, const uint32_t *row)
+    {
+        if (!destination || !source || !row ||
+            destinationSize < 16u ||
+            (destinationSize & 15u) != 0u ||
+            componentWidth > 2u || mode > 1u)
+        {
+            return false;
+        }
+
+        const uint32_t destinationVectors = destinationSize / 16u;
+        destinationVector %= destinationVectors;
+        if (componentWidth == 0u && mode != 1u)
+        {
+            copyWrappedMicroMemory(
+                destination, destinationSize,
+                destinationVector * 16u, source,
+                vectorCount * 16u);
+            return true;
+        }
+
+        const uint32_t sourceStride =
+            componentWidth == 0u ? 16u :
+            componentWidth == 1u ? 8u : 4u;
+        const __m128i rowValues = _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(row));
+        uint32_t remaining = vectorCount;
+        while (remaining != 0u)
+        {
+            const uint32_t chunk = std::min(
+                remaining,
+                destinationVectors - destinationVector);
+            uint8_t *output =
+                destination + destinationVector * 16u;
+            for (uint32_t index = 0u; index < chunk; ++index)
+            {
+                __m128i value{};
+                if (componentWidth == 0u)
+                {
+                    value = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i *>(source));
+                }
+                else if (componentWidth == 1u)
+                {
+                    const __m128i packed = _mm_loadl_epi64(
+                        reinterpret_cast<const __m128i *>(source));
+                    value = zeroExtend
+                        ? _mm_cvtepu16_epi32(packed)
+                        : _mm_cvtepi16_epi32(packed);
+                }
+                else
+                {
+                    uint32_t packed = 0u;
+                    std::memcpy(&packed, source, sizeof(packed));
+                    const __m128i bytes = _mm_cvtsi32_si128(
+                        static_cast<int32_t>(packed));
+                    value = zeroExtend
+                        ? _mm_cvtepu8_epi32(bytes)
+                        : _mm_cvtepi8_epi32(bytes);
+                }
+
+                if (mode == 1u)
+                    value = _mm_add_epi32(value, rowValues);
+                _mm_storeu_si128(
+                    reinterpret_cast<__m128i *>(output), value);
+                source += sourceStride;
+                output += 16u;
+            }
+            remaining -= chunk;
+            destinationVector = 0u;
+        }
+        return true;
+    }
 }
 
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
@@ -1014,6 +1092,17 @@ PS2Memory::processVif1Stream()
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
+                const uint32_t mode = vif1_regs.mode & 3u;
+                if (!maskEnable && vn == 3u && vl <= 2u &&
+                    cl == wl && mode <= 1u &&
+                    tryUnpackContiguousV4(
+                        m_vu1Data, PS2_VU1_DATA_SIZE, vuAddr,
+                        srcBase, writeVectorCount, vl,
+                        zeroExtend, mode, vif1_regs.row))
+                {
+                    pos += totalBytes;
+                    continue;
+                }
                 uint32_t srcIndex = 0u;
                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
                 {
@@ -1250,7 +1339,6 @@ PS2Memory::processVif1Stream()
                     }
 
                     const bool canAdd = (vl != 3u || vn != 3u);
-                    const uint32_t mode = vif1_regs.mode & 3u;
                     const uint32_t colIdx = (cyclePos > 3u) ? 3u : cyclePos;
                     const uint32_t maskCycle = (cyclePos > 3u) ? 3u : cyclePos;
 

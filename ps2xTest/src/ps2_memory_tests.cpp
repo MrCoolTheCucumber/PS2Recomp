@@ -2410,6 +2410,70 @@ void register_ps2_memory_tests()
             t.Equals(sw, 0x00008001u, "zero-extend w");
         });
 
+        tc.Run("VIF UNPACK V4-8 offset mode wraps and honors extension", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(
+                0x01u, 0u,
+                static_cast<uint16_t>((4u << 8u) | 4u)));
+            appendU32(packet, makeVifCmd(0x30u, 0u, 0u));
+            appendU32(packet, 10u);
+            appendU32(packet, 20u);
+            appendU32(packet, 30u);
+            appendU32(packet, 40u);
+            appendU32(packet, makeVifCmd(0x05u, 0u, 1u));
+            appendU32(packet, makeVifCmd(0x6Eu, 2u, 1023u));
+            packet.insert(packet.end(), {
+                0x80u, 0x01u, 0x7Fu, 0xFFu,
+                0x02u, 0xFEu, 0x00u, 0x40u});
+
+            appendU32(packet, makeVifCmd(0x05u, 0u, 0u));
+            appendU32(packet, makeVifCmd(0x6Eu, 1u, 0x4001u));
+            packet.insert(packet.end(), {
+                0x80u, 0x01u, 0x7Fu, 0xFFu});
+
+            mem.processVIF1Data(
+                packet.data(), static_cast<uint32_t>(packet.size()));
+
+            const auto lane = [&](uint32_t vector, uint32_t field)
+            {
+                uint32_t value = 0u;
+                std::memcpy(
+                    &value,
+                    mem.getVU1Data() + vector * 16u + field * 4u,
+                    sizeof(value));
+                return value;
+            };
+            t.Equals(lane(1023u, 0u), 0xFFFFFF8Au,
+                     "signed V4-8 X should add ROW before the ring boundary");
+            t.Equals(lane(1023u, 1u), 21u,
+                     "signed V4-8 Y should add ROW before the ring boundary");
+            t.Equals(lane(1023u, 2u), 157u,
+                     "signed V4-8 Z should add ROW before the ring boundary");
+            t.Equals(lane(1023u, 3u), 39u,
+                     "signed V4-8 W should add ROW before the ring boundary");
+            t.Equals(lane(0u, 0u), 12u,
+                     "the second V4-8 vector should wrap to VU address zero");
+            t.Equals(lane(0u, 1u), 18u,
+                     "wrapped signed V4-8 data should retain offset mode");
+            t.Equals(lane(0u, 2u), 30u,
+                     "wrapped zero source data should retain offset mode");
+            t.Equals(lane(0u, 3u), 104u,
+                     "wrapped positive V4-8 data should retain offset mode");
+            t.Equals(lane(1u, 0u), 128u,
+                     "USN should zero-extend V4-8 X");
+            t.Equals(lane(1u, 1u), 1u,
+                     "USN should zero-extend V4-8 Y");
+            t.Equals(lane(1u, 2u), 127u,
+                     "USN should zero-extend V4-8 Z");
+            t.Equals(lane(1u, 3u), 255u,
+                     "USN should zero-extend V4-8 W");
+        });
+
         tc.Run("VIF UNPACK V2 and V3 reproduce hardware indeterminate lanes", [](TestCase &t)
         {
             PS2Memory mem;
