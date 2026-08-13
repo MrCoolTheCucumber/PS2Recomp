@@ -40,6 +40,9 @@ public:
     void endCpuVramAccess(
         GS *gs,
         const GsVramPageMask &writePages);
+    // Complete software work collected for one frontend producer group while
+    // preserving accelerated residency across non-observing GIF drains.
+    void endDrawSubmissionBatch(GS *gs);
     void endDrawBatch(GS *gs);
     void drawPrimitive(GS *gs);
     [[nodiscard]] bool configureVulkanRenderer(

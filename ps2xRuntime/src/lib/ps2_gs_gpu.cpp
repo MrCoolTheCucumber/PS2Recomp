@@ -1869,6 +1869,12 @@ void GS::beginRenderBatch()
     m_rasterizer.beginDrawBatch(this);
 }
 
+void GS::endRenderSubmissionBatch()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_rasterizer.endDrawSubmissionBatch(this);
+}
+
 void GS::flushRenderBatch()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);

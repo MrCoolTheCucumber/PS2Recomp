@@ -130,6 +130,10 @@ public:
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void beginRenderBatch();
+    // Ends a producer-side batching scope without making GPU-newer VRAM
+    // canonical on the CPU. Architectural observers still use the ordinary
+    // flush/end paths below.
+    void endRenderSubmissionBatch();
     void flushRenderBatch();
     void endRenderBatch();
     void uploadImageNative(uint64_t bitbltbuf,

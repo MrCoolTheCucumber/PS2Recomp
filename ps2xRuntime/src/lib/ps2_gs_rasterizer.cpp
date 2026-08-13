@@ -2226,6 +2226,24 @@ void GSRasterizer::endDrawBatch(GS *gs)
     }
 }
 
+void GSRasterizer::endDrawSubmissionBatch(GS *gs)
+{
+    if (gs && gs != m_owner)
+        return;
+
+    // A GIF arbiter drain is a producer grouping, not a GS observation. Keep
+    // accelerated commands and Hybrid admission resident across drains, but
+    // finish software commands before releasing their parallel collection
+    // scope. Later accelerated transitions, CPU VRAM accesses, FINISH, and
+    // presentation retain their existing ordering checkpoints.
+    flushSoftwareDrawBatch(gs);
+    if (m_parallelState)
+    {
+        m_parallelState->batchActive = false;
+        m_parallelState->primaryGs = nullptr;
+    }
+}
+
 bool GSRasterizer::tryQueuePrimitive(
     GS *gs,
     const GsDrawCommand &command)

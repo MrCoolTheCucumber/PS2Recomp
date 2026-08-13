@@ -82,7 +82,7 @@ namespace
                "[--vulkan-vendor ID] [--vulkan-device ID] "
                "[--backend-stats] [--stop-after-command COUNT] "
                "[--stop-after-packet COUNT] [--compare-vram FILE] "
-               "[--batch-stream] "
+               "[--batch-stream | --batch-drains] "
                "GIF_PACKET [GIF_PACKET ...]\n";
     }
 
@@ -861,6 +861,7 @@ int main(int argc, char **argv)
     std::string registerStatePath;
     std::string verificationArtifactDirectory;
     bool batchStream = false;
+    bool batchDrains = false;
     bool backendStats = false;
     bool replayOptionUsed = false;
     bool gifReplayOptionUsed = false;
@@ -884,6 +885,12 @@ int main(int argc, char **argv)
         if (argument == "--batch-stream")
         {
             batchStream = true;
+            replayOptionUsed = true;
+            gifReplayOptionUsed = true;
+        }
+        else if (argument == "--batch-drains")
+        {
+            batchDrains = true;
             replayOptionUsed = true;
             gifReplayOptionUsed = true;
         }
@@ -1583,6 +1590,12 @@ int main(int argc, char **argv)
     for (const auto &[address, value] : overrideRegisters)
         gs.writeRegister(address, value);
 
+    if (batchStream && batchDrains)
+    {
+        std::cerr << "--batch-stream and --batch-drains are mutually exclusive\n";
+        return 2;
+    }
+
     if (backendStats)
     {
         gs.resetBackendCounters();
@@ -1657,7 +1670,23 @@ int main(int argc, char **argv)
 
         try
         {
+            if (batchDrains)
+                gs.beginRenderBatch();
+            struct SubmissionBatchScope
+            {
+                GS *gs = nullptr;
+                ~SubmissionBatchScope()
+                {
+                    if (gs)
+                        gs->endRenderSubmissionBatch();
+                }
+            } submissionBatchScope{batchDrains ? &gs : nullptr};
             gs.processGIFPacket(data, static_cast<uint32_t>(size));
+            if (batchDrains)
+            {
+                gs.endRenderSubmissionBatch();
+                submissionBatchScope.gs = nullptr;
+            }
         }
         catch (const std::exception &error)
         {

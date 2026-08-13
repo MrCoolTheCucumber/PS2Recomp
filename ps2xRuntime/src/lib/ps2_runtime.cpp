@@ -4556,7 +4556,9 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setDrainCallbacks([this]
                                    { m_gs.beginRenderBatch(); },
                                    [this]
-                                   { m_gs.endRenderBatch(); });
+                                   {
+                                       m_gs.endRenderSubmissionBatch();
+                                   });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVif1GifPathAvailableCallback(
         [this](bool directHl)

@@ -16116,6 +16116,126 @@ void register_ps2_gs_vulkan_tests()
                 "software fallback must not post Gouraud GPU work");
         });
 
+        tc.Run("GS Vulkan submission boundaries preserve resident draws", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x44524149u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            const std::vector<uint8_t> initial = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig serviceConfig =
+                makeRendererServiceConfig(preflight);
+            GsVulkanRasterBackendConfig backendConfig{};
+            backendConfig.minimumHybridSpritePixels = 0u;
+            t.IsTrue(
+                accelerated.configureVulkanRenderer(
+                    serviceConfig, backendConfig),
+                "the drain-boundary fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(
+                    accelerated.setRendererMode(GsRendererMode::Hybrid),
+                    "an unavailable host should skip the drain fixture cleanly");
+                return;
+            }
+            t.IsTrue(
+                accelerated.setRendererMode(GsRendererMode::Hybrid),
+                "a capable host should create the Hybrid drain fixture");
+            if (accelerated.rendererMode() != GsRendererMode::Hybrid)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            const auto drawSubmission = [](
+                GS &gs, uint32_t framebufferPage,
+                uint16_t x0, uint16_t y0,
+                uint16_t x1, uint16_t y1,
+                uint32_t rgba)
+            {
+                gs.beginRenderBatch();
+                configureFlatCt32Draws(gs, framebufferPage, 1u);
+                drawFlatCt32Sprite(gs, x0, y0, x1, y1, rgba);
+                gs.endRenderSubmissionBatch();
+            };
+            drawSubmission(
+                software, 5u,
+                2u * 16u, 3u * 16u,
+                10u * 16u, 11u * 16u, 0xA043210Fu);
+            drawSubmission(
+                accelerated, 5u,
+                2u * 16u, 3u * 16u,
+                10u * 16u, 11u * 16u, 0xA043210Fu);
+            drawSubmission(
+                software, 20u,
+                4u * 16u, 5u * 16u,
+                12u * 16u, 13u * 16u, 0xB0876543u);
+            drawSubmission(
+                accelerated, 20u,
+                4u * 16u, 5u * 16u,
+                12u * 16u, 13u * 16u, 0xB0876543u);
+
+            t.IsFalse(
+                softwareVram == initial,
+                "each producer boundary should finish collected software work");
+            t.IsTrue(
+                acceleratedVram == initial,
+                "producer boundaries must not publish GPU-newer pages to CPU VRAM");
+            GsBackendCounters counters = accelerated.backendCounters();
+            t.Equals(counters.commands, 2ull,
+                     "both producer groups should assemble one frontend draw");
+            t.Equals(counters.queueDepth, 2ull,
+                     "resident work should survive across producer groups");
+            t.Equals(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Explicit)],
+                0ull,
+                "a producer group is not an explicit observation boundary");
+            GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 2ull,
+                     "both draws should be accepted before observation");
+            t.Equals(backend.commandsCompleted, 0ull,
+                     "producer boundaries should leave compatible draws pending");
+            GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.queueSubmissions, 0ull,
+                     "producer boundaries must not submit compatible resident work");
+            t.Equals(service.pageDownloadOperationsCompleted, 0ull,
+                     "producer boundaries must not download GPU VRAM");
+
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(
+                acceleratedVram == softwareVram,
+                "the first real observer should recover exact software semantics");
+            counters = accelerated.backendCounters();
+            t.Equals(counters.queueDepth, 0ull,
+                     "the observer should drain the resident queue");
+            backend = accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.residentBatchesCompleted, 1ull,
+                     "draws from separate producer groups should share one resident batch");
+            t.Equals(backend.largestResidentBatch, 2ull,
+                     "the resident batch should span both producer groups");
+            service = accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.pageDownloadOperationsCompleted, 1ull,
+                     "the observer should publish both pages in one download operation");
+            t.Equals(service.pagesDownloaded, 2ull,
+                     "only the two GPU-newer pages should become canonical");
+            t.Equals(service.validationErrors, 0u,
+                     "producer-boundary residency should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "producer-boundary residency should emit no validation warnings");
+        });
+
         tc.Run("GS Vulkan hybrid scopes host transfers and readbacks to overlapping pages", [](TestCase &t)
         {
             GSMem::InitLookupTables();
