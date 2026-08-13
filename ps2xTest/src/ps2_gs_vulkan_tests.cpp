@@ -9631,6 +9631,81 @@ void register_ps2_gs_vulkan_tests()
                      "the conflicting write should upload inputs and execute one batch");
         });
 
+        tc.Run("Vulkan T8 decoded palette is retained until its inputs can change", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand first =
+                makeT8GouraudSourceOverDepthCt32TriangleCommand(30'203u);
+            std::vector<uint8_t> vram = makeVramPattern(0x50414C38u);
+            std::array<uint32_t, 256> palette{};
+            uint64_t paletteCalls = 0u;
+            uint16_t returnedTexa = 0u;
+            auto executor = std::make_unique<FakeCt32Executor>(
+                FakeCt32Executor::Behavior::Exact,
+                true, true, true, true, true, true);
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::move(executor),
+                    GsVulkanRasterBackendConfig{
+                        GsRendererMode::Hybrid, {}},
+                    vram, [](const GsDrawCommand &) {},
+                    [](const GsDrawCommand &) {}, nullptr, {},
+                    [&]() -> GsVulkanDecodedPalette
+                    {
+                        ++paletteCalls;
+                        return {
+                            palette,
+                            paletteCalls,
+                            returnedTexa,
+                            first.context().tex0.psm,
+                            first.context().tex0.csm,
+                            first.context().tex0.csa};
+                    });
+            t.IsNotNull(backend.get(),
+                        "the decoded-palette retention fixture should construct");
+            if (!backend)
+                return;
+
+            backend->submit(std::span<const GsDrawCommand>(&first, 1u));
+            backend->flush(GsFlushReason::Explicit);
+            backend->submit(std::span<const GsDrawCommand>(&first, 1u));
+            backend->flush(GsFlushReason::Explicit);
+            t.Equals(paletteCalls, 1ull,
+                     "unchanged indexed draws should reuse the owned decoded palette");
+
+            GsVramPageMask noWrites;
+            backend->prepareCpuVramAccess(
+                first.resources().clutPages,
+                noWrites,
+                GsFlushReason::ClutHazard);
+            backend->submit(std::span<const GsDrawCommand>(&first, 1u));
+            backend->flush(GsFlushReason::Explicit);
+            t.Equals(paletteCalls, 2ull,
+                     "a read-only CLUT load boundary must invalidate the decoded palette");
+
+            GsDrawGlobalState changedGlobal = first.globalState();
+            changedGlobal.texa.ta0 = 1u;
+            const GsDrawCommand changedTexa = buildGsDrawCommand(
+                30'204u,
+                first.primitive(),
+                first.context(),
+                std::span<const GSVertex>(first.vertices()),
+                changedGlobal);
+            returnedTexa = 1u;
+            backend->submit(
+                std::span<const GsDrawCommand>(&changedTexa, 1u));
+            backend->flush(GsFlushReason::Explicit);
+            t.Equals(paletteCalls, 3ull,
+                     "a TEXA identity change must request a fresh decoded palette");
+
+            backend->flush(GsFlushReason::Reset);
+            backend->submit(
+                std::span<const GsDrawCommand>(&changedTexa, 1u));
+            backend->flush(GsFlushReason::Explicit);
+            t.Equals(paletteCalls, 4ull,
+                     "reset must invalidate the retained decoded palette");
+        });
+
         tc.Run("Vulkan untextured triangles need no palette or texture dependency", [](TestCase &t)
         {
             GSMem::InitLookupTables();

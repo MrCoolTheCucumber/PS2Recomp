@@ -798,6 +798,9 @@ struct GsVulkanRasterBackend::Impl final
     FeedbackSnapshotCallback feedbackSnapshot;
     FeedbackSnapshotGenerationCallback feedbackSnapshotGeneration;
     DecodedPaletteCallback decodedPalette;
+    GsVulkanT8Palette cachedDecodedPaletteColors{};
+    GsVulkanDecodedPalette cachedDecodedPalette;
+    bool cachedDecodedPaletteValid = false;
     GsVulkanRasterBackendStatistics statistics;
     GsVramCoherency coherency;
     ResidentPipeline pendingResidentPipeline = ResidentPipeline::Ct32Sprite;
@@ -842,6 +845,7 @@ struct GsVulkanRasterBackend::Impl final
     const GsDrawCommand *classifiedFeedbackNearestCommand = nullptr;
     uint64_t classifiedFeedbackNearestSequence = 0u;
     GsDrawResources classifiedFeedbackNearestResources;
+    GsDrawResourceCache drawResourceCache;
     std::vector<GsDrawResources> submissionResourcesScratch;
     std::vector<uint8_t> submissionT8Scratch;
     std::vector<uint8_t> submissionFeedbackNearestScratch;
@@ -1532,17 +1536,16 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         command.primitive().type == GS_PRIM_TRIFAN;
     if (assembledTriangle && acceleratedMode)
     {
-        GsDrawResources feedbackNearestResources;
         const GsBackendDecision feedbackNearestDecision =
             classifyGsFeedbackNearestDepthCt32Triangle(
-                command, &feedbackNearestResources);
+                command,
+                &m_impl->classifiedFeedbackNearestResources,
+                &m_impl->drawResourceCache);
         if (feedbackNearestDecision.supported)
         {
             m_impl->classifiedFeedbackNearestCommand = &command;
             m_impl->classifiedFeedbackNearestSequence =
                 command.sequence();
-            m_impl->classifiedFeedbackNearestResources =
-                feedbackNearestResources;
             if (!m_impl->exactFeedbackNearestDepthCt32Triangle ||
                 (m_impl->config.mode == GsRendererMode::Verify &&
                  !m_impl->feedbackSnapshot))
@@ -1552,15 +1555,15 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             return feedbackNearestDecision;
         }
 
-        GsDrawResources t8Resources;
         const GsBackendDecision t8Decision =
             classifyGsT8GouraudDepthCt32Triangle(
-                command, &t8Resources);
+                command,
+                &m_impl->classifiedT8Resources,
+                &m_impl->drawResourceCache);
         if (t8Decision.supported)
         {
             m_impl->classifiedT8Command = &command;
             m_impl->classifiedT8Sequence = command.sequence();
-            m_impl->classifiedT8Resources = t8Resources;
             if (!m_impl->exactT8GouraudDepthCt32Triangle ||
                 (command.primitive().tme && !m_impl->decodedPalette))
             {
@@ -1770,9 +1773,18 @@ void GsVulkanRasterBackend::submit(
     std::vector<uint8_t> &commandIsFeedbackNearest =
         m_impl->submissionFeedbackNearestScratch;
     commandResources.clear();
-    commandResources.resize(commands.size());
-    commandIsT8.assign(commands.size(), 0u);
-    commandIsFeedbackNearest.assign(commands.size(), 0u);
+    commandIsT8.clear();
+    commandIsFeedbackNearest.clear();
+    const bool singleton = commands.size() == 1u;
+    GsDrawResources singletonResources;
+    bool singletonIsT8 = false;
+    bool singletonIsFeedbackNearest = false;
+    if (!singleton)
+    {
+        commandResources.resize(commands.size());
+        commandIsT8.assign(commands.size(), 0u);
+        commandIsFeedbackNearest.assign(commands.size(), 0u);
+    }
     for (size_t index = 0u; index < commands.size(); ++index)
     {
         const GsDrawCommand &command = commands[index];
@@ -1798,20 +1810,34 @@ void GsVulkanRasterBackend::submit(
             m_impl->classifiedFeedbackNearestSequence ==
                 command.sequence())
         {
-            commandResources[index] =
-                m_impl->classifiedFeedbackNearestResources;
-            commandIsFeedbackNearest[index] = 1u;
+            if (singleton)
+            {
+                singletonIsFeedbackNearest = true;
+            }
+            else
+            {
+                commandResources[index] =
+                    m_impl->classifiedFeedbackNearestResources;
+                commandIsFeedbackNearest[index] = 1u;
+            }
         }
         else if (m_impl->classifiedT8Command == &command &&
             m_impl->classifiedT8Sequence == command.sequence())
         {
-            commandResources[index] = m_impl->classifiedT8Resources;
-            commandIsT8[index] = 1u;
+            if (singleton)
+            {
+                singletonIsT8 = true;
+            }
+            else
+            {
+                commandResources[index] = m_impl->classifiedT8Resources;
+                commandIsT8[index] = 1u;
+            }
         }
+        else if (singleton)
+            command.describeResources(singletonResources);
         else
-        {
             commandResources[index] = command.resources();
-        }
     }
     m_impl->classifiedT8Command = nullptr;
     m_impl->classifiedFeedbackNearestCommand = nullptr;
@@ -1836,8 +1862,13 @@ void GsVulkanRasterBackend::submit(
         GsVulkanT8GouraudDepthCt32Triangle
             verifiedT8GouraudDepthTriangle{};
         GsVulkanDecodedPalette t8Palette;
-        const GsDrawResources &resources =
-            commandResources[commandIndex];
+        const GsDrawResources &resources = singleton
+            ? (singletonIsFeedbackNearest
+                   ? m_impl->classifiedFeedbackNearestResources
+               : singletonIsT8
+                   ? m_impl->classifiedT8Resources
+                   : singletonResources)
+            : commandResources[commandIndex];
         const bool isTriangle =
             command.primitive().type == GS_PRIM_TRIANGLE;
         const bool isAssembledTriangle =
@@ -1854,7 +1885,9 @@ void GsVulkanRasterBackend::submit(
         bool isGouraudDepthTriangle = false;
         bool isT8GouraudDepthTriangle = false;
         if (isAssembledTriangle &&
-            commandIsFeedbackNearest[commandIndex] != 0u)
+            (singleton
+                 ? singletonIsFeedbackNearest
+                 : commandIsFeedbackNearest[commandIndex] != 0u))
         {
             const GsBackendDecision prepared =
                 prepareGsVulkanFeedbackNearestDepthCt32Triangle(
@@ -1870,19 +1903,52 @@ void GsVulkanRasterBackend::submit(
             }
             isFeedbackNearestDepthTriangle = true;
         }
-        else if (isAssembledTriangle && commandIsT8[commandIndex] != 0u)
+        else if (isAssembledTriangle &&
+                 (singleton
+                      ? singletonIsT8
+                      : commandIsT8[commandIndex] != 0u))
         {
             const bool textured = command.primitive().tme;
             if (textured)
             {
-                t8Palette = m_impl->decodedPalette();
-                if (t8Palette.colors.size() != 256u)
+                const GSTex0Reg &tex0 = command.context().tex0;
+                const GSTexaReg &texa = command.globalState().texa;
+                const uint16_t packedTexa =
+                    static_cast<uint16_t>(texa.ta0) |
+                    (static_cast<uint16_t>(texa.aem) << 8u) |
+                    (static_cast<uint16_t>(texa.ta1) << 9u);
+                const bool samePaletteInputs =
+                    m_impl->cachedDecodedPaletteValid &&
+                    m_impl->cachedDecodedPalette.texa == packedTexa &&
+                    m_impl->cachedDecodedPalette.sourcePsm == tex0.psm &&
+                    m_impl->cachedDecodedPalette.csm == tex0.csm &&
+                    m_impl->cachedDecodedPalette.csa == tex0.csa;
+                if (!samePaletteInputs)
                 {
-                    m_impl->failRequest(
-                        "T8 Gouraud triangle palette capture for draw " +
-                            std::to_string(command.sequence()),
-                        "frontend did not provide an exact 256-entry decoded palette");
+                    const GsVulkanDecodedPalette decoded =
+                        m_impl->decodedPalette();
+                    if (decoded.colors.size() != 256u)
+                    {
+                        m_impl->failRequest(
+                            "T8 Gouraud triangle palette capture for draw " +
+                                std::to_string(command.sequence()),
+                            "frontend did not provide an exact 256-entry decoded palette");
+                    }
+                    std::copy(
+                        decoded.colors.begin(),
+                        decoded.colors.end(),
+                        m_impl->cachedDecodedPaletteColors.begin());
+                    m_impl->cachedDecodedPalette = {
+                        std::span<const uint32_t>(
+                            m_impl->cachedDecodedPaletteColors),
+                        decoded.generation,
+                        decoded.texa,
+                        decoded.sourcePsm,
+                        decoded.csm,
+                        decoded.csa};
+                    m_impl->cachedDecodedPaletteValid = true;
                 }
+                t8Palette = m_impl->cachedDecodedPalette;
             }
             const GsBackendDecision prepared =
                 prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
@@ -2611,6 +2677,11 @@ void GsVulkanRasterBackend::submit(
 void GsVulkanRasterBackend::flush(GsFlushReason reason)
 {
     ++m_impl->statistics.flushes;
+    if (reason == GsFlushReason::Reset ||
+        reason == GsFlushReason::SaveLoad)
+    {
+        m_impl->cachedDecodedPaletteValid = false;
+    }
     if (reason == GsFlushReason::Shutdown && !m_impl->shutDown)
     {
         GsVramPageMask allPages;
@@ -2653,6 +2724,11 @@ void GsVulkanRasterBackend::prepareCpuVramAccess(
 {
     if (!readPages.any() && !writePages.any())
         return;
+    // CLUT loads enter through this boundary as read-only CPU accesses, while
+    // transfers and restore paths can alter their source. The cached span is
+    // still owned by the frontend; force its identity/decode callback before
+    // the next indexed draw after any external VRAM observation.
+    m_impl->cachedDecodedPaletteValid = false;
     const bool conflicts =
         m_impl->pendingResidentWritePages.intersects(readPages) ||
         m_impl->pendingResidentReadPages.intersects(writePages) ||
@@ -2668,6 +2744,7 @@ void GsVulkanRasterBackend::prepareCpuVramAccess(
 void GsVulkanRasterBackend::noteCpuVramWrite(
     const GsVramPageMask &pages)
 {
+    m_impl->cachedDecodedPaletteValid = false;
     m_impl->coherency.noteCpuWrite(pages);
 }
 

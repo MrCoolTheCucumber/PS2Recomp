@@ -2739,6 +2739,18 @@ prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
     };
     for (size_t channel = 0u; channel < 4u; ++channel)
     {
+        const uint32_t shift = static_cast<uint32_t>(channel * 8u);
+        const uint32_t first =
+            (prepared.rgba[0] >> shift) & 0xFFu;
+        const uint32_t second =
+            (prepared.rgba[1] >> shift) & 0xFFu;
+        const uint32_t third =
+            (prepared.rgba[2] >> shift) & 0xFFu;
+        // A constant attribute has an exact zero plane gradient regardless
+        // of vertex sorting or winding. This is especially common for source
+        // alpha and avoids two host fma operations per constant channel.
+        if (first == second && second == third)
+            continue;
         const auto value = [&](size_t sortedIndex)
         {
             return static_cast<float>(
@@ -2759,23 +2771,29 @@ prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
             -(delta02 * gradientX01OverCross)));
     }
     {
-        const auto value = [&](size_t sortedIndex)
+        const bool constantFog =
+            vertices[0].fog == vertices[1].fog &&
+            vertices[1].fog == vertices[2].fog;
+        if (!constantFog)
         {
-            return static_cast<float>(
-                       vertices[sorted[sortedIndex].index].fog) *
-                   128.0f;
-        };
-        const float top = value(0u);
-        const float delta01 = value(1u) - top;
-        const float delta02 = value(2u) - top;
-        prepared.fogDxBits = std::bit_cast<uint32_t>(std::fma(
-            delta02,
-            gradientY01OverCross,
-            -(delta01 * gradientY02OverCross)));
-        prepared.fogDyBits = std::bit_cast<uint32_t>(std::fma(
-            delta01,
-            gradientX02OverCross,
-            -(delta02 * gradientX01OverCross)));
+            const auto value = [&](size_t sortedIndex)
+            {
+                return static_cast<float>(
+                           vertices[sorted[sortedIndex].index].fog) *
+                       128.0f;
+            };
+            const float top = value(0u);
+            const float delta01 = value(1u) - top;
+            const float delta02 = value(2u) - top;
+            prepared.fogDxBits = std::bit_cast<uint32_t>(std::fma(
+                delta02,
+                gradientY01OverCross,
+                -(delta01 * gradientY02OverCross)));
+            prepared.fogDyBits = std::bit_cast<uint32_t>(std::fma(
+                delta01,
+                gradientX02OverCross,
+                -(delta02 * gradientX01OverCross)));
+        }
     }
     {
         const auto [dx, dy] = gradient(
@@ -8499,6 +8517,7 @@ struct GsVulkanService::Impl final
             healthy = false;
             initialized = true;
             workerFinished = true;
+            available.store(false, std::memory_order_release);
             requestPending = false;
             requestPageUploadSource = {};
             requestPageDownloadDestination = {};
@@ -8683,6 +8702,9 @@ struct GsVulkanService::Impl final
             initialized = true;
             if (!initializedSuccessfully)
                 workerFinished = true;
+            available.store(
+                initializedSuccessfully,
+                std::memory_order_release);
         }
         stateChanged.notify_all();
         if (!initializedSuccessfully)
@@ -9467,6 +9489,7 @@ struct GsVulkanService::Impl final
                 capabilities = localCapabilities;
                 statistics = localStatistics;
                 healthy = context.healthy();
+                available.store(healthy, std::memory_order_release);
                 responseOutput = std::move(output);
                 responseResults = std::move(memoryResults);
                 responseError = std::move(operationError);
@@ -9494,6 +9517,7 @@ struct GsVulkanService::Impl final
             statistics = localStatistics;
             healthy = false;
             workerFinished = true;
+            available.store(false, std::memory_order_release);
         }
         stateChanged.notify_all();
     }
@@ -9686,6 +9710,7 @@ struct GsVulkanService::Impl final
         {
             std::lock_guard lock(stateMutex);
             stopping = true;
+            available.store(false, std::memory_order_release);
         }
         stateChanged.notify_all();
         if (worker.joinable())
@@ -9751,6 +9776,10 @@ struct GsVulkanService::Impl final
     bool requestInFlight = false;
     bool responseReady = false;
     bool responseSucceeded = false;
+    // Classification only needs a current fail-fast signal. Request posting
+    // still rechecks the mutex-protected lifecycle state, so publishing this
+    // mirror removes a per-draw mutex without weakening execution safety.
+    std::atomic<bool> available{false};
 };
 #else
 struct GsVulkanService::Impl final
@@ -11059,8 +11088,6 @@ bool GsVulkanService::healthy() const
 #if !PS2X_HAS_GS_VULKAN
     return false;
 #else
-    std::lock_guard lock(m_impl->stateMutex);
-    return m_impl->healthy && !m_impl->stopping &&
-           !m_impl->workerFinished;
+    return m_impl->available.load(std::memory_order_acquire);
 #endif
 }

@@ -622,6 +622,86 @@ void register_ps2_gs_tests()
                       "opaque CT32 draw with disabled depth should not claim a read dependency");
         });
 
+        tc.Run("GS draw resource cache retains only invariant texture views", [](TestCase &t)
+        {
+            GSContext context{};
+            context.frame = {400u, 2u, GS_PSM_CT32, 0u};
+            context.scissor = {0u, 63u, 0u, 63u};
+            context.zbuf = {300u, GS_PSM_Z24, false};
+            context.test = 0x50001u;
+            context.tex0.tbp0 = 32u;
+            context.tex0.tbw = 2u;
+            context.tex0.psm = GS_PSM_T8;
+            context.tex0.tw = 7u;
+            context.tex0.th = 7u;
+            context.tex0.cbp = 192u;
+            context.tex0.cpsm = GS_PSM_CT32;
+            context.tex1 = (2ull << 2u) | (4ull << 6u);
+            context.miptbp1 =
+                96ull | (2ull << 14u) |
+                (128ull << 20u) | (1ull << 34u);
+
+            GSPrimReg primitive{};
+            primitive.type = GS_PRIM_SPRITE;
+            primitive.tme = true;
+            primitive.abe = true;
+            const GsDrawGlobalState global{};
+            const auto makeCommand =
+                [&](uint64_t sequence,
+                    const GSContext &drawContext,
+                    uint16_t extent)
+            {
+                std::array<GSVertex, 2> vertices{};
+                vertices[1].x12_4 = extent;
+                vertices[1].y12_4 = extent;
+                return buildGsDrawCommand(
+                    sequence,
+                    primitive,
+                    drawContext,
+                    std::span<const GSVertex>(vertices),
+                    global);
+            };
+
+            GsDrawResourceCache cache;
+            const auto expectCachedExact =
+                [&](const GsDrawCommand &command, const char *message)
+            {
+                GsDrawResources cached;
+                cache.describe(command, cached);
+                t.IsTrue(cached == command.resources(), message);
+            };
+
+            expectCachedExact(
+                makeCommand(1u, context, 16u * 16u),
+                "a cold cached description should match the canonical path");
+            expectCachedExact(
+                makeCommand(2u, context, 48u * 16u),
+                "varying target bounds must rebuild exact framebuffer and depth pages");
+
+            GSContext changedTexture = context;
+            changedTexture.tex0.tbp0 += 64u;
+            expectCachedExact(
+                makeCommand(3u, changedTexture, 48u * 16u),
+                "a texture base change must invalidate cached texture pages");
+
+            GSContext changedWrap = changedTexture;
+            changedWrap.clamp = 1u | (1ull << 2u);
+            expectCachedExact(
+                makeCommand(4u, changedWrap, 48u * 16u),
+                "a wrap-mode change must invalidate cached texture bounds");
+
+            GSContext unknownTexture = changedWrap;
+            unknownTexture.tex0.psm = 0x3Fu;
+            expectCachedExact(
+                makeCommand(5u, unknownTexture, 48u * 16u),
+                "an unknown cached texture layout must remain fail-closed");
+
+            cache.reset();
+            expectCachedExact(
+                makeCommand(6u, context, 32u * 16u),
+                "reset should force a fresh canonical texture description");
+        });
+
         tc.Run("GS region texture resource masks contain post-wrap coordinates", [](TestCase &t)
         {
             GSMem::InitLookupTables();

@@ -309,14 +309,105 @@ namespace
             (mipRegister >> (shift + 14u)) & 0x3Fu);
     }
 
-    GsDrawResources describeResources(const GSPrimReg &primitive,
-                                      const GSContext &context,
-                                      const GsDrawGlobalState &globalState,
-                                      const GsDrawBounds &bounds) noexcept
+    void describeTextureResources(
+        const GSPrimReg &primitive,
+        const GSContext &context,
+        const GsDrawGlobalState &globalState,
+        GsVramPageMask &texturePages,
+        GsVramPageMask &mipPages,
+        GsVramPageMask &clutPages,
+        bool &unknownMemoryLayout) noexcept
     {
-        GsDrawResources resources{};
+        texturePages.clear();
+        mipPages.clear();
+        clutPages.clear();
+        unknownMemoryLayout = false;
+        if (!primitive.tme)
+            return;
+
+        const uint8_t lastLevel = maximumMipLevel(context);
+        for (uint8_t level = 0u; level <= lastLevel; ++level)
+        {
+            uint32_t base = 0u;
+            uint8_t width = 0u;
+            mipSurface(context, level, base, width);
+            const uint32_t textureWidth =
+                std::max(1u, (1u << context.tex0.tw) >> level);
+            const uint32_t textureHeight =
+                std::max(1u, (1u << context.tex0.th) >> level);
+            const uint64_t clamp = context.clamp;
+            const uint32_t maximumTextureX =
+                GSInternal::maximumWrappedTextureCoordinate(
+                    textureWidth,
+                    static_cast<uint8_t>(clamp & 0x3u),
+                    static_cast<uint16_t>(
+                        ((clamp >> 4u) & 0x3FFu) >> level),
+                    static_cast<uint16_t>(
+                        ((clamp >> 14u) & 0x3FFu) >> level));
+            const uint32_t maximumTextureY =
+                GSInternal::maximumWrappedTextureCoordinate(
+                    textureHeight,
+                    static_cast<uint8_t>((clamp >> 2u) & 0x3u),
+                    static_cast<uint16_t>(
+                        ((clamp >> 24u) & 0x3FFu) >> level),
+                    static_cast<uint16_t>(
+                        ((clamp >> 34u) & 0x3FFu) >> level));
+            GsVramPageMask &pages =
+                level == 0u ? texturePages : mipPages;
+            if (!addSurfaceRange(pages,
+                                 base,
+                                 width,
+                                 context.tex0.psm,
+                                 maximumTextureX,
+                                 maximumTextureY))
+            {
+                unknownMemoryLayout = true;
+            }
+        }
+
+        if (!isIndexedTexture(context.tex0.psm))
+            return;
+        const bool fourBit =
+            context.tex0.psm == GS_PSM_T4 ||
+            context.tex0.psm == GS_PSM_T4HL ||
+            context.tex0.psm == GS_PSM_T4HH;
+        const uint32_t entryCount = fourBit ? 16u : 256u;
+        const bool csm2 = context.tex0.csm != 0u;
+        const uint32_t clutWidth =
+            csm2 && globalState.texclut.cbw != 0u
+                ? globalState.texclut.cbw
+                : 1u;
+        const uint32_t maximumClutX = csm2
+            ? (static_cast<uint32_t>(globalState.texclut.cou) << 4u) + 15u
+            : 15u;
+        const uint32_t maximumClutY = csm2
+            ? static_cast<uint32_t>(globalState.texclut.cov) +
+                  ((entryCount - 1u) >> 4u)
+            : 15u;
+        if (!addSurfaceRange(clutPages,
+                             context.tex0.cbp,
+                             clutWidth,
+                             context.tex0.cpsm,
+                             maximumClutX,
+                             maximumClutY))
+        {
+            unknownMemoryLayout = true;
+        }
+    }
+
+    void describeResources(const GSPrimReg &primitive,
+                           const GSContext &context,
+                           const GsDrawGlobalState &globalState,
+                           const GsDrawBounds &bounds,
+                           GsDrawResources &resources,
+                           const GsVramPageMask *cachedTexturePages = nullptr,
+                           const GsVramPageMask *cachedMipPages = nullptr,
+                           const GsVramPageMask *cachedClutPages = nullptr,
+                           bool cachedUnknownTextureLayout = false) noexcept
+    {
+        resources = {};
         if (bounds.empty())
-            return resources;
+            return;
 
         const uint32_t maximumX = static_cast<uint32_t>(bounds.x1 - 1);
         const uint32_t maximumY = static_cast<uint32_t>(bounds.y1 - 1);
@@ -378,79 +469,24 @@ namespace
                 resources.depthWritePages = depthSurface;
         }
 
-        if (primitive.tme)
+        if (cachedTexturePages && cachedMipPages && cachedClutPages)
         {
-            const uint8_t lastLevel = maximumMipLevel(context);
-            for (uint8_t level = 0u; level <= lastLevel; ++level)
-            {
-                uint32_t base = 0u;
-                uint8_t width = 0u;
-                mipSurface(context, level, base, width);
-                const uint32_t textureWidth =
-                    std::max(1u, (1u << context.tex0.tw) >> level);
-                const uint32_t textureHeight =
-                    std::max(1u, (1u << context.tex0.th) >> level);
-                const uint64_t clamp = context.clamp;
-                const uint32_t maximumTextureX =
-                    GSInternal::maximumWrappedTextureCoordinate(
-                        textureWidth,
-                        static_cast<uint8_t>(clamp & 0x3u),
-                        static_cast<uint16_t>(
-                            ((clamp >> 4u) & 0x3FFu) >> level),
-                        static_cast<uint16_t>(
-                            ((clamp >> 14u) & 0x3FFu) >> level));
-                const uint32_t maximumTextureY =
-                    GSInternal::maximumWrappedTextureCoordinate(
-                        textureHeight,
-                        static_cast<uint8_t>((clamp >> 2u) & 0x3u),
-                        static_cast<uint16_t>(
-                            ((clamp >> 24u) & 0x3FFu) >> level),
-                        static_cast<uint16_t>(
-                            ((clamp >> 34u) & 0x3FFu) >> level));
-                GsVramPageMask &pages =
-                    level == 0u ? resources.texturePages : resources.mipPages;
-                if (!addSurfaceRange(pages,
-                                     base,
-                                     width,
-                                     context.tex0.psm,
-                                     maximumTextureX,
-                                     maximumTextureY))
-                {
-                    resources.unknownMemoryLayout = true;
-                }
-            }
-
-            if (isIndexedTexture(context.tex0.psm))
-            {
-                const bool fourBit =
-                    context.tex0.psm == GS_PSM_T4 ||
-                    context.tex0.psm == GS_PSM_T4HL ||
-                    context.tex0.psm == GS_PSM_T4HH;
-                const uint32_t entryCount = fourBit ? 16u : 256u;
-                const bool csm2 = context.tex0.csm != 0u;
-                const uint32_t clutWidth =
-                    csm2 && globalState.texclut.cbw != 0u
-                        ? globalState.texclut.cbw
-                        : 1u;
-                const uint32_t maximumClutX =
-                    csm2
-                        ? (static_cast<uint32_t>(globalState.texclut.cou) << 4u) + 15u
-                        : 15u;
-                const uint32_t maximumClutY =
-                    csm2
-                        ? static_cast<uint32_t>(globalState.texclut.cov) +
-                              ((entryCount - 1u) >> 4u)
-                        : 15u;
-                if (!addSurfaceRange(resources.clutPages,
-                                     context.tex0.cbp,
-                                     clutWidth,
-                                     context.tex0.cpsm,
-                                     maximumClutX,
-                                     maximumClutY))
-                {
-                    resources.unknownMemoryLayout = true;
-                }
-            }
+            resources.texturePages = *cachedTexturePages;
+            resources.mipPages = *cachedMipPages;
+            resources.clutPages = *cachedClutPages;
+            resources.unknownMemoryLayout |=
+                cachedUnknownTextureLayout;
+        }
+        else
+        {
+            bool unknownTextureLayout = false;
+            describeTextureResources(
+                primitive, context, globalState,
+                resources.texturePages,
+                resources.mipPages,
+                resources.clutPages,
+                unknownTextureLayout);
+            resources.unknownMemoryLayout |= unknownTextureLayout;
         }
 
         resources.readPages = resources.framebufferReadPages;
@@ -472,7 +508,42 @@ namespace
             resources.framebufferWritePages.intersects(resources.mipPages);
         resources.framebufferClutAlias =
             resources.framebufferWritePages.intersects(resources.clutPages);
-        return resources;
+    }
+
+    bool sameTextureResourceState(
+        const GsDrawCommand &first,
+        const GsDrawCommand &second) noexcept
+    {
+        const GSPrimReg &firstPrimitive = first.primitive();
+        const GSPrimReg &secondPrimitive = second.primitive();
+        if (firstPrimitive.tme != secondPrimitive.tme)
+            return false;
+        if (!firstPrimitive.tme)
+            return true;
+
+        const GSContext &firstContext = first.context();
+        const GSContext &secondContext = second.context();
+        const GSTex0Reg &firstTex0 = firstContext.tex0;
+        const GSTex0Reg &secondTex0 = secondContext.tex0;
+        const GSTexClutReg &firstTexClut =
+            first.globalState().texclut;
+        const GSTexClutReg &secondTexClut =
+            second.globalState().texclut;
+        return firstTex0.tbp0 == secondTex0.tbp0 &&
+               firstTex0.tbw == secondTex0.tbw &&
+               firstTex0.psm == secondTex0.psm &&
+               firstTex0.tw == secondTex0.tw &&
+               firstTex0.th == secondTex0.th &&
+               firstTex0.cbp == secondTex0.cbp &&
+               firstTex0.cpsm == secondTex0.cpsm &&
+               firstTex0.csm == secondTex0.csm &&
+               firstContext.tex1 == secondContext.tex1 &&
+               firstContext.miptbp1 == secondContext.miptbp1 &&
+               firstContext.miptbp2 == secondContext.miptbp2 &&
+               firstContext.clamp == secondContext.clamp &&
+               firstTexClut.cbw == secondTexClut.cbw &&
+               firstTexClut.cou == secondTexClut.cou &&
+               firstTexClut.cov == secondTexClut.cov;
     }
 
     class StableHash
@@ -807,8 +878,54 @@ uint64_t GsDrawCommand::stateSignature() const noexcept
 
 GsDrawResources GsDrawCommand::resources() const noexcept
 {
-    return describeResources(
-        m_primitive, m_context, m_globalState, m_bounds);
+    GsDrawResources result;
+    describeResources(result);
+    return result;
+}
+
+void GsDrawCommand::describeResources(
+    GsDrawResources &resources) const noexcept
+{
+    ::describeResources(
+        m_primitive, m_context, m_globalState, m_bounds, resources);
+}
+
+void GsDrawResourceCache::describe(
+    const GsDrawCommand &command,
+    GsDrawResources &resources) noexcept
+{
+    if (!m_textureState ||
+        !sameTextureResourceState(*m_textureState, command))
+    {
+        describeTextureResources(
+            command.primitive(),
+            command.context(),
+            command.globalState(),
+            m_texturePages,
+            m_mipPages,
+            m_clutPages,
+            m_unknownTextureLayout);
+        m_textureState = command;
+    }
+    ::describeResources(
+        command.primitive(),
+        command.context(),
+        command.globalState(),
+        command.bounds(),
+        resources,
+        &m_texturePages,
+        &m_mipPages,
+        &m_clutPages,
+        m_unknownTextureLayout);
+}
+
+void GsDrawResourceCache::reset() noexcept
+{
+    m_textureState.reset();
+    m_texturePages.clear();
+    m_mipPages.clear();
+    m_clutPages.clear();
+    m_unknownTextureLayout = false;
 }
 
 GsDrawCommand buildGsDrawCommand(
@@ -1280,7 +1397,8 @@ GsBackendDecision classifyGsFeedbackLinearDepthCt32Sprite(
 
 GsBackendDecision classifyGsFeedbackNearestDepthCt32Triangle(
     const GsDrawCommand &command,
-    GsDrawResources *supportedResources) noexcept
+    GsDrawResources *supportedResources,
+    GsDrawResourceCache *resourceCache) noexcept
 {
     const GSPrimReg &primitive = command.primitive();
     const GSContext &context = command.context();
@@ -1406,7 +1524,13 @@ GsBackendDecision classifyGsFeedbackNearestDepthCt32Triangle(
             GsFallbackReason::UnsupportedTextureCoordinates};
     }
 
-    GsDrawResources resources = command.resources();
+    GsDrawResources localResources;
+    GsDrawResources &resources =
+        supportedResources ? *supportedResources : localResources;
+    if (resourceCache)
+        resourceCache->describe(command, resources);
+    else
+        command.describeResources(resources);
     if (resources.unknownMemoryLayout)
         return {false, GsFallbackReason::UnknownMemoryLayout};
     const bool exactFeedbackSurface =
@@ -1424,8 +1548,6 @@ GsBackendDecision classifyGsFeedbackNearestDepthCt32Triangle(
     // so remove only the proven-dead write from resident ownership tracking.
     resources.depthWritePages.clear();
     resources.writePages = resources.framebufferWritePages;
-    if (supportedResources)
-        *supportedResources = resources;
     return {true, GsFallbackReason::Supported};
 }
 
@@ -1475,7 +1597,8 @@ GsBackendDecision classifyGsGouraudSourceOverDepthCt32Triangle(
 
 GsBackendDecision classifyGsT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
-    GsDrawResources *supportedResources) noexcept
+    GsDrawResources *supportedResources,
+    GsDrawResourceCache *resourceCache) noexcept
 {
     const GSPrimReg &primitive = command.primitive();
     const GSContext &context = command.context();
@@ -1613,13 +1736,17 @@ GsBackendDecision classifyGsT8GouraudDepthCt32Triangle(
         }
     }
 
-    const GsDrawResources resources = command.resources();
+    GsDrawResources localResources;
+    GsDrawResources &resources =
+        supportedResources ? *supportedResources : localResources;
+    if (resourceCache)
+        resourceCache->describe(command, resources);
+    else
+        command.describeResources(resources);
     if (resources.unknownMemoryLayout)
         return {false, GsFallbackReason::UnknownMemoryLayout};
     if (resources.aliasesAnotherView())
         return {false, GsFallbackReason::ResourceAlias};
-    if (supportedResources)
-        *supportedResources = resources;
     return {true, GsFallbackReason::Supported};
 }
 

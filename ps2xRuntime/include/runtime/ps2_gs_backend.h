@@ -80,6 +80,8 @@ struct GsDrawResources
                framebufferTextureAlias ||
                framebufferClutAlias;
     }
+
+    bool operator==(const GsDrawResources &) const noexcept = default;
 };
 
 struct GsDrawGlobalState
@@ -120,6 +122,7 @@ public:
     [[nodiscard]] const GsDrawBounds &bounds() const noexcept { return m_bounds; }
     [[nodiscard]] const GsDrawGlobalState &globalState() const noexcept { return m_globalState; }
     [[nodiscard]] GsDrawResources resources() const noexcept;
+    void describeResources(GsDrawResources &resources) const noexcept;
 
 private:
     GsDrawCommand(uint64_t sequence,
@@ -148,6 +151,25 @@ private:
     std::array<int32_t, 3> m_fixedY{};
     GsDrawBounds m_bounds{};
     GsDrawGlobalState m_globalState{};
+};
+
+// Resource bounds vary per primitive, while texture, mip, and CLUT surfaces
+// commonly remain identical for thousands of adjacent strip triangles. This
+// descriptor retains only those bounds-independent views and always rebuilds
+// framebuffer/depth masks from the current immutable command.
+class GsDrawResourceCache final
+{
+public:
+    void describe(const GsDrawCommand &command,
+                  GsDrawResources &resources) noexcept;
+    void reset() noexcept;
+
+private:
+    std::optional<GsDrawCommand> m_textureState;
+    GsVramPageMask m_texturePages;
+    GsVramPageMask m_mipPages;
+    GsVramPageMask m_clutPages;
+    bool m_unknownTextureLayout = false;
 };
 
 enum class GsRendererMode : uint8_t
@@ -510,7 +532,8 @@ classifyGsFeedbackLinearDepthCt32Sprite(
 [[nodiscard]] GsBackendDecision
 classifyGsFeedbackNearestDepthCt32Triangle(
     const GsDrawCommand &command,
-    GsDrawResources *supportedResources = nullptr) noexcept;
+    GsDrawResources *supportedResources = nullptr,
+    GsDrawResourceCache *resourceCache = nullptr) noexcept;
 
 // Phase 5's first triangle predicate deliberately admits only flat,
 // untextured CT32 triangles with no destination or depth dependency. It shares
@@ -538,7 +561,8 @@ classifyGsGouraudSourceOverDepthCt32Triangle(
 [[nodiscard]] GsBackendDecision
 classifyGsT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
-    GsDrawResources *supportedResources = nullptr) noexcept;
+    GsDrawResources *supportedResources = nullptr,
+    GsDrawResourceCache *resourceCache = nullptr) noexcept;
 
 [[nodiscard]] std::string_view gsFallbackReasonName(
     GsFallbackReason reason) noexcept;
