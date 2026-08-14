@@ -1028,8 +1028,19 @@ struct PS2DebugServer::Impl
         progress.AddMember("vu1_cycles", vu1Progress.cycles, allocator);
         result.AddMember("progress", progress, allocator);
 
-        const GsAsyncRuntimeStatistics gsAsync =
+        GsAsyncRuntimeStatistics gsAsync =
             runtime.gsAsyncStatistics();
+        std::optional<GsRendererStatusResult> gsRendererStatus;
+        if (gsAsync.enabled)
+        {
+            gsRendererStatus =
+                takeGsCommandResult<GsRendererStatusResult>(
+                    runtime.submitGsCommand(
+                        GsRendererStatusCommand{}));
+            // Keep owner counters on the same ordered boundary as the Vulkan
+            // service/backend snapshot above.
+            gsAsync = runtime.gsAsyncStatistics();
+        }
         Value gsAsyncValue(rapidjson::kObjectType);
         gsAsyncValue.AddMember("enabled", gsAsync.enabled, allocator);
         gsAsyncValue.AddMember(
@@ -1103,6 +1114,18 @@ struct PS2DebugServer::Impl
             "producer_blocked_ns",
             owner.producerBlockedNanoseconds, allocator);
         ownerValue.AddMember(
+            "producer_slot_wait_count",
+            owner.producerSlotWaitCount, allocator);
+        ownerValue.AddMember(
+            "producer_slot_wait_ns",
+            owner.producerSlotWaitNanoseconds, allocator);
+        ownerValue.AddMember(
+            "producer_payload_wait_count",
+            owner.producerPayloadWaitCount, allocator);
+        ownerValue.AddMember(
+            "producer_payload_wait_ns",
+            owner.producerPayloadWaitNanoseconds, allocator);
+        ownerValue.AddMember(
             "worker_active_ns",
             owner.workerActiveNanoseconds, allocator);
         ownerValue.AddMember(
@@ -1132,8 +1155,95 @@ struct PS2DebugServer::Impl
         ownerValue.AddMember("started", owner.started, allocator);
         ownerValue.AddMember("running", owner.running, allocator);
         ownerValue.AddMember("accepting", owner.accepting, allocator);
+        ownerValue.AddMember(
+            "drain_requested", owner.drainRequested, allocator);
+        ownerValue.AddMember(
+            "cancel_requested", owner.cancelRequested, allocator);
         ownerValue.AddMember("failed", owner.failed, allocator);
         gsAsyncValue.AddMember("owner", ownerValue, allocator);
+        if (gsRendererStatus)
+        {
+            const GsVulkanServiceStatistics &service =
+                gsRendererStatus->serviceStatistics;
+            Value serviceValue(rapidjson::kObjectType);
+            serviceValue.AddMember(
+                "round_trips_completed",
+                service.roundTripsCompleted, allocator);
+            serviceValue.AddMember(
+                "round_trips_failed",
+                service.roundTripsFailed, allocator);
+            serviceValue.AddMember(
+                "request_waits", service.requestWaits, allocator);
+            serviceValue.AddMember(
+                "request_wait_ns",
+                service.requestWaitNanoseconds, allocator);
+            serviceValue.AddMember(
+                "maximum_request_wait_ns",
+                service.maximumRequestWaitNanoseconds, allocator);
+            serviceValue.AddMember(
+                "queue_submissions",
+                service.queueSubmissions, allocator);
+            serviceValue.AddMember(
+                "shader_dispatches",
+                service.shaderDispatches, allocator);
+            serviceValue.AddMember(
+                "fence_waits", service.fenceWaits, allocator);
+            serviceValue.AddMember(
+                "fence_wait_ns",
+                service.fenceWaitNanoseconds, allocator);
+            serviceValue.AddMember(
+                "bytes_uploaded", service.bytesUploaded, allocator);
+            serviceValue.AddMember(
+                "bytes_downloaded", service.bytesDownloaded, allocator);
+            serviceValue.AddMember(
+                "page_uploads",
+                service.pageUploadOperationsCompleted, allocator);
+            serviceValue.AddMember(
+                "page_downloads",
+                service.pageDownloadOperationsCompleted, allocator);
+            gsAsyncValue.AddMember(
+                "vulkan_service", serviceValue, allocator);
+
+            const GsVulkanRasterBackendStatistics &backend =
+                gsRendererStatus->backendStatistics;
+            Value backendValue(rapidjson::kObjectType);
+            backendValue.AddMember(
+                "commands_attempted",
+                backend.commandsAttempted, allocator);
+            backendValue.AddMember(
+                "commands_completed",
+                backend.commandsCompleted, allocator);
+            backendValue.AddMember(
+                "gpu_requests_failed",
+                backend.gpuRequestsFailed, allocator);
+            backendValue.AddMember(
+                "committed_gpu_commands",
+                backend.committedGpuCommands, allocator);
+            backendValue.AddMember(
+                "resident_commands",
+                backend.residentCommands, allocator);
+            backendValue.AddMember(
+                "resident_batches_completed",
+                backend.residentBatchesCompleted, allocator);
+            backendValue.AddMember(
+                "largest_resident_batch",
+                static_cast<uint64_t>(backend.largestResidentBatch),
+                allocator);
+            backendValue.AddMember(
+                "resource_hazard_drains",
+                backend.resourceHazardDrains, allocator);
+            backendValue.AddMember(
+                "queue_backpressure_drains",
+                backend.queueBackpressureDrains, allocator);
+            backendValue.AddMember(
+                "pipeline_change_drains",
+                backend.pipelineChangeDrains, allocator);
+            backendValue.AddMember(
+                "cpu_access_preparations",
+                backend.cpuAccessPreparations, allocator);
+            gsAsyncValue.AddMember(
+                "vulkan_backend", backendValue, allocator);
+        }
         result.AddMember("gs_async", gsAsyncValue, allocator);
 
         const auto vuBackendStatus =

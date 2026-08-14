@@ -213,6 +213,12 @@ struct GsVulkanServiceStatistics
 {
     uint64_t roundTripsCompleted = 0u;
     uint64_t roundTripsFailed = 0u;
+    // Time the posting thread spends waiting for the Vulkan owner to publish
+    // a response. This separates service round-trip coordination from device
+    // fence time measured on the Vulkan thread below.
+    uint64_t requestWaits = 0u;
+    uint64_t requestWaitNanoseconds = 0u;
+    uint64_t maximumRequestWaitNanoseconds = 0u;
     uint64_t queueSubmissions = 0u;
     uint64_t shaderDispatches = 0u;
     uint64_t pipelineBarriers = 0u;

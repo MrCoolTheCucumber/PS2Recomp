@@ -17322,6 +17322,11 @@ void register_ps2_gs_vulkan_tests()
                      "all accepted requests should complete exactly once");
             t.Equals(statistics.roundTripsFailed, 0ull,
                      "caller-side size rejection should not submit failed GPU work");
+            t.Equals(statistics.requestWaits, 6ull,
+                     "every accepted request should publish one caller wait");
+            t.IsTrue(statistics.requestWaitNanoseconds > 0u &&
+                         statistics.maximumRequestWaitNanoseconds > 0u,
+                     "service coordination time should remain observable");
             t.Equals(statistics.queueSubmissions, 6ull,
                      "each request should use one bounded queue submission");
             t.Equals(statistics.shaderDispatches, 6ull,

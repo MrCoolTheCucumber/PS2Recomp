@@ -2,7 +2,8 @@
 
 Status: Milestone 1 contract, audited against PS2Recomp revision
 `588d9a68d69b8a87a8cd755618502278a10b4ec3` on 2026-08-13 and reconciled
-with the implemented GS owner through Milestone 4 on 2026-08-14.
+with the implemented GS owner through the Milestone 5 ownership hardening on
+2026-08-14.
 
 This document is the source inventory and publication contract for moving GS
 and VU1 work off the EE executor. It describes current behavior first and the
@@ -466,6 +467,90 @@ used for an observation or control operation. Queue/payload high-water,
 producer blocking, owner active/idle time, field-marker completion, and the EE
 journal/lead counters are exposed through `system.status.gs_async`. Those
 statistics are observational and do not participate in guest scheduling.
+
+## Milestone 5 hardened GS ownership
+
+### SPSC signaling and lifecycle closure
+
+Successful producer/consumer traffic no longer enters the executor lifecycle
+mutex. One serialized hot producer reserves payload bytes and publishes to the
+bounded SPSC ring. It then increments a counted atomic work signal; the owner
+acquires exactly one signal before popping exactly one command. After a pop
+and after payload release, the owner increments a monotonic atomic space epoch
+and wakes capacity waiters. A producer loads that epoch before rechecking the
+slot and byte bounds, so a release between the capacity check and
+`atomic::wait` cannot be lost.
+
+`m_submitMutex` remains the one-producer and lifecycle serialization point; it
+does not synchronize the producer with the consumer. Drain, cancel, and fatal
+closure follow this order:
+
+1. Publish `accepting=false` and increment the space epoch.
+2. Acquire and release the submit mutex, proving every producer that passed
+   admission either published its ring entry plus work signal or rejected
+   closure.
+3. Publish drain or cancel and add one control work signal.
+4. Join the owner. Drain consumes all command signals before the control
+   signal; cancel resolves the active and queued completions exceptionally.
+
+Fatal closure records its exception before waking a payload-capacity waiter.
+This makes failure, rather than newly available payload space, the first state
+observed by that producer. Slot and payload waits have separate counts and
+wall-time totals; the combined block metric remains for compatibility.
+
+### Exclusive frontend state and immutable subordinates
+
+`GS` no longer contains a recursive state mutex. Architectural frontend state
+is mutated and observed only by `GsCommandProcessor` on its selected inline or
+owner lane. Runtime snapshots, controls, replay capture/restore, FIFO reads,
+and renderer status are typed commands on that lane. The legacy completed
+display-frame handoff retains its independent snapshot mutex because the main
+thread copies already-latched pixels without accessing frontend state.
+
+The two non-command semantic contexts are explicit and do not overlap a
+runtime GS owner: lifecycle construction calls `GS::init`, and a standalone
+`VuUnit` fixture with no `PS2Memory` may submit PATH1 directly to its fixture
+`GS`. Normal runtime VU execution always has memory and enters the EE-owned GIF
+arbiter instead.
+
+Software raster work has this immutable handoff contract:
+
+- each queued raster command owns a copied `GsDrawCommand`, including
+  primitive/context/global state, vertices, fixed coordinates, and bounds;
+- decoded palettes are copied into the parallel state;
+- each raster worker owns a separate `GS` clone and mutates only that clone;
+- workers share the canonical VRAM allocation only through the existing
+  scanline/hazard partition and expose progress through atomics;
+- the primary owner waits for `workersRemaining == 0` before clearing command
+  or palette storage or advancing past the flush boundary.
+
+Worker zero is the GS owner itself. The default is five total raster
+participants, leaving host capacity for EE, Vulkan, and VU ownership while
+retaining almost all measured software throughput on the audited eight-core
+host. `PS2X_GS_RASTER_THREADS` remains an explicit 1..16 override because
+portable C++ does not expose physical-core topology reliably. Re-audit this
+budget after enabling a VU1 owner rather than silently growing the pool.
+
+Debug GIF packets, history entries, replay state, and VRAM observations are
+likewise copied into owning containers at an ordered owner boundary. No
+subordinate or observer retains a reference to mutable command/frontend state
+after the owner advances.
+
+### Vulkan interaction observation
+
+The Vulkan service remains the Vulkan-object owner. Its status now separates
+posting-thread request/response wait time from fence wait time measured on the
+Vulkan thread. Ordered renderer status also includes service submissions,
+transfers, and the backend's resident-command batches and drain reasons.
+`system.status` first submits the typed renderer-status command and then
+refreshes executor counters, so owner and Vulkan interval snapshots describe
+the same ordered boundary. On the audited RAC1 interval, 89-92% of request wait
+is device fence time. The remaining 55.7-57.2 microseconds per request is an
+upper bound that also includes necessary Vulkan-thread submission work, while
+resident requests already average 2,248 commands and reach the 6,144-command
+bound. Therefore the service topology is retained for M5. Sampled Vulkan CPU
+share alone would not have established this because the posting owner can be
+sleeping; reprofile fence and transfer behavior after integrated VU overlap.
 
 ## Audit maintenance
 

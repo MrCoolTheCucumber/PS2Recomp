@@ -390,6 +390,12 @@ namespace
                << statistics.roundTripsCompleted
                << ",\"round_trips_failed\":"
                << statistics.roundTripsFailed
+               << ",\"request_waits\":"
+               << statistics.requestWaits
+               << ",\"request_wait_nanoseconds\":"
+               << statistics.requestWaitNanoseconds
+               << ",\"maximum_request_wait_nanoseconds\":"
+               << statistics.maximumRequestWaitNanoseconds
                << ",\"queue_submissions\":"
                << statistics.queueSubmissions
                << ",\"shader_dispatches\":"
@@ -2001,6 +2007,14 @@ int main(int argc, char **argv)
             << ownerStatistics.producerBlockCount
             << ",\"producer_blocked_nanoseconds\":"
             << ownerStatistics.producerBlockedNanoseconds
+            << ",\"producer_slot_wait_count\":"
+            << ownerStatistics.producerSlotWaitCount
+            << ",\"producer_slot_wait_nanoseconds\":"
+            << ownerStatistics.producerSlotWaitNanoseconds
+            << ",\"producer_payload_wait_count\":"
+            << ownerStatistics.producerPayloadWaitCount
+            << ",\"producer_payload_wait_nanoseconds\":"
+            << ownerStatistics.producerPayloadWaitNanoseconds
             << ",\"worker_active_nanoseconds\":"
             << ownerStatistics.workerActiveNanoseconds
             << ",\"worker_idle_nanoseconds\":"

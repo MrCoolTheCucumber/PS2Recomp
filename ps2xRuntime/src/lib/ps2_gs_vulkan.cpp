@@ -9676,6 +9676,8 @@ struct GsVulkanService::Impl final
         responseSucceeded = false;
         responseReady = false;
         requestPending = true;
+        const auto requestWaitStart =
+            std::chrono::steady_clock::now();
         stateLock.unlock();
         stateChanged.notify_all();
         stateLock.lock();
@@ -9683,6 +9685,25 @@ struct GsVulkanService::Impl final
         {
             return responseReady || workerFinished;
         });
+        const uint64_t requestWaitNanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - requestWaitStart)
+                    .count());
+        requestWaits.fetch_add(1u, std::memory_order_relaxed);
+        requestWaitTotalNanoseconds.fetch_add(
+            requestWaitNanoseconds, std::memory_order_relaxed);
+        uint64_t maximumWait =
+            maximumRequestWaitNanoseconds.load(
+                std::memory_order_relaxed);
+        while (maximumWait < requestWaitNanoseconds &&
+               !maximumRequestWaitNanoseconds.compare_exchange_weak(
+                   maximumWait,
+                   requestWaitNanoseconds,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed))
+        {
+        }
 
         if (!responseReady)
         {
@@ -9787,6 +9808,9 @@ struct GsVulkanService::Impl final
     bool requestInFlight = false;
     bool responseReady = false;
     bool responseSucceeded = false;
+    std::atomic<uint64_t> requestWaits{0u};
+    std::atomic<uint64_t> requestWaitTotalNanoseconds{0u};
+    std::atomic<uint64_t> maximumRequestWaitNanoseconds{0u};
     // Classification only needs a current fail-fast signal. Request posting
     // still rechecks the mutex-protected lifecycle state, so publishing this
     // mirror removes a per-draw mutex without weakening execution safety.
@@ -11090,7 +11114,16 @@ GsVulkanServiceStatistics GsVulkanService::statistics() const
     return {};
 #else
     std::lock_guard lock(m_impl->stateMutex);
-    return m_impl->statistics;
+    GsVulkanServiceStatistics statistics = m_impl->statistics;
+    statistics.requestWaits = m_impl->requestWaits.load(
+        std::memory_order_relaxed);
+    statistics.requestWaitNanoseconds =
+        m_impl->requestWaitTotalNanoseconds.load(
+            std::memory_order_relaxed);
+    statistics.maximumRequestWaitNanoseconds =
+        m_impl->maximumRequestWaitNanoseconds.load(
+            std::memory_order_relaxed);
+    return statistics;
 #endif
 }
 
