@@ -5696,8 +5696,18 @@ void PS2Runtime::serviceVif1DmaAtEvent(
     m_vif1DmaEventToken = {
         ps2x::timing::EeEventSource::DmacVif1,
         0u};
-    const Vif1DmaAdvanceResult advance =
-        m_memory.advanceVif1Dma();
+    Vif1DmaAdvanceResult advance{};
+    beginVu1SynchronousCommandBatch();
+    try
+    {
+        advance = m_memory.advanceVif1Dma();
+    }
+    catch (...)
+    {
+        finishVu1SynchronousCommandBatch(false);
+        throw;
+    }
+    finishVu1SynchronousCommandBatch(true);
     if (!advance.active || advance.completed)
         return;
 
@@ -6319,24 +6329,50 @@ PS2Runtime::Vu1SynchronousCommandBarrier
 PS2Runtime::beginVu1SynchronousCommandBarrier()
 {
     Vu1SynchronousCommandBarrier barrier{};
+    if (m_vu1SynchronousCommandBatchActive &&
+        m_batchedVu1SynchronousCommandBarrier.resolution !=
+            Vu1SpeculationResolution::None)
+    {
+        return barrier;
+    }
+    const auto prepareForBatch =
+        [this](Vu1SynchronousCommandBarrier prepared)
+        {
+            if (!m_vu1SynchronousCommandBatchActive ||
+                prepared.resolution ==
+                    Vu1SpeculationResolution::None)
+            {
+                return prepared;
+            }
+            if (m_batchedVu1SynchronousCommandBarrier.resolution !=
+                    Vu1SpeculationResolution::None ||
+                m_batchedVu1SynchronousCommandBarrier.requeue)
+            {
+                throw std::logic_error(
+                    "VU1 synchronous command batch already owns a hazard");
+            }
+            m_batchedVu1SynchronousCommandBarrier = prepared;
+            prepared.requeue.reset();
+            return prepared;
+        };
     if (m_vu1ExecutionMode !=
             Vu1ExecutionMode::ThreadedAsync ||
         !m_threadedVu1Executor)
     {
-        return barrier;
+        return prepareForBatch(std::move(barrier));
     }
 
     if (m_vu1SpeculationPublicationState ==
         Vu1SpeculationPublicationState::None)
     {
-        return barrier;
+        return prepareForBatch(std::move(barrier));
     }
     if (m_vu1SpeculationPublicationState ==
         Vu1SpeculationPublicationState::Published)
     {
         barrier.resolution =
             Vu1SpeculationResolution::Commit;
-        return barrier;
+        return prepareForBatch(std::move(barrier));
     }
     if (!m_pendingVu1Slice)
     {
@@ -6354,9 +6390,18 @@ PS2Runtime::beginVu1SynchronousCommandBarrier()
     barrier.requeue = pending.plan;
 
     const auto waitAt = std::chrono::steady_clock::now();
-    const Vu1CommandResult discarded =
-        m_threadedVu1Executor->wait(
+    Vu1CommandResult discarded{};
+    try
+    {
+        discarded = m_threadedVu1Executor->wait(
             std::move(pending.submission));
+    }
+    catch (...)
+    {
+        m_vu1SpeculationPublicationState =
+            Vu1SpeculationPublicationState::None;
+        throw;
+    }
     const uint64_t waitNanoseconds =
         static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -6371,15 +6416,27 @@ PS2Runtime::beginVu1SynchronousCommandBarrier()
         !std::holds_alternative<Vu1SliceResult>(
             discarded.payload))
     {
+        m_vu1SpeculationPublicationState =
+            Vu1SpeculationPublicationState::None;
         throw std::logic_error(
             "VU1 hazard discarded a non-slice result");
     }
-    return barrier;
+    return prepareForBatch(std::move(barrier));
 }
 
 void PS2Runtime::finishVu1SynchronousCommandBarrier(
     const Vu1SynchronousCommandBarrier &barrier)
 {
+    if (m_vu1SynchronousCommandBatchActive)
+    {
+        if (barrier.resolution !=
+            Vu1SpeculationResolution::None)
+        {
+            m_vu1SpeculationPublicationState =
+                Vu1SpeculationPublicationState::None;
+        }
+        return;
+    }
     if (barrier.resolution !=
         Vu1SpeculationResolution::None)
     {
@@ -6407,6 +6464,54 @@ void PS2Runtime::finishVu1SynchronousCommandBarrier(
         plan, Vu1SpeculationResolution::None);
     m_vu1AsyncHazardRequeueCount.fetch_add(
         1u, std::memory_order_relaxed);
+}
+
+void PS2Runtime::beginVu1SynchronousCommandBatch()
+{
+    if (m_vu1ExecutionMode !=
+        Vu1ExecutionMode::ThreadedAsync)
+    {
+        return;
+    }
+    if (m_vu1SynchronousCommandBatchActive ||
+        m_batchedVu1SynchronousCommandBarrier.resolution !=
+            Vu1SpeculationResolution::None ||
+        m_batchedVu1SynchronousCommandBarrier.requeue)
+    {
+        throw std::logic_error(
+            "nested VU1 synchronous command batch");
+    }
+    m_vu1SynchronousCommandBatchActive = true;
+}
+
+void PS2Runtime::finishVu1SynchronousCommandBatch(bool requeue)
+{
+    if (m_vu1ExecutionMode !=
+        Vu1ExecutionMode::ThreadedAsync)
+    {
+        return;
+    }
+    if (!m_vu1SynchronousCommandBatchActive)
+    {
+        throw std::logic_error(
+            "VU1 synchronous command batch is not active");
+    }
+
+    m_vu1SynchronousCommandBatchActive = false;
+    Vu1SynchronousCommandBarrier barrier =
+        std::move(m_batchedVu1SynchronousCommandBarrier);
+    m_batchedVu1SynchronousCommandBarrier = {};
+    if (!requeue)
+    {
+        if (barrier.resolution !=
+            Vu1SpeculationResolution::None)
+        {
+            m_vu1SpeculationPublicationState =
+                Vu1SpeculationPublicationState::None;
+        }
+        return;
+    }
+    finishVu1SynchronousCommandBarrier(barrier);
 }
 
 void PS2Runtime::enqueueVu1SpeculativeSlice(

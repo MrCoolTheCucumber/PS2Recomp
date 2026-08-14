@@ -2468,6 +2468,8 @@ private:
     beginVu1SynchronousCommandBarrier();
     void finishVu1SynchronousCommandBarrier(
         const Vu1SynchronousCommandBarrier &barrier);
+    void beginVu1SynchronousCommandBatch();
+    void finishVu1SynchronousCommandBatch(bool requeue);
     void enqueueVu1SpeculativeSlice(
         const Vu1PendingSlicePlan &plan,
         Vu1SpeculationResolution previousResolution);
@@ -2754,6 +2756,9 @@ private:
     Vu1SpeculationPublicationState
         m_vu1SpeculationPublicationState =
             Vu1SpeculationPublicationState::None;
+    Vu1SynchronousCommandBarrier
+        m_batchedVu1SynchronousCommandBarrier{};
+    bool m_vu1SynchronousCommandBatchActive = false;
     std::atomic<bool> m_vu1AsyncPendingSlice{false};
     std::atomic<uint64_t> m_vu1AsyncSlicesSubmitted{0u};
     std::atomic<uint64_t> m_vu1AsyncSlicesPublished{0u};

@@ -2329,6 +2329,303 @@ void register_ps2_vu1_command_stream_tests()
                      "the post-event snapshot should commit the published result");
         });
 
+        tc.Run("runtime coalesces one VIF1 parser batch into one speculation hazard", [](TestCase &t)
+        {
+            struct RunResult
+            {
+                uint64_t architecturalHash = 0u;
+                Vu1AsyncRuntimeStatistics afterPayload{};
+                Vu1AsyncRuntimeStatistics afterEmptyService{};
+                Vu1AsyncRuntimeStatistics afterPublication{};
+            };
+
+            const auto run =
+                [&](Vu1ExecutionMode mode) -> RunResult
+                {
+                    PS2RuntimeConfiguration configuration =
+                        defaultPs2RuntimeConfiguration();
+                    configuration.vu1ExecutionMode = mode;
+                    configuration.vu1CommandQueueCapacity = 1u;
+                    configuration.vu1CommandPayloadCapacityBytes =
+                        1024u * 1024u;
+                    configuration.captureVu1ArchitecturalStateHashes =
+                        true;
+                    PS2Runtime runtime(configuration);
+                    if (!runtime.memory().initialize() ||
+                        !runtime.syncCoreSubsystems())
+                    {
+                        t.Fail("VIF1 hazard-batch runtime should initialize");
+                        return {};
+                    }
+
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 0u,
+                        makeVuIaddiu(1u, 0u, 7),
+                        kVuUpperNop);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 8u, 0u, kVuUpperEnd);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 16u, 0u, kVuUpperNop);
+                    const uint32_t mscal =
+                        makeVifCommand(0x14u, 0u, 0u);
+                    runtime.memory().processVIF1Data(
+                        reinterpret_cast<const uint8_t *>(&mscal),
+                        sizeof(mscal));
+
+                    if (mode == Vu1ExecutionMode::ThreadedAsync &&
+                        !waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return statistics.pendingSlice &&
+                                       statistics.owner.completedTickets ==
+                                           statistics.owner.submittedTickets;
+                            }))
+                    {
+                        t.Fail("the initial private slice should finish early");
+                        return {};
+                    }
+
+                    constexpr uint32_t kVif1 = 0x10009000u;
+                    constexpr uint32_t kSource = 0x00030000u;
+                    const std::array<uint32_t, 4u> vifCommands = {
+                        makeVifCommand(0x01u, 0u, 0x0101u),
+                        makeVifCommand(0x02u, 0u, 3u),
+                        makeVifCommand(0x05u, 0u, 1u),
+                        makeVifCommand(0x01u, 0u, 0x0202u),
+                    };
+                    std::memcpy(
+                        runtime.memory().getRDRAM() + kSource,
+                        vifCommands.data(), sizeof(vifCommands));
+                    if (!runtime.memory().writeIORegister(
+                            kVif1 + 0x10u, kSource) ||
+                        !runtime.memory().writeIORegister(
+                            kVif1 + 0x20u, 1u) ||
+                        !runtime.memory().writeIORegister(
+                            kVif1, 0x100u))
+                    {
+                        t.Fail("the VIF1 hazard-batch DMA should start");
+                        return {};
+                    }
+
+                    R5900Context &context = runtime.cpu();
+                    context.advanceEeCycleTicks(32u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    const Vu1AsyncRuntimeStatistics afterPayload =
+                        runtime.vu1AsyncStatistics();
+
+                    if (mode == Vu1ExecutionMode::ThreadedAsync &&
+                        !waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return statistics.pendingSlice &&
+                                       statistics.owner.completedTickets ==
+                                           statistics.owner.submittedTickets;
+                            }))
+                    {
+                        t.Fail("the once-requeued slice should finish early");
+                        return {};
+                    }
+
+                    // The payload schedules a finalization-only VIF1 service
+                    // two EE cycles later. It must not disturb speculation.
+                    context.advanceEeCycleTicks(16u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    const Vu1AsyncRuntimeStatistics afterEmptyService =
+                        runtime.vu1AsyncStatistics();
+
+                    context.advanceEeCycleTicks(80u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    const Vu1AsyncRuntimeStatistics afterPublication =
+                        runtime.vu1AsyncStatistics();
+                    const std::shared_ptr<const Vu1Snapshot> snapshot =
+                        runtime.snapshotVu1Owner();
+                    return RunResult{
+                        .architecturalHash =
+                            vu1ArchitecturalStateHash(
+                                snapshot->state,
+                                snapshot->microMemory,
+                                snapshot->dataMemory,
+                                snapshot->vif,
+                                snapshot->codeGeneration),
+                        .afterPayload = afterPayload,
+                        .afterEmptyService = afterEmptyService,
+                        .afterPublication = afterPublication,
+                    };
+                };
+
+            const RunResult reference =
+                run(Vu1ExecutionMode::Inline);
+            const RunResult asynchronous =
+                run(Vu1ExecutionMode::ThreadedAsync);
+            t.Equals(
+                asynchronous.architecturalHash,
+                reference.architecturalHash,
+                "batched VIF1 hazards should retain inline architecture");
+            t.Equals(
+                asynchronous.afterPayload.hazardBarrierCount, 1ull,
+                "one parser batch should resolve speculation once");
+            t.Equals(
+                asynchronous.afterPayload.hazardRequeueCount, 1ull,
+                "one parser batch should requeue speculation once");
+            t.Equals(
+                asynchronous.afterPayload.slicesSubmitted, 2ull,
+                "four owner commands should produce only one recomputed slice");
+            t.Equals(
+                asynchronous.afterPayload.owner.speculation.rolledBackSlices,
+                1ull,
+                "the parser batch should roll back one private checkpoint");
+            t.Equals(
+                asynchronous.afterEmptyService.hazardBarrierCount,
+                asynchronous.afterPayload.hazardBarrierCount,
+                "a VIF1 service without owner commands must not add a hazard");
+            t.Equals(
+                asynchronous.afterEmptyService.slicesSubmitted,
+                asynchronous.afterPayload.slicesSubmitted,
+                "a finalization-only VIF1 service must keep the pending slice");
+            t.Equals(
+                asynchronous.afterPublication.slicesPublished, 1ull,
+                "the recomputed startup slice should publish exactly once");
+            t.Equals(
+                asynchronous.afterPublication.budgetFallbackCount, 0ull,
+                "the on-time batch should not require budget fallback");
+        });
+
+        tc.Run("runtime abandons a VIF1 batch requeue after owner failure", [](TestCase &t)
+        {
+            std::atomic<bool> injectFailure{false};
+            std::atomic<uint32_t> stateUpdates{0u};
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedAsync;
+            configuration.vu1CommandQueueCapacity = 1u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.vu1BeforeProcess =
+                [&](const Vu1Command &command, uint64_t)
+                {
+                    if (!injectFailure.load(
+                            std::memory_order_acquire) ||
+                        command.type !=
+                            Vu1CommandType::VifStateUpdate)
+                    {
+                        return;
+                    }
+                    if (stateUpdates.fetch_add(
+                            1u, std::memory_order_relaxed) == 1u)
+                    {
+                        throw std::runtime_error(
+                            "injected VIF1 batch owner failure");
+                    }
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "failure-batch runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "failure-batch runtime subsystems should bind");
+
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(1u, 0u, 7),
+                kVuUpperNop);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 16u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1AsyncStatistics();
+                        return statistics.pendingSlice &&
+                               statistics.owner.completedTickets ==
+                                   statistics.owner.submittedTickets;
+                    }),
+                "the failure fixture should begin with ready private work");
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kSource = 0x00030000u;
+            const std::array<uint32_t, 4u> vifCommands = {
+                makeVifCommand(0x01u, 0u, 0x0101u),
+                makeVifCommand(0x02u, 0u, 3u),
+                makeVifCommand(0x05u, 0u, 1u),
+                makeVifCommand(0x01u, 0u, 0x0202u),
+            };
+            std::memcpy(
+                runtime.memory().getRDRAM() + kSource,
+                vifCommands.data(), sizeof(vifCommands));
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x10u, kSource) &&
+                         runtime.memory().writeIORegister(
+                             kVif1 + 0x20u, 1u) &&
+                         runtime.memory().writeIORegister(
+                             kVif1, 0x100u),
+                     "the failure-batch DMA should start");
+
+            injectFailure.store(true, std::memory_order_release);
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(32u);
+            const std::string serviceError =
+                captureException(
+                    [&]()
+                    {
+                        runtime.serviceEeEventsAtBlockBoundary(
+                            runtime.memory().getRDRAM(), &context);
+                    });
+            t.IsTrue(
+                serviceError.find(
+                    "injected VIF1 batch owner failure") !=
+                    std::string::npos,
+                "the parser service should surface the owner failure");
+
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        return runtime.vu1AsyncStatistics().owner.failed;
+                    }),
+                "the owner transport should publish fatal closure");
+            const Vu1AsyncRuntimeStatistics statistics =
+                runtime.vu1AsyncStatistics();
+            t.IsFalse(statistics.pendingSlice,
+                      "failed batch cleanup must retain no private slice");
+            t.Equals(statistics.hazardBarrierCount, 1ull,
+                     "the failed parser batch should resolve one hazard");
+            t.Equals(statistics.hazardRequeueCount, 0ull,
+                     "the failed parser batch must not requeue work");
+            t.IsTrue(statistics.owner.failed,
+                     "the owner transport should retain fatal closure");
+
+            const std::string laterError =
+                captureException(
+                    [&]()
+                    {
+                        (void)runtime.snapshotVu1Owner();
+                    });
+            t.IsTrue(
+                laterError.find(
+                    "injected VIF1 batch owner failure") !=
+                    std::string::npos,
+                "later work should observe the retained owner failure");
+            t.IsTrue(
+                laterError.find("synchronous command batch") ==
+                    std::string::npos,
+                "failed cleanup must not leak an active batch state");
+        });
+
         tc.Run("runtime waits for a late VU1 result without moving guest time", [](TestCase &t)
         {
             std::mutex gateMutex;
