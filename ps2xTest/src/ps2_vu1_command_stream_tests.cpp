@@ -2497,6 +2497,196 @@ void register_ps2_vu1_command_stream_tests()
                 "the on-time batch should not require budget fallback");
         });
 
+        tc.Run("runtime resolves a new speculation epoch inside one VIF1 parser batch", [](TestCase &t)
+        {
+            struct RunResult
+            {
+                std::string serviceError;
+                uint64_t architecturalHash = 0u;
+                uint32_t vifMode = 0u;
+                Vu1AsyncRuntimeStatistics afterFirstPublication{};
+                Vu1AsyncRuntimeStatistics afterPayload{};
+                Vu1AsyncRuntimeStatistics afterSecondPublication{};
+            };
+
+            const auto run =
+                [&](Vu1ExecutionMode mode) -> RunResult
+                {
+                    PS2RuntimeConfiguration configuration =
+                        defaultPs2RuntimeConfiguration();
+                    configuration.vu1ExecutionMode = mode;
+                    configuration.vu1CommandQueueCapacity = 1u;
+                    configuration.vu1CommandPayloadCapacityBytes =
+                        1024u * 1024u;
+                    configuration.captureVu1ArchitecturalStateHashes =
+                        true;
+                    PS2Runtime runtime(configuration);
+                    if (!runtime.memory().initialize() ||
+                        !runtime.syncCoreSubsystems())
+                    {
+                        t.Fail("multi-epoch VIF1 batch runtime should initialize");
+                        return {};
+                    }
+
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 0u,
+                        makeVuIaddiu(1u, 1u, 1),
+                        kVuUpperNop);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 8u, 0u, kVuUpperEnd);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 16u, 0u, kVuUpperNop);
+                    const uint32_t initialMscal =
+                        makeVifCommand(0x14u, 0u, 0u);
+                    runtime.memory().processVIF1Data(
+                        reinterpret_cast<const uint8_t *>(
+                            &initialMscal),
+                        sizeof(initialMscal));
+
+                    if (mode == Vu1ExecutionMode::ThreadedAsync &&
+                        !waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return statistics.pendingSlice &&
+                                       statistics.owner.completedTickets ==
+                                           statistics.owner.submittedTickets;
+                            }))
+                    {
+                        t.Fail("the first startup slice should finish early");
+                        return {};
+                    }
+
+                    R5900Context &context = runtime.cpu();
+                    context.advanceEeCycleTicks(128u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    const Vu1AsyncRuntimeStatistics afterFirstPublication =
+                        runtime.vu1AsyncStatistics();
+
+                    constexpr uint32_t kVif1 = 0x10009000u;
+                    constexpr uint32_t kSource = 0x00031000u;
+                    const std::array<uint32_t, 4u> vifCommands = {
+                        makeVifCommand(0x14u, 0u, 0u),
+                        makeVifCommand(0x05u, 0u, 3u),
+                        makeVifCommand(0x00u, 0u, 0u),
+                        makeVifCommand(0x00u, 0u, 0u),
+                    };
+                    std::memcpy(
+                        runtime.memory().getRDRAM() + kSource,
+                        vifCommands.data(), sizeof(vifCommands));
+                    if (!runtime.memory().writeIORegister(
+                            kVif1 + 0x10u, kSource) ||
+                        !runtime.memory().writeIORegister(
+                            kVif1 + 0x20u, 1u) ||
+                        !runtime.memory().writeIORegister(
+                            kVif1, 0x100u))
+                    {
+                        t.Fail("the multi-epoch VIF1 DMA should start");
+                        return {};
+                    }
+
+                    context.advanceEeCycleTicks(32u);
+                    const std::string serviceError =
+                        captureException(
+                            [&]()
+                            {
+                                runtime.serviceEeEventsAtBlockBoundary(
+                                    runtime.memory().getRDRAM(), &context);
+                            });
+                    if (!serviceError.empty())
+                    {
+                        return RunResult{
+                            .serviceError = serviceError,
+                            .afterFirstPublication =
+                                afterFirstPublication,
+                        };
+                    }
+                    const Vu1AsyncRuntimeStatistics afterPayload =
+                        runtime.vu1AsyncStatistics();
+
+                    if (mode == Vu1ExecutionMode::ThreadedAsync &&
+                        !waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return statistics.pendingSlice &&
+                                       statistics.owner.completedTickets ==
+                                           statistics.owner.submittedTickets;
+                            }))
+                    {
+                        t.Fail("the replacement startup slice should finish early");
+                        return {};
+                    }
+
+                    context.advanceEeCycleTicks(128u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    const Vu1AsyncRuntimeStatistics afterSecondPublication =
+                        runtime.vu1AsyncStatistics();
+                    const std::shared_ptr<const Vu1Snapshot> snapshot =
+                        runtime.snapshotVu1Owner();
+                    return RunResult{
+                        .architecturalHash =
+                            vu1ArchitecturalStateHash(
+                                snapshot->state,
+                                snapshot->microMemory,
+                                snapshot->dataMemory,
+                                snapshot->vif,
+                                snapshot->codeGeneration),
+                        .vifMode = runtime.memory().vif1_regs.mode,
+                        .afterFirstPublication =
+                            afterFirstPublication,
+                        .afterPayload = afterPayload,
+                        .afterSecondPublication =
+                            afterSecondPublication,
+                    };
+                };
+
+            const RunResult reference =
+                run(Vu1ExecutionMode::Inline);
+            const RunResult asynchronous =
+                run(Vu1ExecutionMode::ThreadedAsync);
+            t.IsTrue(
+                asynchronous.serviceError.empty(),
+                "a new speculative startup inside a parser batch must receive its own explicit resolution; observed: " +
+                    asynchronous.serviceError);
+            t.Equals(
+                asynchronous.architecturalHash,
+                reference.architecturalHash,
+                "multiple speculation epochs in one parser batch should retain inline architecture");
+            t.Equals(asynchronous.vifMode, 3u,
+                     "the command after MSCAL should execute in parser order");
+            t.Equals(
+                asynchronous.afterFirstPublication.slicesPublished, 1ull,
+                "the fixture should begin with one published speculative epoch");
+            t.Equals(
+                asynchronous.afterPayload.slicesSubmitted, 3ull,
+                "the replacement epoch should be recomputed once after its hazard");
+            t.Equals(
+                asynchronous.afterPayload.hazardBarrierCount, 1ull,
+                "only the unpublished replacement epoch should require a wait barrier");
+            t.Equals(
+                asynchronous.afterPayload.hazardRequeueCount, 1ull,
+                "the replacement epoch should requeue exactly once");
+            t.Equals(
+                asynchronous.afterPayload.owner.speculation.committedSlices,
+                1ull,
+                "the first published epoch should commit before the new MSCAL");
+            t.Equals(
+                asynchronous.afterPayload.owner.speculation.rolledBackSlices,
+                1ull,
+                "the following state command should roll back the new private epoch");
+            t.Equals(
+                asynchronous.afterSecondPublication.slicesPublished, 2ull,
+                "both startup epochs should publish at their own scheduler events");
+            t.Equals(
+                asynchronous.afterSecondPublication.budgetFallbackCount, 0ull,
+                "the on-time replacement epoch should not require budget fallback");
+        });
+
         tc.Run("runtime abandons a VIF1 batch requeue after owner failure", [](TestCase &t)
         {
             std::atomic<bool> injectFailure{false};

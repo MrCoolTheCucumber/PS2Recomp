@@ -6547,6 +6547,27 @@ void PS2Runtime::enqueueVu1SpeculativeSlice(
             "VU1 speculative enqueue resolution does not match publication state");
     }
 
+    const bool startsNewBatchSpeculationEpoch =
+        m_vu1SynchronousCommandBatchActive &&
+        m_batchedVu1SynchronousCommandBarrier.resolution !=
+            Vu1SpeculationResolution::None;
+    if (startsNewBatchSpeculationEpoch &&
+        m_batchedVu1SynchronousCommandBarrier.requeue)
+    {
+        const Vu1PendingSlicePlan &deferred =
+            *m_batchedVu1SynchronousCommandBarrier.requeue;
+        if (m_vu1ExecutionTiming.generation ==
+                deferred.executionGeneration &&
+            m_vu1ExecutionTiming.eventToken.generation ==
+                deferred.eventGeneration &&
+            m_publishedVu1Active.load(
+                std::memory_order_acquire))
+        {
+            throw std::logic_error(
+                "new VU1 speculation cannot replace a current batch requeue");
+        }
+    }
+
     const auto submitAt = std::chrono::steady_clock::now();
     try
     {
@@ -6567,6 +6588,15 @@ void PS2Runtime::enqueueVu1SpeculativeSlice(
             Vu1SpeculationPublicationState::Unpublished;
         m_vu1AsyncPendingSlice.store(
             true, std::memory_order_release);
+        if (startsNewBatchSpeculationEpoch)
+        {
+            // MSCAL/MSCNT can start a fresh VU generation while one VIF1
+            // parser invocation is still active. The prior resolution has
+            // already reached the owner, and its deferred plan is stale.
+            // Subsequent commands in this parser call must therefore
+            // resolve the new private startup slice as a distinct epoch.
+            m_batchedVu1SynchronousCommandBarrier = {};
+        }
     }
     catch (...)
     {
