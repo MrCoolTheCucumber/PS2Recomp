@@ -307,7 +307,10 @@ private:
     uint32_t m_vramSize = 0;
     struct GSRegisters *m_privRegs = nullptr;
     std::vector<GsPrivilegedSideEffect> *m_privilegedSideEffectSink = nullptr;
-    mutable std::recursive_mutex m_stateMutex;
+    // Architectural state is single-owned by GsCommandProcessor. Runtime
+    // observations and controls are typed commands on that same ordered lane;
+    // subordinate raster workers receive immutable value snapshots instead of
+    // borrowing this mutable frontend state.
     std::function<uint64_t()> m_vsyncTickProvider;
 
     GSContext m_ctx[2];

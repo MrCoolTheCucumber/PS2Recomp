@@ -686,7 +686,6 @@ GS::GS()
 
 GS::~GS()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_rasterizer.flushDrawBatch(this, GsFlushReason::Shutdown);
 }
 
@@ -701,8 +700,6 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 void GS::setVSyncTickProvider(
     std::function<uint64_t()> provider)
 {
-    std::lock_guard<std::recursive_mutex> lock(
-        m_stateMutex);
     m_vsyncTickProvider = std::move(provider);
 }
 
@@ -723,7 +720,6 @@ void GS::flushForObservation(GsFlushReason reason) const
 
 void GS::reset()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_rasterizer.flushDrawBatch(this, GsFlushReason::Reset);
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
@@ -804,7 +800,6 @@ GSContext &GS::activeContext()
 
 void GS::snapshotVRAM()
 {
-    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     m_rasterizer.flushDrawBatch(
         this, GsFlushReason::PresentationLatch);
     if (!m_vram || m_vramSize == 0)
@@ -829,7 +824,6 @@ const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
 
 GSDebugSnapshot GS::getDebugSnapshot() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     flushForObservation(GsFlushReason::DebuggerObservation);
 
     GSDebugSnapshot snapshot{};
@@ -928,14 +922,12 @@ GsReplayState GS::captureReplayStateUnlocked() const
 
 GsReplayState GS::captureReplayState() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     flushForObservation(GsFlushReason::SaveLoad);
     return captureReplayStateUnlocked();
 }
 
 bool GS::copyVram(std::vector<uint8_t> &outVram) const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!m_vram || m_vramSize == 0u)
     {
         outVram.clear();
@@ -948,7 +940,6 @@ bool GS::copyVram(std::vector<uint8_t> &outVram) const
 
 bool GS::restoreReplayState(const GsReplayState &state)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (static_cast<uint32_t>(state.prim.type) >
             static_cast<uint32_t>(GS_PRIM_SPRITE) ||
         state.vertexCount < 0 ||
@@ -1069,7 +1060,6 @@ void GS::setProgressTrackingEnabled(bool enabled)
 
 std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     flushForObservation(GsFlushReason::DebuggerObservation);
 
     std::vector<GSDebugHistoryEntry> out;
@@ -1088,7 +1078,6 @@ void GS::copyRecentGifPackets(size_t limit,
                               std::vector<uint8_t> &outInitialVram,
                               GsReplayState *outInitialState) const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     flushForObservation(GsFlushReason::DebuggerObservation);
     // The initial state belongs to the first retained packet, so always copy
     // the complete bounded segment.
@@ -1115,7 +1104,6 @@ void GS::copyRecentGifPackets(size_t limit,
 
 void GS::clearDebugHistory()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_debugHistoryWrite = 0;
     m_debugHistoryCount = 0;
     m_debugGifPackets.clear();
@@ -1129,13 +1117,11 @@ void GS::clearDebugHistory()
 
 bool GS::isDebugHistoryPaused() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_debugHistoryPaused;
 }
 
 void GS::setDebugHistoryPaused(bool paused)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_debugHistoryPaused != paused)
     {
         m_rasterizer.flushDrawBatch(
@@ -1322,7 +1308,6 @@ void GS::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp
 
 bool GS::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!m_hasPreferredDisplaySource)
     {
         outSource = {};
@@ -1504,7 +1489,6 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
 
 void GS::latchHostPresentationFrame()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     GsPrivilegedRegisterSnapshot registers{};
     if (m_privRegs)
     {
@@ -1525,7 +1509,6 @@ void GS::latchHostPresentationFrame()
 void GS::latchHostPresentationFrame(
     const GsPrivilegedRegisterSnapshot &registers)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     latchHostPresentationFrameUnlocked(registers);
 }
 
@@ -1923,7 +1906,6 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t *outSourceFbp,
                                           bool *outUsedPreferred) const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!m_hasHostPresentationFrame || m_hostPresentationFrame.empty())
     {
         outPixels.clear();
@@ -1953,31 +1935,26 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::beginRenderBatch()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_rasterizer.beginDrawBatch(this);
 }
 
 void GS::endRenderSubmissionBatch()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_rasterizer.endDrawSubmissionBatch(this);
 }
 
 void GS::flushRenderBatch()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_rasterizer.flushDrawBatch(this, GsFlushReason::Explicit);
 }
 
 void GS::endRenderBatch()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_rasterizer.endDrawBatch(this);
 }
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_vram ||
         m_drawCommandLimitReached)
         return;
@@ -2211,7 +2188,6 @@ bool GS::processPackedStRgbaXyzf2(
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_vram)
         return false;
 
@@ -2275,7 +2251,6 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes == 0 || !m_vram)
         return;
 
@@ -2555,7 +2530,6 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
@@ -3778,7 +3752,6 @@ void GS::performLocalToHostToBuffer()
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     const GSContext &context =
         m_ctx[(contextIndex != 0u) ? 1 : 0];
     const GsVramPageMask writePages =
@@ -3793,7 +3766,6 @@ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     GSContext &context = activeContext();
     const GsVramPageMask writePages =
         clearFramebufferPages(context);
@@ -3809,7 +3781,6 @@ bool GS::configureVulkanRenderer(
     const GsVulkanServiceConfig &config,
     std::string verificationArtifactDirectory)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_rasterizer.configureVulkanRenderer(
         config, std::move(verificationArtifactDirectory));
 }
@@ -3818,70 +3789,59 @@ bool GS::configureVulkanRenderer(
     const GsVulkanServiceConfig &config,
     GsVulkanRasterBackendConfig backendConfig)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_rasterizer.configureVulkanRenderer(
         config, std::move(backendConfig));
 }
 
 bool GS::setRendererMode(GsRendererMode mode)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_rasterizer.setRendererMode(mode);
 }
 
 GsRendererMode GS::rendererMode() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_rasterizer.rendererMode();
 }
 
 std::string GS::rendererDiagnostic() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_rasterizer.rendererDiagnostic();
 }
 
 GsVulkanCapabilityReport GS::vulkanRendererCapabilities() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_rasterizer.vulkanRendererCapabilities();
 }
 
 GsVulkanServiceStatistics
 GS::vulkanRendererServiceStatistics() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_rasterizer.vulkanRendererServiceStatistics();
 }
 
 GsVulkanRasterBackendStatistics
 GS::vulkanRendererBackendStatistics() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_rasterizer.vulkanRendererBackendStatistics();
 }
 
 void GS::setBackendCountersEnabled(bool enabled)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_rasterizer.setBackendCountersEnabled(enabled);
 }
 
 GsBackendCounters GS::backendCounters() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_rasterizer.backendCounters();
 }
 
 void GS::resetBackendCounters()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_rasterizer.resetBackendCounters();
 }
 
 void GS::setDrawCommandLimit(uint64_t maximumCommands)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_drawCommandLimit = maximumCommands;
     m_drawCommandLimitReached =
         m_nextDrawSequence - 1u >= maximumCommands;
@@ -3889,26 +3849,22 @@ void GS::setDrawCommandLimit(uint64_t maximumCommands)
 
 void GS::clearDrawCommandLimit()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_drawCommandLimit = UINT64_MAX;
     m_drawCommandLimitReached = false;
 }
 
 bool GS::drawCommandLimitReached() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_drawCommandLimitReached;
 }
 
 uint64_t GS::submittedDrawCommandCount() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_nextDrawSequence - 1u;
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!dst || maxBytes == 0)
         return 0;
     size_t avail = m_localToHostBuffer.size() - m_localToHostReadPos;
