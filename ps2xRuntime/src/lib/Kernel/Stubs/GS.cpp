@@ -159,12 +159,22 @@ namespace ps2_stubs
                 return;
             }
 
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.xyz2a.reg & 0xFFu), clear.xyz2a.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.xyz2b.reg & 0xFFu), clear.xyz2b.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
+            const GsRegPairMem pairs[] = {
+                clear.testa,
+                clear.prim,
+                clear.rgbaq,
+                clear.xyz2a,
+                clear.xyz2b,
+                clear.testb,
+            };
+            for (const GsRegPairMem &pair : pairs)
+            {
+                (void)runtime->submitEeGsCommand(
+                    GsWriteRegisterCommand{
+                        .address = static_cast<uint8_t>(
+                            pair.reg & 0xFFu),
+                        .value = pair.value});
+            }
         }
 
         void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
@@ -979,7 +989,16 @@ namespace ps2_stubs
         mem.processPendingTransfers();
 
         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "sceGsExecStoreImage", ctx);
-        runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
+        GsFifoReadResult fifo =
+            takeGsCommandResult<GsFifoReadResult>(
+                runtime->submitEeGsCommand(
+                    GsReadFifoCommand{
+                        .maximumBytes = totalImageBytes}));
+        if (!fifo.bytes.empty())
+        {
+            std::memcpy(
+                dst, fifo.bytes.data(), fifo.bytes.size());
+        }
         runtime->guestFree(pktAddr);
 
         setReturnS32(ctx, 0);
@@ -1057,7 +1076,8 @@ namespace ps2_stubs
                 // previous renderer leak odd/even scanline masks into the
                 // next client (notably MPEG playback).  GS local memory is
                 // intentionally retained by GS::reset().
-                runtime->gs().reset();
+                (void)runtime->submitEeGsCommand(
+                    GsResetCommand{});
 
                 EeInterruptRuntimeState &state =
                     runtime->eeInterruptRuntimeState();
@@ -1512,7 +1532,11 @@ namespace ps2_stubs
             if (hasSeededGsClearPacket(db.clear0))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
+                (void)runtime->submitEeGsCommand(
+                    GsClearFramebufferCommand{
+                        .contextIndex = clearContext,
+                        .rgba = static_cast<uint32_t>(
+                            db.clear0.rgbaq.value)});
             }
             applyGsClearPacket(runtime, db.clear0);
         }
@@ -1523,7 +1547,11 @@ namespace ps2_stubs
             if (hasSeededGsClearPacket(db.clear1))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
+                (void)runtime->submitEeGsCommand(
+                    GsClearFramebufferCommand{
+                        .contextIndex = clearContext,
+                        .rgba = static_cast<uint32_t>(
+                            db.clear1.rgbaq.value)});
             }
             applyGsClearPacket(runtime, db.clear1);
         }

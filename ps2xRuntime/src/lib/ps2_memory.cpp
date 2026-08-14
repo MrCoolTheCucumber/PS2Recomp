@@ -1,6 +1,6 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
-#include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_gs_command_stream.h"
 #include "runtime/ps2_vu1.h"
 #include "ps2_log.h"
 #include <array>
@@ -9546,7 +9546,8 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         m_gifPacketCallback(data, sizeBytes);
 }
 
-bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr)
+bool PS2Memory::tryProcessNativeGifImageUploadChain(
+    GsCommandExecutor &executor, uint32_t tadr, uint32_t chcr)
 {
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -9719,7 +9720,14 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;
     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-    gs.uploadImageNative(setupRegs[0], setupRegs[1], setupRegs[2], setupRegs[3], imageData, imageBytes);
+    GsNativeImageUploadCommand upload{
+        .bitbltbuf = setupRegs[0],
+        .trxpos = setupRegs[1],
+        .trxreg = setupRegs[2],
+        .trxdir = setupRegs[3],
+    };
+    upload.bytes.assign(imageData, imageData + imageBytes);
+    (void)executor.submit(std::move(upload));
 
     m_ioRegisters[GIF_CHANNEL + 0x30u] = finalTadr;
     m_ioRegisters[GIF_CHANNEL + 0x40u] = 0u;
@@ -9733,7 +9741,8 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     return true;
 }
 
-bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
+bool PS2Memory::tryProcessNativeGifPackedChain(
+    GsCommandExecutor &executor, uint32_t tadr, uint32_t chcr)
 {
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -9787,7 +9796,11 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
     const uint8_t *payload = nullptr;
     if (!resolveContiguous(tadr + 16u, payloadBytes, payload))
         return false;
-    if (!gs.processNativePackedGIFPacket(payload, payloadBytes))
+    GsNativePackedGifCommand packet{};
+    packet.bytes.assign(payload, payload + payloadBytes);
+    if (!takeGsCommandResult<GsBooleanResult>(
+            executor.submit(std::move(packet)))
+             .value)
         return false;
 
     const DmacTransferToken transfer =

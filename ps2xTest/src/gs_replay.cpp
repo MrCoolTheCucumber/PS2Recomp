@@ -1,4 +1,5 @@
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_gs_command_stream.h"
 #include "runtime/ps2_gs_vulkan.h"
 #include "runtime/ps2_memory.h"
 
@@ -685,6 +686,15 @@ namespace
             hash *= 1099511628211ull;
         }
         return hash;
+    }
+
+    void appendU64ToFnv(uint64_t &hash, uint64_t value) noexcept
+    {
+        for (uint32_t shift = 0u; shift < 64u; shift += 8u)
+        {
+            hash ^= static_cast<uint8_t>(value >> shift);
+            hash *= 1099511628211ull;
+        }
     }
 
     void fillDeterministicVram(std::vector<uint8_t> &vram)
@@ -1527,6 +1537,20 @@ int main(int argc, char **argv)
     GS gs;
     gs.init(memory.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
             &memory.gs());
+    GsCommandProcessor gsProcessor(gs, true);
+    InlineGsExecutor gsExecutor(gsProcessor);
+    uint64_t commandDigest = 14695981039346656037ull;
+    uint64_t gsCommands = 0u;
+    auto submitGs = [&](GsCommandPayload payload)
+    {
+        GsCommandResult result =
+            gsExecutor.submit(std::move(payload));
+        appendU64ToFnv(
+            commandDigest,
+            gsCommandDigestHash(result.digest));
+        ++gsCommands;
+        return result;
+    };
 
     if (rendererMode != GsRendererMode::Software)
     {
@@ -1534,19 +1558,33 @@ int main(int argc, char **argv)
         serviceConfig.probe = vulkanConfig;
         vulkanBackendConfig.verificationArtifactDirectory =
             verificationArtifactDirectory;
-        if (!gs.configureVulkanRenderer(
-                serviceConfig, vulkanBackendConfig))
+        if (!takeGsCommandResult<GsBooleanResult>(
+                submitGs(
+                    GsConfigureVulkanCommand{
+                        .service = std::move(serviceConfig),
+                        .backend = std::move(vulkanBackendConfig)}))
+                 .value)
         {
+            const GsRendererStatusResult status =
+                takeGsCommandResult<GsRendererStatusResult>(
+                    submitGs(GsRendererStatusCommand{}));
             std::cerr << "failed to configure Vulkan renderer: "
-                      << gs.rendererDiagnostic() << '\n';
+                      << status.diagnostic << '\n';
             return 2;
         }
     }
-    if (!gs.setRendererMode(rendererMode))
+    if (!takeGsCommandResult<GsBooleanResult>(
+            submitGs(
+                GsSetRendererModeCommand{
+                    .mode = rendererMode}))
+             .value)
     {
         std::cerr << "renderer mode is unavailable: "
                   << gsRendererModeName(rendererMode);
-        const std::string diagnostic = gs.rendererDiagnostic();
+        const std::string diagnostic =
+            takeGsCommandResult<GsRendererStatusResult>(
+                submitGs(GsRendererStatusCommand{}))
+                .diagnostic;
         if (!diagnostic.empty())
             std::cerr << ": " << diagnostic;
         std::cerr << '\n';
@@ -1575,7 +1613,11 @@ int main(int argc, char **argv)
 
     if (replayStateLoaded)
     {
-        if (!gs.restoreReplayState(replayState))
+        if (!takeGsCommandResult<GsBooleanResult>(
+                submitGs(
+                    GsRestoreReplayStateCommand{
+                        .state = std::move(replayState)}))
+                 .value)
         {
             std::cerr << "initial GS replay state is incompatible "
                          "with this runtime\n";
@@ -1585,10 +1627,20 @@ int main(int argc, char **argv)
     else
     {
         for (const auto &[address, value] : fileRegisters)
-            gs.writeRegister(address, value);
+        {
+            (void)submitGs(
+                GsWriteRegisterCommand{
+                    .address = address,
+                    .value = value});
+        }
     }
     for (const auto &[address, value] : overrideRegisters)
-        gs.writeRegister(address, value);
+    {
+        (void)submitGs(
+            GsWriteRegisterCommand{
+                .address = address,
+                .value = value});
+    }
 
     if (batchStream && batchDrains)
     {
@@ -1598,23 +1650,35 @@ int main(int argc, char **argv)
 
     if (backendStats)
     {
-        gs.resetBackendCounters();
-        gs.setBackendCountersEnabled(true);
+        (void)submitGs(GsResetBackendCountersCommand{});
+        (void)submitGs(
+            GsSetBackendCountersEnabledCommand{
+                .enabled = true});
     }
     if (commandLimitSet)
-        gs.setDrawCommandLimit(commandLimit);
+    {
+        (void)submitGs(
+            GsSetDrawCommandLimitCommand{
+                .maximumCommands = commandLimit});
+    }
 
-    if (batchStream)
-        gs.beginRenderBatch();
     struct RenderBatchScope
     {
-        GS *gs = nullptr;
+        GsCommandExecutor *executor = nullptr;
         ~RenderBatchScope()
         {
-            if (gs)
-                gs->endRenderBatch();
+            if (!executor)
+                return;
+            try
+            {
+                (void)executor->submit(
+                    GsEndRenderBatchCommand{});
+            }
+            catch (...)
+            {
+            }
         }
-    } renderBatchScope{batchStream ? &gs : nullptr};
+    } renderBatchScope{};
 
     std::ofstream hashTrace;
     if (!hashTracePath.empty())
@@ -1649,7 +1713,15 @@ int main(int argc, char **argv)
     bool stopped = false;
     bool stoppedWithinPacket = false;
     const char *stopReason = "complete";
-    if (commandLimitSet && gs.drawCommandLimitReached())
+    if (batchStream)
+    {
+        (void)submitGs(GsBeginRenderBatchCommand{});
+        renderBatchScope.executor = &gsExecutor;
+    }
+    if (commandLimitSet &&
+        takeGsCommandResult<GsDrawStatusResult>(
+            submitGs(GsDrawStatusCommand{}))
+            .limitReached)
     {
         stopped = true;
         stopReason = "command-limit";
@@ -1670,23 +1742,16 @@ int main(int argc, char **argv)
 
         try
         {
-            if (batchDrains)
-                gs.beginRenderBatch();
-            struct SubmissionBatchScope
-            {
-                GS *gs = nullptr;
-                ~SubmissionBatchScope()
-                {
-                    if (gs)
-                        gs->endRenderSubmissionBatch();
-                }
-            } submissionBatchScope{batchDrains ? &gs : nullptr};
-            gs.processGIFPacket(data, static_cast<uint32_t>(size));
-            if (batchDrains)
-            {
-                gs.endRenderSubmissionBatch();
-                submissionBatchScope.gs = nullptr;
-            }
+            GsDrainBatchCommand batch{};
+            batch.beginSubmissionBatch = batchDrains;
+            batch.endSubmissionBatch = batchDrains;
+            GifArbiterDrainBatch::Packet packet{};
+            packet.pathId = GifPathId::Path3;
+            packet.storageIndex = 3u;
+            packet.size = size;
+            batch.batch.storage[3].assign(data, data + size);
+            batch.batch.packets.push_back(std::move(packet));
+            (void)submitGs(std::move(batch));
         }
         catch (const std::exception &error)
         {
@@ -1699,7 +1764,7 @@ int main(int argc, char **argv)
         totalBytes += size;
         if (hashTrace.is_open())
         {
-            gs.flushRenderBatch();
+            (void)submitGs(GsFlushRenderBatchCommand{});
             hashTrace << packetIndex << ',' << size << ','
                       << std::hex << std::setw(16) << std::setfill('0')
                       << fnv1a64(data, size) << ','
@@ -1708,7 +1773,10 @@ int main(int argc, char **argv)
                       << std::dec << '\n';
         }
         ++packetIndex;
-        if (commandLimitSet && gs.drawCommandLimitReached())
+        if (commandLimitSet &&
+            takeGsCommandResult<GsDrawStatusResult>(
+                submitGs(GsDrawStatusCommand{}))
+                .limitReached)
         {
             stopped = true;
             stoppedWithinPacket = true;
@@ -1764,16 +1832,34 @@ int main(int argc, char **argv)
 
     if (batchStream)
     {
-        gs.endRenderBatch();
-        renderBatchScope.gs = nullptr;
+        (void)submitGs(GsEndRenderBatchCommand{});
+        renderBatchScope.executor = nullptr;
     }
 
     // Final comparison, hashing, and output are CPU observations. Hybrid may
     // deliberately leave newer pages resident on the GPU after the last
     // packet, so use the ordinary save/load observation boundary to publish
     // canonical CPU VRAM before reading it directly below.
-    if (gs.rendererMode() != GsRendererMode::Software)
-        (void)gs.captureReplayState();
+    GsRendererStatusResult rendererStatus =
+        takeGsCommandResult<GsRendererStatusResult>(
+            submitGs(GsRendererStatusCommand{}));
+    if (rendererStatus.mode != GsRendererMode::Software)
+    {
+        (void)submitGs(GsCaptureReplayStateCommand{});
+        rendererStatus =
+            takeGsCommandResult<GsRendererStatusResult>(
+                submitGs(GsRendererStatusCommand{}));
+    }
+    const GsDrawStatusResult drawStatus =
+        takeGsCommandResult<GsDrawStatusResult>(
+            submitGs(GsDrawStatusCommand{}));
+    GsBackendCountersResult backendCounterResult{};
+    if (backendStats)
+    {
+        backendCounterResult =
+            takeGsCommandResult<GsBackendCountersResult>(
+                submitGs(GsBackendCountersCommand{}));
+    }
 
     const VramDifference difference = expectedVram.empty()
         ? VramDifference{}
@@ -1788,10 +1874,14 @@ int main(int argc, char **argv)
     }
 
     std::cout << "{\"schema_version\":1,\"renderer\":\""
-              << gsRendererModeName(gs.rendererMode())
+              << gsRendererModeName(rendererStatus.mode)
               << "\",\"packets\":" << packetIndex
               << ",\"bytes\":" << totalBytes
-              << ",\"commands\":" << gs.submittedDrawCommandCount()
+              << ",\"commands\":" << drawStatus.submittedCommands
+              << ",\"gs_stream_commands\":" << gsCommands
+              << ",\"gs_command_digest_fnv1a64\":\"0x"
+              << std::hex << std::setw(16) << std::setfill('0')
+              << commandDigest << '\"' << std::dec
               << ",\"state_restored\":"
               << (replayStateLoaded ? "true" : "false")
               << ",\"stopped\":" << (stopped ? "true" : "false")
@@ -1825,20 +1915,21 @@ int main(int argc, char **argv)
     if (backendStats)
     {
         std::cout << ",\"backend_counters\":";
-        writeBackendCounters(std::cout, gs.backendCounters());
-        if (gs.rendererMode() != GsRendererMode::Software)
+        writeBackendCounters(
+            std::cout, backendCounterResult.counters);
+        if (rendererStatus.mode != GsRendererMode::Software)
         {
             std::cout << ",\"vulkan_capabilities\":{";
             writeVulkanCapabilityFields(
-                std::cout, gs.vulkanRendererCapabilities());
+                std::cout, rendererStatus.capabilities);
             std::cout << "},\"vulkan_service_statistics\":";
             writeVulkanServiceStatistics(
                 std::cout,
-                gs.vulkanRendererServiceStatistics());
+                rendererStatus.serviceStatistics);
             std::cout << ",\"vulkan_backend_statistics\":";
             writeVulkanRasterBackendStatistics(
                 std::cout,
-                gs.vulkanRendererBackendStatistics());
+                rendererStatus.backendStatistics);
         }
     }
 

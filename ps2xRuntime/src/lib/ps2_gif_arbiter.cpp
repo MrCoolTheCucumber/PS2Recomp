@@ -51,7 +51,7 @@ GifArbiter::GifArbiter(ProcessPacketFn processFn)
 
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
 {
-    if (!data || sizeBytes == 0u || !m_processFn)
+    if (!data || sizeBytes == 0u)
         return;
 
     const size_t pathIndex = static_cast<size_t>(pathId);
@@ -59,6 +59,13 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
         return;
 
     PathStream &stream = m_pathStreams[pathIndex];
+    if (stream.data.empty() &&
+        m_recycledStorage[pathIndex].capacity() >
+            stream.data.capacity())
+    {
+        stream.data.swap(m_recycledStorage[pathIndex]);
+        stream.data.clear();
+    }
     auto dropIncompletePacket = [&stream]()
     {
         stream.data.resize(stream.packetStart);
@@ -133,6 +140,8 @@ void GifArbiter::reset()
     m_queue.clear();
     for (PathStream &stream : m_pathStreams)
         stream = {};
+    m_recycledStorage = {};
+    m_recycledPackets = {};
 }
 
 bool GifArbiter::empty() const
@@ -163,8 +172,51 @@ bool GifArbiter::canAcceptPath2(bool directHl) const
 
 void GifArbiter::drain()
 {
-    if (!m_processFn || m_queue.empty())
+    if ((!m_processFn && !m_processBatchFn) ||
+        m_queue.empty())
         return;
+
+    GifArbiterDrainBatch batch = takeDrainBatch();
+    if (batch.empty())
+        return;
+
+    if (m_processBatchFn)
+    {
+        m_processBatchFn(std::move(batch));
+        return;
+    }
+
+    if (m_beginDrainFn)
+        m_beginDrainFn();
+    struct DrainScope
+    {
+        DrainBoundaryFn &endFn;
+        ~DrainScope()
+        {
+            if (endFn)
+                endFn();
+        }
+    } drainScope{m_endDrainFn};
+
+    for (const GifArbiterDrainBatch::Packet &packet : batch.packets)
+    {
+        const std::span<const uint8_t> bytes =
+            batch.packetBytes(packet);
+        if (!bytes.empty())
+        {
+            m_processFn(
+                bytes.data(),
+                static_cast<uint32_t>(bytes.size()));
+        }
+    }
+    recycleDrainBatch(std::move(batch));
+}
+
+GifArbiterDrainBatch GifArbiter::takeDrainBatch()
+{
+    GifArbiterDrainBatch batch{};
+    if (m_queue.empty())
+        return batch;
 
     std::stable_sort(m_queue.begin(), m_queue.end(),
                      [](const GifArbiterPacket &a, const GifArbiterPacket &b)
@@ -180,18 +232,57 @@ void GifArbiter::drain()
                          return pathPriority(a.pathId) < pathPriority(b.pathId);
                      });
 
-    if (m_beginDrainFn)
-        m_beginDrainFn();
-    struct DrainScope
+    std::array<size_t, 4> consumedByPath{};
+    for (const GifArbiterPacket &packet : m_queue)
     {
-        DrainBoundaryFn &endFn;
-        ~DrainScope()
+        const size_t pathIndex =
+            static_cast<size_t>(packet.pathId);
+        if (pathIndex < consumedByPath.size())
         {
-            if (endFn)
-                endFn();
+            consumedByPath[pathIndex] = std::max(
+                consumedByPath[pathIndex],
+                packet.offset + packet.size);
         }
-    } drainScope{m_endDrainFn};
+    }
+    for (size_t pathIndex = 0u;
+         pathIndex < m_pathStreams.size(); ++pathIndex)
+    {
+        PathStream &stream = m_pathStreams[pathIndex];
+        const size_t consumed = consumedByPath[pathIndex];
+        if (consumed == 0u || consumed > stream.data.size())
+            continue;
 
+        if (consumed == stream.data.size())
+        {
+            batch.storage[pathIndex] = std::move(stream.data);
+            stream.data.clear();
+        }
+        else
+        {
+            // A complete prefix plus an incomplete suffix cannot share one
+            // vector after ownership moves to the command. Copy only that
+            // rare suffix, then move the complete prefix without copying it.
+            std::vector<uint8_t> suffix(
+                stream.data.begin() +
+                    static_cast<std::ptrdiff_t>(consumed),
+                stream.data.end());
+            stream.data.resize(consumed);
+            batch.storage[pathIndex] = std::move(stream.data);
+            stream.data = std::move(suffix);
+        }
+
+        stream.packetStart = 0u;
+        stream.parseOffset -= consumed;
+        if (stream.data.empty())
+        {
+            stream.path2DirectHl = false;
+            stream.packetContainsImage = false;
+        }
+    }
+
+    batch.packets.swap(m_recycledPackets);
+    batch.packets.clear();
+    batch.packets.reserve(m_queue.size());
     for (size_t i = 0; i < m_queue.size(); ++i)
     {
         const GifArbiterPacket &pkt = m_queue[i];
@@ -200,42 +291,57 @@ void GifArbiter::drain()
         if (pathIndex >= m_pathStreams.size())
             continue;
 
-        const PathStream &stream =
-            m_pathStreams[pathIndex];
+        const std::vector<uint8_t> &storage =
+            batch.storage[pathIndex];
         if (pkt.size != 0u &&
-            pkt.offset <= stream.data.size() &&
-            pkt.size <= stream.data.size() - pkt.offset)
+            pkt.offset <= storage.size() &&
+            pkt.size <= storage.size() - pkt.offset)
         {
-            m_processFn(
-                stream.data.data() + pkt.offset,
-                static_cast<uint32_t>(pkt.size));
+            GifArbiterDrainBatch::Packet owned{};
+            owned.pathId = pkt.pathId;
+            owned.path2DirectHl = pkt.path2DirectHl;
+            owned.path3Image = pkt.path3Image;
+            owned.storageIndex =
+                static_cast<uint8_t>(pathIndex);
+            owned.offset = pkt.offset;
+            owned.size = pkt.size;
+            batch.packets.push_back(std::move(owned));
         }
     }
     m_queue.clear();
+    return batch;
+}
 
-    for (PathStream &stream : m_pathStreams)
+void GifArbiter::recycleDrainBatch(
+    GifArbiterDrainBatch batch)
+{
+    for (size_t pathIndex = 0u;
+         pathIndex < batch.storage.size(); ++pathIndex)
     {
-        const size_t consumed = stream.packetStart;
-        if (consumed == 0u)
+        std::vector<uint8_t> &returned = batch.storage[pathIndex];
+        returned.clear();
+        PathStream &stream = m_pathStreams[pathIndex];
+        if (stream.data.empty() &&
+            stream.packetStart == 0u &&
+            stream.parseOffset == 0u &&
+            returned.capacity() > stream.data.capacity())
+        {
+            stream.data = std::move(returned);
             continue;
-
-        const size_t remaining =
-            stream.data.size() - consumed;
-        if (remaining != 0u)
-        {
-            std::memmove(
-                stream.data.data(),
-                stream.data.data() + consumed,
-                remaining);
         }
-        stream.data.resize(remaining);
-        stream.packetStart = 0u;
-        stream.parseOffset -= consumed;
-        if (remaining == 0u)
+        if (returned.capacity() >
+            m_recycledStorage[pathIndex].capacity())
         {
-            stream.path2DirectHl = false;
-            stream.packetContainsImage = false;
+            m_recycledStorage[pathIndex] =
+                std::move(returned);
         }
+    }
+    batch.packets.clear();
+    if (batch.packets.capacity() >
+        m_recycledPackets.capacity())
+    {
+        m_recycledPackets =
+            std::move(batch.packets);
     }
 }
 

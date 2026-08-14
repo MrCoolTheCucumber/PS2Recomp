@@ -39,6 +39,7 @@
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_gs_command_stream.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_vu_clip.h"
 #include "runtime/ps2_vu1.h"
@@ -78,6 +79,7 @@ namespace ps2_stubs
 
 struct PS2RuntimeConfiguration
 {
+    GsExecutionMode gsExecutionMode = GsExecutionMode::Inline;
     EeExecutionBackendKind eeExecutionBackend =
         EeExecutionBackendKind::LegacyHostThread;
     bool useEeExecutionBackendEnvironment = true;
@@ -696,6 +698,15 @@ public:
 
     bool initialize(const char *title = "PS2 Game");
     bool syncCoreSubsystems();
+    [[nodiscard]] GsCommandResult submitGsCommand(
+        GsCommandPayload payload,
+        uint64_t publicationToken = 0u);
+    // Guest execution is the sole hot GS producer. This entry records the
+    // authoritative EE timeline; control/UI callers use submitGsCommand and
+    // inherit the last safely published guest tick.
+    [[nodiscard]] GsCommandResult submitEeGsCommand(
+        GsCommandPayload payload,
+        uint64_t publicationToken = 0u);
     [[nodiscard]] ps2x::timing::EeTick currentEeTick() const noexcept;
     void resetEeTiming(R5900Context *context = nullptr);
     void setRealtimeVSyncPacingEnabled(bool enabled);
@@ -2478,6 +2489,9 @@ private:
     EeCache m_eeCache;
     GifArbiter m_gifArbiter;
     GS m_gs;
+    GsCommandProcessor m_gsCommandProcessor;
+    std::unique_ptr<GsCommandExecutor> m_gsExecutor;
+    std::atomic<uint64_t> m_publishedGsGuestTick{0u};
     std::unique_ptr<HostPresentationUploadState>
         m_hostPresentationUploadState;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;

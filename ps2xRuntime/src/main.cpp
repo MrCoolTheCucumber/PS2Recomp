@@ -287,17 +287,27 @@ int main(int argc, char *argv[])
             std::cerr << "Failed to initialize PS2 runtime" << std::endl;
             return 1;
         }
-        if (!runtime.gs().setRendererMode(options.rendererMode))
+        const bool rendererSelected =
+            takeGsCommandResult<GsBooleanResult>(
+                runtime.submitGsCommand(
+                    GsSetRendererModeCommand{
+                        .mode = options.rendererMode}))
+                .value;
+        GsRendererStatusResult rendererStatus =
+            takeGsCommandResult<GsRendererStatusResult>(
+                runtime.submitGsCommand(
+                    GsRendererStatusCommand{}));
+        if (!rendererSelected)
         {
             std::cerr
                 << "Failed to select GS renderer '"
                 << gsRendererModeName(options.rendererMode) << "': "
-                << runtime.gs().rendererDiagnostic() << std::endl;
+                << rendererStatus.diagnostic << std::endl;
             return 1;
         }
         std::cout
             << "GS renderer: "
-            << gsRendererModeName(runtime.gs().rendererMode())
+            << gsRendererModeName(rendererStatus.mode)
             << std::endl;
 
         if (!runtime.loadELF(filePathStr))

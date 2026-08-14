@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_gs_command_stream.h"
 #include "runtime/ps2_gs_psmct32.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -3105,6 +3106,79 @@ void register_ps2_memory_tests()
             t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
         });
 
+        tc.Run("GIF arbiter drain batches own bytes and preserve DIRECTHL ordering", [](TestCase &t)
+        {
+            GifArbiter arbiter;
+            auto makeEmptyPacket = [](uint8_t marker)
+            {
+                std::vector<uint8_t> packet;
+                appendU64(
+                    packet,
+                    makeGifTag(
+                        0u, GIF_FMT_PACKED, 1u, true));
+                appendU64(packet, marker);
+                return packet;
+            };
+            std::vector<uint8_t> path1 =
+                makeEmptyPacket(0x11u);
+            std::vector<uint8_t> path2 =
+                makeEmptyPacket(0x22u);
+            std::vector<uint8_t> path3;
+            appendU64(
+                path3,
+                makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(path3, 0x33u);
+            path3.insert(path3.end(), 16u, 0xA3u);
+
+            arbiter.submit(
+                GifPathId::Path2, path2.data(),
+                static_cast<uint32_t>(path2.size()), true);
+            arbiter.submit(
+                GifPathId::Path3, path3.data(),
+                static_cast<uint32_t>(path3.size()));
+            arbiter.submit(
+                GifPathId::Path1, path1.data(),
+                static_cast<uint32_t>(path1.size()));
+            GifArbiterDrainBatch batch =
+                arbiter.takeDrainBatch();
+
+            std::fill(path1.begin(), path1.end(), 0xFFu);
+            std::fill(path2.begin(), path2.end(), 0xFFu);
+            std::fill(path3.begin(), path3.end(), 0xFFu);
+            t.Equals(batch.packets.size(), static_cast<size_t>(3u),
+                     "the owned drain should contain every complete packet");
+            if (batch.packets.size() == 3u)
+            {
+                t.Equals(
+                    static_cast<uint32_t>(batch.packets[0].pathId),
+                    static_cast<uint32_t>(GifPathId::Path1),
+                    "PATH1 should remain first");
+                t.Equals(
+                    static_cast<uint32_t>(batch.packets[1].pathId),
+                    static_cast<uint32_t>(GifPathId::Path3),
+                    "PATH3 IMAGE should remain ahead of DIRECTHL");
+                t.Equals(
+                    static_cast<uint32_t>(batch.packets[2].pathId),
+                    static_cast<uint32_t>(GifPathId::Path2),
+                    "DIRECTHL should remain behind PATH3 IMAGE");
+                t.Equals(batch.packetBytes(batch.packets[0])[8],
+                         static_cast<uint8_t>(0x11u),
+                         "the batch should own PATH1 bytes after producer mutation");
+                t.Equals(batch.packetBytes(batch.packets[1])[8],
+                         static_cast<uint8_t>(0x33u),
+                         "the batch should own PATH3 bytes after producer mutation");
+                t.Equals(batch.packetBytes(batch.packets[2])[8],
+                         static_cast<uint8_t>(0x22u),
+                         "the batch should own PATH2 bytes after producer mutation");
+                t.IsTrue(batch.packets[1].path3Image,
+                         "the owned packet should retain PATH3 IMAGE metadata");
+                t.IsTrue(batch.packets[2].path2DirectHl,
+                         "the owned packet should retain DIRECTHL metadata");
+            }
+            t.IsTrue(arbiter.empty(),
+                     "taking a complete drain batch should compact all path streams");
+        });
+
         tc.Run("GIF arbiter brackets a non-empty drain once", [](TestCase &t)
         {
             std::vector<uint8_t> events;
@@ -4244,6 +4318,8 @@ void register_ps2_memory_tests()
 
             GS gs;
             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            GsCommandProcessor gsProcessor(gs);
+            InlineGsExecutor gsExecutor(gsProcessor);
 
             constexpr uint32_t kGifCh = 0x1000A000u;
             constexpr uint32_t kDStat = 0x1000E010u;
@@ -4263,7 +4339,7 @@ void register_ps2_memory_tests()
             writeDmaTag(rdram, chain, makeDmaTag(0u, 7u, 0u, false)); // END.
 
             t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kChain), "write GIF TADR should succeed");
-            t.IsTrue(mem.tryProcessNativeGifImageUploadChain(gs, kChain, 0x105u),
+            t.IsTrue(mem.tryProcessNativeGifImageUploadChain(gsExecutor, kChain, 0x105u),
                      "canonical load-image chain should use the native upload path");
             publishDmacCompletions(mem);
 
@@ -4301,6 +4377,8 @@ void register_ps2_memory_tests()
 
             GS nativeGs;
             nativeGs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            GsCommandProcessor nativeGsProcessor(nativeGs);
+            InlineGsExecutor nativeGsExecutor(nativeGsProcessor);
 
             GSRegisters genericRegs{};
             std::vector<uint8_t> genericVram(PS2_GS_VRAM_SIZE, 0u);
@@ -4341,7 +4419,7 @@ void register_ps2_memory_tests()
             std::memcpy(scratch + 16u, packet.data(), packet.size());
 
             t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kScratchTag), "write GIF TADR scratchpad alias should succeed");
-            t.IsTrue(mem.tryProcessNativeGifPackedChain(nativeGs, kScratchTag, 0x105u),
+            t.IsTrue(mem.tryProcessNativeGifPackedChain(nativeGsExecutor, kScratchTag, 0x105u),
                      "packed primitive chain should use the native packed GIF path");
             publishDmacCompletions(mem);
 

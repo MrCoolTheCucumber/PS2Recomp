@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_gs_command_stream.h"
 #include "runtime/ps2_gs_backend.h"
 #include "runtime/ps2_gs_memory.h"
 #include "runtime/ps2_gs_rasterizer.h"
@@ -22,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2203,6 +2205,339 @@ void register_ps2_gs_tests()
                     invalidFrontend, canonical, &stateError),
                 "invalid primitive types should fail closed");
         });
+
+        tc.Run("inline GS commands own packet bytes and produce deterministic digests", [](TestCase &t)
+        {
+            std::vector<uint8_t> sourcePacket;
+            appendU64(
+                sourcePacket,
+                makeGifTag(1u, GIF_FMT_PACKED, 1u));
+            appendU64(sourcePacket, 0x0Eull);
+            appendGifAd(sourcePacket, 2u, GS_REG_SCANMSK);
+            const std::vector<uint8_t> expectedPacket = sourcePacket;
+
+            std::vector<uint8_t> vramA(PS2_GS_VRAM_SIZE, 0u);
+            std::vector<uint8_t> vramB(PS2_GS_VRAM_SIZE, 0u);
+            GS gsA;
+            GS gsB;
+            gsA.init(
+                vramA.data(), static_cast<uint32_t>(vramA.size()),
+                nullptr);
+            gsB.init(
+                vramB.data(), static_cast<uint32_t>(vramB.size()),
+                nullptr);
+            GsCommandProcessor processorA(gsA, true);
+            GsCommandProcessor processorB(gsB, true);
+            InlineGsExecutor executorA(processorA);
+            InlineGsExecutor executorB(processorB);
+
+            GsDrainBatchCommand batchA{};
+            batchA.batch.storage[2] = sourcePacket;
+            batchA.batch.packets.push_back(GifArbiterDrainBatch::Packet{
+                .pathId = GifPathId::Path2,
+                .path2DirectHl = true,
+                .storageIndex = 2u,
+                .size = sourcePacket.size(),
+            });
+            std::fill(
+                sourcePacket.begin(), sourcePacket.end(), 0xCCu);
+            GsDrainBatchCommand batchB{};
+            batchB.batch.storage[2] = expectedPacket;
+            batchB.batch.packets.push_back(GifArbiterDrainBatch::Packet{
+                .pathId = GifPathId::Path2,
+                .path2DirectHl = true,
+                .storageIndex = 2u,
+                .size = expectedPacket.size(),
+            });
+
+            const GsCommandResult resultA = executorA.submit(
+                std::move(batchA), 1234u, 77u, 9u);
+            const GsCommandResult resultB = executorB.submit(
+                std::move(batchB), 1234u, 77u, 9u);
+            t.IsTrue(resultA.completed(),
+                     "the owned drain command should complete inline");
+            t.IsTrue(resultA.digest == resultB.digest,
+                     "identical command inputs should produce identical digests");
+            t.Equals(
+                gsCommandDigestHash(resultA.digest),
+                gsCommandDigestHash(resultB.digest),
+                "the compact command digest hash should be deterministic");
+            t.Equals(resultA.identity.sequence, 1ull,
+                     "the first command should receive sequence one");
+            t.Equals(resultA.identity.generation, 1ull,
+                     "the first command should use the initial generation");
+            t.Equals(resultA.identity.guestTick, 1234ull,
+                     "the command should retain its guest submission tick");
+            t.Equals(resultA.identity.publicationToken, 77ull,
+                     "the command should retain its publication token");
+            t.Equals(
+                resultA.digest.payloadSize,
+                static_cast<uint64_t>(expectedPacket.size() + 21u),
+                "the digest should cover owned packet bytes and batch boundaries");
+
+            const GsReplayState stateA =
+                takeGsCommandResult<GsReplayStateResult>(
+                    executorA.submit(GsCaptureReplayStateCommand{}))
+                    .state;
+            const GsReplayState stateB =
+                takeGsCommandResult<GsReplayStateResult>(
+                    executorB.submit(GsCaptureReplayStateCommand{}))
+                    .state;
+            t.Equals(stateA.scanMask, static_cast<uint8_t>(2u),
+                     "the command must retain bytes copied before the producer mutates its source");
+            t.Equals(stateB.scanMask, stateA.scanMask,
+                     "equal command streams should leave equal frontend state");
+            t.IsTrue(vramA == vramB,
+                     "equal command streams should leave byte-identical VRAM");
+        });
+
+        tc.Run("GS command processor rejects stale and reordered generations", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(
+                vram.data(), static_cast<uint32_t>(vram.size()),
+                nullptr);
+            GsCommandProcessor processor(gs);
+
+            auto makeCommand = [](
+                GsCommandPayload payload,
+                uint64_t sequence,
+                uint64_t generation)
+            {
+                const GsCommandType type = gsCommandType(payload);
+                const uint64_t payloadSize =
+                    gsCommandPayloadSize(payload);
+                return GsCommand{
+                    .identity = {
+                        .sequence = sequence,
+                        .generation = generation,
+                    },
+                    .type = type,
+                    .payloadSize = payloadSize,
+                    .payload = std::move(payload),
+                };
+            };
+
+            t.Equals(
+                static_cast<uint32_t>(
+                    processor.process(
+                        makeCommand(GsBarrierCommand{}, 1u, 1u))
+                        .disposition),
+                static_cast<uint32_t>(
+                    GsCommandDisposition::Completed),
+                "the initial in-order command should complete");
+            t.Equals(
+                static_cast<uint32_t>(
+                    processor.process(
+                        makeCommand(GsResetCommand{}, 2u, 2u))
+                        .disposition),
+                static_cast<uint32_t>(
+                    GsCommandDisposition::OutOfOrder),
+                "a new generation must begin at sequence one");
+            t.Equals(processor.generation(), 1ull,
+                     "a rejected generation start must not retire the current generation");
+            t.Equals(
+                static_cast<uint32_t>(
+                    processor.process(
+                        makeCommand(GsResetCommand{}, 1u, 2u))
+                        .disposition),
+                static_cast<uint32_t>(
+                    GsCommandDisposition::Completed),
+                "reset should begin exactly the next generation at sequence one");
+            t.Equals(
+                static_cast<uint32_t>(
+                    processor.process(
+                        makeCommand(GsResetCommand{}, 2u, 2u))
+                        .disposition),
+                static_cast<uint32_t>(
+                    GsCommandDisposition::FutureGeneration),
+                "reset without a generation increment should be rejected");
+
+            const GsCommandResult stale = processor.process(
+                makeCommand(
+                    GsWriteRegisterCommand{
+                        .address = GS_REG_SCANMSK,
+                        .value = 1u,
+                    },
+                    2u, 1u));
+            t.Equals(
+                static_cast<uint32_t>(stale.disposition),
+                static_cast<uint32_t>(
+                    GsCommandDisposition::StaleGeneration),
+                "queued work from the retired generation should be rejected");
+            const GsCommandResult future = processor.process(
+                makeCommand(GsResetCommand{}, 1u, 4u));
+            t.Equals(
+                static_cast<uint32_t>(future.disposition),
+                static_cast<uint32_t>(
+                    GsCommandDisposition::FutureGeneration),
+                "a skipped generation should be rejected");
+            const GsCommandResult reordered = processor.process(
+                makeCommand(
+                    GsWriteRegisterCommand{
+                        .address = GS_REG_SCANMSK,
+                        .value = 2u,
+                    },
+                    3u, 2u));
+            t.Equals(
+                static_cast<uint32_t>(reordered.disposition),
+                static_cast<uint32_t>(
+                    GsCommandDisposition::OutOfOrder),
+                "a sequence gap should be rejected");
+
+            GsCommand malformed = makeCommand(
+                GsWriteRegisterCommand{
+                    .address = GS_REG_SCANMSK,
+                    .value = 3u,
+                },
+                2u, 2u);
+            malformed.type = GsCommandType::Barrier;
+            t.Equals(
+                static_cast<uint32_t>(
+                    processor.process(std::move(malformed))
+                        .disposition),
+                static_cast<uint32_t>(
+                    GsCommandDisposition::Malformed),
+                "a mismatched type and payload should fail closed");
+            t.Equals(processor.completedSequence(), 1ull,
+                     "rejected commands must not advance the new generation");
+
+            GsDrainBatchCommand invalidBatch{};
+            invalidBatch.batch.storage[2] = {
+                0x01u, 0x02u, 0x03u, 0x04u};
+            invalidBatch.batch.packets.push_back(
+                GifArbiterDrainBatch::Packet{
+                    .pathId = GifPathId::Path2,
+                    .storageIndex = 2u,
+                    .offset = 3u,
+                    .size = 2u,
+                });
+            t.Equals(
+                static_cast<uint32_t>(
+                    processor.process(
+                        makeCommand(
+                            std::move(invalidBatch),
+                            2u, 2u))
+                        .disposition),
+                static_cast<uint32_t>(
+                    GsCommandDisposition::Malformed),
+                "an owned packet span outside its backing storage should fail closed");
+            t.Equals(processor.completedSequence(), 1ull,
+                     "an invalid owned span must not retire its command");
+
+            const GsCommandResult accepted = processor.process(
+                makeCommand(
+                    GsWriteRegisterCommand{
+                        .address = GS_REG_SCANMSK,
+                        .value = 2u,
+                    },
+                    2u, 2u));
+            t.IsTrue(accepted.completed(),
+                     "the missing in-order command should remain admissible");
+            t.Equals(gs.captureReplayState().scanMask,
+                     static_cast<uint8_t>(2u),
+                     "only accepted current-generation work should mutate GS state");
+        });
+
+        tc.Run("inline GS reset and restore start fresh command generations", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(
+                vram.data(), static_cast<uint32_t>(vram.size()),
+                nullptr);
+            GsCommandProcessor processor(gs);
+            InlineGsExecutor executor(processor);
+
+            (void)executor.submit(
+                GsWriteRegisterCommand{
+                    .address = GS_REG_SCANMSK,
+                    .value = 3u,
+                });
+            GsReplayState saved =
+                takeGsCommandResult<GsReplayStateResult>(
+                    executor.submit(GsCaptureReplayStateCommand{}))
+                    .state;
+
+            const GsCommandResult reset =
+                executor.submit(GsResetCommand{});
+            t.Equals(reset.identity.generation, 2ull,
+                     "reset should increment the executor generation");
+            t.Equals(reset.identity.sequence, 1ull,
+                     "reset should restart sequencing in its generation");
+            t.Equals(
+                takeGsCommandResult<GsReplayStateResult>(
+                    executor.submit(GsCaptureReplayStateCommand{}))
+                    .state.scanMask,
+                static_cast<uint8_t>(0u),
+                "reset should clear the saved frontend register");
+
+            const GsCommandResult restored =
+                executor.submit(
+                    GsRestoreReplayStateCommand{
+                        .state = std::move(saved)});
+            t.IsTrue(
+                takeGsCommandResult<GsBooleanResult>(restored).value,
+                "the typed restore command should accept its snapshot");
+            t.Equals(restored.identity.generation, 3ull,
+                     "restore should invalidate the preceding generation");
+            t.Equals(restored.identity.sequence, 1ull,
+                     "restore should restart sequencing in its generation");
+            t.Equals(
+                takeGsCommandResult<GsReplayStateResult>(
+                    executor.submit(GsCaptureReplayStateCommand{}))
+                    .state.scanMask,
+                static_cast<uint8_t>(3u),
+                     "restore should reproduce the captured frontend state");
+        });
+
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+        tc.Run("inline GS diagnostics reject a second hot producer thread", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(
+                vram.data(), static_cast<uint32_t>(vram.size()),
+                nullptr);
+            GsCommandProcessor processor(gs);
+            InlineGsExecutor executor(processor);
+
+            (void)executor.submit(
+                GsWriteRegisterCommand{
+                    .address = GS_REG_SCANMSK,
+                    .value = 1u,
+                });
+
+            std::atomic<bool> rejected{false};
+            std::thread secondProducer([&]
+            {
+                try
+                {
+                    (void)executor.submit(
+                        GsWriteRegisterCommand{
+                            .address = GS_REG_SCANMSK,
+                            .value = 2u,
+                        });
+                }
+                catch (const std::logic_error &)
+                {
+                    rejected.store(true, std::memory_order_release);
+                }
+            });
+            secondProducer.join();
+
+            t.IsTrue(
+                rejected.load(std::memory_order_acquire),
+                "hot commands from another producer thread must fail before GS mutation");
+            t.Equals(
+                takeGsCommandResult<GsReplayStateResult>(
+                    executor.submit(GsCaptureReplayStateCommand{}))
+                    .state.scanMask,
+                static_cast<uint8_t>(1u),
+                "the rejected producer must not mutate GS state");
+        });
+#endif
 
         tc.Run("GS replay state resumes partial host-to-local transfers", [](TestCase &t)
         {

@@ -1914,7 +1914,11 @@ namespace
             return;
         for (size_t i = 0; i < pairCount; ++i)
         {
-            runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);
+            (void)runtime->submitEeGsCommand(
+                GsWriteRegisterCommand{
+                    .address = static_cast<uint8_t>(
+                        pairs[i].reg & 0xFFu),
+                    .value = pairs[i].value});
         }
     }
 

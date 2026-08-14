@@ -1254,7 +1254,8 @@ static void UploadFrame(
         currentTick != state.lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        (void)rt->submitGsCommand(
+            GsLatchPresentationCommand{});
         state.lastPresentationTick = currentTick;
         state.hasLatchedInitialFrame = true;
     }
@@ -1271,18 +1272,18 @@ static void UploadFrame(
         return;
     }
 
-    state.scratch.clear();
-    uint32_t width = 0u;
-    uint32_t height = 0u;
-    uint32_t displayFbp = 0u;
-    uint32_t sourceFbp = 0u;
-    bool usedPreferredDisplaySource = false;
-    if (!rt->gs().copyLatchedHostPresentationFrame(state.scratch,
-                                                   width,
-                                                   height,
-                                                   &displayFbp,
-                                                   &sourceFbp,
-                                                   &usedPreferredDisplaySource))
+    GsPresentationResult frame =
+        takeGsCommandResult<GsPresentationResult>(
+            rt->submitGsCommand(
+                GsCopyPresentationCommand{}));
+    state.scratch = std::move(frame.pixels);
+    const uint32_t width = frame.width;
+    const uint32_t height = frame.height;
+    const uint32_t displayFbp = frame.displayFbp;
+    const uint32_t sourceFbp = frame.sourceFbp;
+    const bool usedPreferredDisplaySource =
+        frame.usedPreferred;
+    if (!frame.available)
     {
         Image blank = GenImageColor(
             FB_WIDTH, DEFAULT_DISPLAY_HEIGHT, MAGENTA);
@@ -1350,7 +1351,8 @@ PS2Runtime::PS2Runtime()
 }
 
 PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
-    : m_vu0(VuUnitId::Vu0),
+    : m_gsCommandProcessor(m_gs),
+      m_vu0(VuUnitId::Vu0),
       m_vu1(VuUnitId::Vu1),
       m_cpuContext(
           R5900Context::InitializationProfile::PostBiosElf)
@@ -1360,6 +1362,17 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     {
         throw std::runtime_error(
             "generated EE function table uses an incompatible fast/precise ABI");
+    }
+
+    switch (configuration.gsExecutionMode)
+    {
+    case GsExecutionMode::Inline:
+        m_gsExecutor = std::make_unique<InlineGsExecutor>(
+            m_gsCommandProcessor);
+        break;
+    default:
+        throw std::invalid_argument(
+            "unsupported GS execution mode");
     }
 
     m_memory.installPostBiosTlbState();
@@ -1430,12 +1443,6 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<ps2_stubs::PadRuntimeState>();
     m_sifRuntimeState =
         std::make_unique<ps2_stubs::SifRuntimeState>();
-    m_gs.setVSyncTickProvider(
-        [this]()
-        {
-            return ps2_syscalls::GetCurrentVSyncTick(
-                this);
-        });
     m_eeThreadRuntimeState =
         std::make_unique<EeThreadRuntimeState>(
             allocateEeThreadRuntimeGeneration());
@@ -1829,7 +1836,6 @@ PS2Runtime::~PS2Runtime()
             CloseWindow();
         }
 
-        m_gs.setVSyncTickProvider({});
         m_loadedModules.clear();
     }
     catch (const std::exception &e)
@@ -3061,6 +3067,31 @@ void PS2Runtime::resetIop()
 ps2x::timing::EeTick PS2Runtime::currentEeTick() const noexcept
 {
     return m_eeTimeline.now();
+}
+
+GsCommandResult PS2Runtime::submitGsCommand(
+    GsCommandPayload payload,
+    uint64_t publicationToken)
+{
+    return m_gsExecutor->submit(
+        std::move(payload),
+        m_publishedGsGuestTick.load(
+            std::memory_order_acquire),
+        publicationToken,
+        ps2_syscalls::GetCurrentVSyncTick(this));
+}
+
+GsCommandResult PS2Runtime::submitEeGsCommand(
+    GsCommandPayload payload,
+    uint64_t publicationToken)
+{
+    const uint64_t guestTick = currentEeTick().raw();
+    m_publishedGsGuestTick.store(
+        guestTick, std::memory_order_release);
+    return m_gsExecutor->submit(
+        std::move(payload), guestTick,
+        publicationToken,
+        ps2_syscalls::GetCurrentVSyncTick(this));
 }
 
 void PS2Runtime::cancelEeCounterEvent() noexcept
@@ -4414,6 +4445,8 @@ void PS2Runtime::resetEeTimingUnlocked(
         }
     }
     m_eeTimeline.reset();
+    m_publishedGsGuestTick.store(
+        0u, std::memory_order_release);
     m_eeEventScheduler.reset();
     m_eeBranchHistoryTags = {};
     m_eeBranchHistoryStates = {};
@@ -4588,14 +4621,18 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.reset();
-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
-    m_gifArbiter.setDrainCallbacks([this]
-                                   { m_gs.beginRenderBatch(); },
-                                   [this]
-                                   {
-                                       m_gs.endRenderSubmissionBatch();
-                                   });
+    m_gifArbiter.setProcessBatchFn(
+        [this](GifArbiterDrainBatch batch)
+        {
+            GsDrainBatchCommand command{};
+            command.batch = std::move(batch);
+            GsCommandResult result =
+                submitEeGsCommand(std::move(command));
+            m_gifArbiter.recycleDrainBatch(
+                std::move(takeGsCommandResult<GsDrainBatchResult>(
+                    std::move(result))
+                    .batch));
+        });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVif1GifPathAvailableCallback(
         [this](bool directHl)
@@ -13606,8 +13643,11 @@ void PS2Runtime::run()
     const char *const gsHistoryDumpPath = std::getenv(GS_HISTORY_DUMP_ENV);
     if (gsHistoryDumpPath && gsHistoryDumpPath[0] != '\0')
     {
-        m_gs.clearDebugHistory();
-        m_gs.setDebugHistoryPaused(false);
+        (void)submitGsCommand(
+            GsClearDebugHistoryCommand{});
+        (void)submitGsCommand(
+            GsSetDebugHistoryPausedCommand{
+                .paused = false});
     }
 
     std::clog
@@ -13699,7 +13739,10 @@ void PS2Runtime::run()
         m_debugVSyncFields.load(
             std::memory_order_relaxed);
     uint64_t windowTitleSamplePresentations =
-        m_gs.getProgressSnapshot().presentations;
+        takeGsCommandResult<GsProgressSnapshotResult>(
+            submitGsCommand(
+                GsProgressSnapshotCommand{}))
+            .snapshot.presentations;
     uint64_t windowTitleSamplePeriodCycles =
         m_debugVSyncPeriodCycles.load(
             std::memory_order_relaxed);
@@ -13819,8 +13862,10 @@ void PS2Runtime::run()
                 m_debugVSyncFields.load(
                     std::memory_order_relaxed);
             const uint64_t currentPresentations =
-                m_gs.getProgressSnapshot()
-                    .presentations;
+                takeGsCommandResult<GsProgressSnapshotResult>(
+                    submitGsCommand(
+                        GsProgressSnapshotCommand{}))
+                    .snapshot.presentations;
             const uint64_t currentPeriodCycles =
                 m_debugVSyncPeriodCycles.load(
                     std::memory_order_relaxed);
@@ -14005,9 +14050,19 @@ void PS2Runtime::run()
 
     if (gsHistoryDumpPath && gsHistoryDumpPath[0] != '\0')
     {
-        m_gs.setDebugHistoryPaused(true);
-        const GSDebugSnapshot snapshot = m_gs.getDebugSnapshot();
-        const std::vector<GSDebugHistoryEntry> history = m_gs.getDebugHistory();
+        (void)submitGsCommand(
+            GsSetDebugHistoryPausedCommand{
+                .paused = true});
+        const GSDebugSnapshot snapshot =
+            takeGsCommandResult<GsDebugSnapshotResult>(
+                submitGsCommand(
+                    GsDebugSnapshotCommand{}))
+                .snapshot;
+        const std::vector<GSDebugHistoryEntry> history =
+            takeGsCommandResult<GsDebugHistoryResult>(
+                submitGsCommand(
+                    GsDebugHistoryCommand{}))
+                .entries;
         std::ofstream out(gsHistoryDumpPath, std::ios::out | std::ios::trunc);
         if (!out)
         {

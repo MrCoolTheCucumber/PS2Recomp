@@ -1561,7 +1561,11 @@ namespace
     void drawGsTab(PS2Runtime &runtime)
     {
         GSRegisters &regs = runtime.memory().gs();
-        const GSDebugSnapshot gs = runtime.gs().getDebugSnapshot();
+        const GSDebugSnapshot gs =
+            takeGsCommandResult<GsDebugSnapshotResult>(
+                runtime.submitGsCommand(
+                    GsDebugSnapshotCommand{}))
+                .snapshot;
 
         ImGui::SeparatorText("GS private registers");
         if (ImGui::BeginTable("gspriv", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
@@ -1629,8 +1633,16 @@ namespace
         drawGsContext("Context 1", gs.ctx[1]);
 
         ImGui::SeparatorText("GS history");
-        bool gsHistoryPaused = runtime.gs().isDebugHistoryPaused();
-        std::vector<GSDebugHistoryEntry> history = runtime.gs().getDebugHistory();
+        bool gsHistoryPaused =
+            takeGsCommandResult<GsBooleanResult>(
+                runtime.submitGsCommand(
+                    GsDebugHistoryPausedCommand{}))
+                .value;
+        std::vector<GSDebugHistoryEntry> history =
+            takeGsCommandResult<GsDebugHistoryResult>(
+                runtime.submitGsCommand(
+                    GsDebugHistoryCommand{}))
+                .entries;
         uint32_t latestFrame = 0u;
         if (!history.empty())
         {
@@ -1646,14 +1658,17 @@ namespace
         ImGui::SameLine();
         if (ImGui::Button("Clear GS history"))
         {
-            runtime.gs().clearDebugHistory();
+            (void)runtime.submitGsCommand(
+                GsClearDebugHistoryCommand{});
             history.clear();
             latestFrame = 0u;
         }
         ImGui::SameLine();
         if (ImGui::Checkbox("Pause capture", &gsHistoryPaused))
         {
-            runtime.gs().setDebugHistoryPaused(gsHistoryPaused);
+            (void)runtime.submitGsCommand(
+                GsSetDebugHistoryPausedCommand{
+                    .paused = gsHistoryPaused});
         }
         ImGui::SameLine();
         if (ImGui::Button("Dump GS TXT"))

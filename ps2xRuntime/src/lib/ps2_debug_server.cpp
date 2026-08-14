@@ -641,7 +641,11 @@ struct PS2DebugServer::Impl
     {
         const PS2Runtime::DebugRuntimeProgress core =
             runtime.debugRuntimeProgress();
-        const GSProgressSnapshot gs = runtime.gs().getProgressSnapshot();
+        const GSProgressSnapshot gs =
+            takeGsCommandResult<GsProgressSnapshotResult>(
+                runtime.submitGsCommand(
+                    GsProgressSnapshotCommand{}))
+                .snapshot;
         const VuProgressSnapshot vu0 =
             runtime.vu0().getProgressSnapshot();
         const VuProgressSnapshot vu1 =
@@ -959,7 +963,10 @@ struct PS2DebugServer::Impl
         const PS2Runtime::DebugRuntimeProgress core =
             runtime.debugRuntimeProgress();
         const GSProgressSnapshot gsProgress =
-            runtime.gs().getProgressSnapshot();
+            takeGsCommandResult<GsProgressSnapshotResult>(
+                runtime.submitGsCommand(
+                    GsProgressSnapshotCommand{}))
+                .snapshot;
         const VuProgressSnapshot vu0Progress =
             runtime.vu0().getProgressSnapshot();
         const VuProgressSnapshot vu1Progress =
@@ -3492,7 +3499,8 @@ struct PS2DebugServer::Impl
             throw RequestError(
                 -32001, "GS history can only be cleared while paused");
         }
-        runtime.gs().clearDebugHistory();
+        (void)runtime.submitGsCommand(
+            GsClearDebugHistoryCommand{});
         Value result(rapidjson::kObjectType);
         result.AddMember("cleared", true, allocator);
         return result;
@@ -3729,7 +3737,11 @@ struct PS2DebugServer::Impl
                       Value &artifacts,
                       Allocator &allocator)
     {
-        const GSDebugSnapshot snapshot = runtime.gs().getDebugSnapshot();
+        const GSDebugSnapshot snapshot =
+            takeGsCommandResult<GsDebugSnapshotResult>(
+                runtime.submitGsCommand(
+                    GsDebugSnapshotCommand{}))
+                .snapshot;
         Document document;
         document.SetObject();
         Allocator &stateAllocator = document.GetAllocator();
@@ -3794,7 +3806,11 @@ struct PS2DebugServer::Impl
                      Value &artifacts,
                      Allocator &allocator)
     {
-        std::vector<GSDebugHistoryEntry> history = runtime.gs().getDebugHistory();
+        std::vector<GSDebugHistoryEntry> history =
+            takeGsCommandResult<GsDebugHistoryResult>(
+                runtime.submitGsCommand(
+                    GsDebugHistoryCommand{}))
+                .entries;
         if (history.size() > historyLimit)
         {
             history.erase(history.begin(),
@@ -4043,17 +4059,18 @@ struct PS2DebugServer::Impl
                         Value &artifacts,
                         Allocator &allocator)
     {
-        std::vector<uint8_t> stream;
-        std::vector<uint32_t> sizes;
-        std::vector<uint8_t> initialVram;
-        GsReplayState initialState{};
-        runtime.gs().copyRecentGifPackets(
-            static_cast<size_t>(std::min<uint64_t>(
-                historyLimit, std::numeric_limits<size_t>::max())),
-            stream,
-            sizes,
-            initialVram,
-            &initialState);
+        GsRecentGifPacketsResult packets =
+            takeGsCommandResult<GsRecentGifPacketsResult>(
+                runtime.submitGsCommand(
+                    GsRecentGifPacketsCommand{
+                        .limit = static_cast<size_t>(
+                            std::min<uint64_t>(
+                                historyLimit,
+                                std::numeric_limits<size_t>::max()))}));
+        std::vector<uint8_t> &stream = packets.stream;
+        std::vector<uint32_t> &sizes = packets.sizes;
+        std::vector<uint8_t> &initialVram = packets.initialVram;
+        GsReplayState &initialState = packets.initialState;
         if (sizes.empty())
             return;
 
@@ -4114,11 +4131,14 @@ struct PS2DebugServer::Impl
                          Value &artifacts,
                          Allocator &allocator)
     {
-        std::vector<uint8_t> pixels;
-        uint32_t width = 0u;
-        uint32_t height = 0u;
-        if (!runtime.gs().copyLatchedHostPresentationFrame(
-                pixels, width, height) ||
+        GsPresentationResult frame =
+            takeGsCommandResult<GsPresentationResult>(
+                runtime.submitGsCommand(
+                    GsCopyPresentationCommand{}));
+        std::vector<uint8_t> &pixels = frame.pixels;
+        const uint32_t width = frame.width;
+        const uint32_t height = frame.height;
+        if (!frame.available ||
             width == 0u || height == 0u ||
             pixels.size() < static_cast<size_t>(width) * height * 4u)
         {
@@ -4944,10 +4964,15 @@ struct PS2DebugServer::Impl
         }
 
         stopped.store(false, std::memory_order_release);
-        runtime.gs().clearDebugHistory();
-        runtime.gs().setDebugHistoryPaused(
-            environmentFlagEnabled("PS2DBG_PAUSE_GS_HISTORY"));
-        runtime.gs().setProgressTrackingEnabled(true);
+        (void)runtime.submitGsCommand(
+            GsClearDebugHistoryCommand{});
+        (void)runtime.submitGsCommand(
+            GsSetDebugHistoryPausedCommand{
+                .paused = environmentFlagEnabled(
+                    "PS2DBG_PAUSE_GS_HISTORY")});
+        (void)runtime.submitGsCommand(
+            GsSetProgressTrackingCommand{
+                .enabled = true});
         runtime.vu0().setProgressTrackingEnabled(true);
         runtime.vu1().setProgressTrackingEnabled(true);
         thread = std::thread([this]()
@@ -4994,10 +5019,14 @@ struct PS2DebugServer::Impl
         {
             watchdogThread.join();
         }
-        runtime.gs().setProgressTrackingEnabled(false);
+        (void)runtime.submitGsCommand(
+            GsSetProgressTrackingCommand{
+                .enabled = false});
         runtime.vu0().setProgressTrackingEnabled(false);
         runtime.vu1().setProgressTrackingEnabled(false);
-        runtime.gs().setDebugHistoryPaused(true);
+        (void)runtime.submitGsCommand(
+            GsSetDebugHistoryPausedCommand{
+                .paused = true});
         if (!socketPath.empty())
         {
             unlink(socketPath.c_str());
