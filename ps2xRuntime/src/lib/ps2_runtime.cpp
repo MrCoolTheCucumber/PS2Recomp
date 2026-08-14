@@ -3576,6 +3576,15 @@ PS2Runtime::vu1AsyncStatistics() const
         .maximumEventWaitNanoseconds =
             m_vu1AsyncMaximumEventWaitNanoseconds.load(
                 std::memory_order_acquire),
+        .budgetFallbackCount =
+            m_vu1AsyncBudgetFallbackCount.load(
+                std::memory_order_acquire),
+        .budgetFallbackCycleDelta =
+            m_vu1AsyncBudgetFallbackCycleDelta.load(
+                std::memory_order_acquire),
+        .budgetFallbackWaitNanoseconds =
+            m_vu1AsyncBudgetFallbackWaitNanoseconds.load(
+                std::memory_order_acquire),
         .hazardBarrierCount =
             m_vu1AsyncHazardBarrierCount.load(
                 std::memory_order_acquire),
@@ -6483,7 +6492,8 @@ void PS2Runtime::enqueueVu1SpeculativeSlice(
 
 Vu1CommandResult
 PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
-    const ps2x::timing::EeEventService &service)
+    const ps2x::timing::EeEventService &service,
+    uint32_t cycleBudget)
 {
     if (m_vu1SpeculationPublicationState !=
             Vu1SpeculationPublicationState::Unpublished ||
@@ -6497,12 +6507,14 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
         m_pendingVu1Slice->plan.executionGeneration !=
             m_vu1ExecutionTiming.generation ||
         m_pendingVu1Slice->plan.deadline !=
-            service.serviceTick)
+            service.scheduledTick)
     {
         throw std::logic_error(
             "VU1 speculative result does not match its event");
     }
 
+    const uint32_t speculativeCycleBudget =
+        m_pendingVu1Slice->plan.cycleBudget;
     Vu1CommandSubmission submission =
         std::move(m_pendingVu1Slice->submission);
     m_pendingVu1Slice.reset();
@@ -6510,9 +6522,68 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
         false, std::memory_order_release);
     const bool ready = submission.ready();
     const auto waitAt = std::chrono::steady_clock::now();
-    Vu1CommandResult result =
+    Vu1CommandResult speculativeResult =
         m_threadedVu1Executor->wait(
             std::move(submission));
+    if (speculativeResult.identity.publicationToken !=
+            service.generation ||
+        speculativeResult.identity.guestTick !=
+            service.scheduledTick.raw() ||
+        speculativeResult.digest.type !=
+            Vu1CommandType::AdvanceSlice ||
+        !std::holds_alternative<Vu1SliceResult>(
+            speculativeResult.payload))
+    {
+        throw std::logic_error(
+            "VU1 speculative event returned an invalid result");
+    }
+
+    Vu1CommandResult result{};
+    if (speculativeCycleBudget == cycleBudget)
+    {
+        result = std::move(speculativeResult);
+        m_vu1SpeculationPublicationState =
+            Vu1SpeculationPublicationState::Published;
+    }
+    else
+    {
+        result = m_threadedVu1Executor->submitResolvingSpeculation(
+            Vu1AdvanceSliceCommand{
+                .maximumCycles = cycleBudget,
+            },
+            Vu1SpeculationResolution::Rollback,
+            service.serviceTick.raw(),
+            service.generation);
+        m_vu1SpeculationPublicationState =
+            Vu1SpeculationPublicationState::None;
+        const uint64_t cycleDelta =
+            cycleBudget >= speculativeCycleBudget
+                ? static_cast<uint64_t>(
+                      cycleBudget - speculativeCycleBudget)
+                : static_cast<uint64_t>(
+                      speculativeCycleBudget - cycleBudget);
+        m_vu1AsyncBudgetFallbackCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        m_vu1AsyncBudgetFallbackCycleDelta.fetch_add(
+            cycleDelta, std::memory_order_relaxed);
+    }
+
+    const uint64_t expectedResultGuestTick =
+        speculativeCycleBudget == cycleBudget
+            ? service.scheduledTick.raw()
+            : service.serviceTick.raw();
+    if (result.identity.publicationToken !=
+            service.generation ||
+        result.identity.guestTick != expectedResultGuestTick ||
+        result.digest.type !=
+            Vu1CommandType::AdvanceSlice ||
+        !std::holds_alternative<Vu1SliceResult>(
+            result.payload))
+    {
+        throw std::logic_error(
+            "VU1 event returned an invalid published result");
+    }
+
     const uint64_t waitNanoseconds =
         static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -6525,6 +6596,11 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
     updateAtomicMaximum(
         m_vu1AsyncMaximumEventWaitNanoseconds,
         waitNanoseconds);
+    if (speculativeCycleBudget != cycleBudget)
+    {
+        m_vu1AsyncBudgetFallbackWaitNanoseconds.fetch_add(
+            waitNanoseconds, std::memory_order_relaxed);
+    }
     if (ready)
     {
         m_vu1AsyncResultsReadyAtEvent.fetch_add(
@@ -6534,18 +6610,6 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
     {
         m_vu1AsyncResultsLateAtEvent.fetch_add(
             1u, std::memory_order_relaxed);
-    }
-    if (result.identity.publicationToken !=
-            service.generation ||
-        result.identity.guestTick !=
-            service.serviceTick.raw() ||
-        result.digest.type !=
-            Vu1CommandType::AdvanceSlice ||
-        !std::holds_alternative<Vu1SliceResult>(
-            result.payload))
-    {
-        throw std::logic_error(
-            "VU1 speculative event returned an invalid result");
     }
     return result;
 }
@@ -7066,18 +7130,15 @@ void PS2Runtime::serviceVU1AtEvent(
     if (m_vu1ExecutionMode ==
         Vu1ExecutionMode::ThreadedAsync)
     {
-        if (!m_pendingVu1Slice ||
-            m_pendingVu1Slice->plan.cycleBudget !=
-                cycleBudget)
+        if (!m_pendingVu1Slice)
         {
             throw std::logic_error(
-                "VU1 speculative cycle budget does not match its event");
+                "VU1 event has no pending speculative slice");
         }
         commandResult =
-            consumeVu1SpeculativeSliceAtEvent(service);
+            consumeVu1SpeculativeSliceAtEvent(
+                service, cycleBudget);
         publishVu1CommandResult(commandResult);
-        m_vu1SpeculationPublicationState =
-            Vu1SpeculationPublicationState::Published;
         m_vu1AsyncSlicesPublished.fetch_add(
             1u, std::memory_order_relaxed);
     }

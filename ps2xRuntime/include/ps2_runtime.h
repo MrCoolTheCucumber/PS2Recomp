@@ -142,6 +142,9 @@ struct Vu1AsyncRuntimeStatistics
     uint64_t eventWaitCount = 0u;
     uint64_t eventWaitNanoseconds = 0u;
     uint64_t maximumEventWaitNanoseconds = 0u;
+    uint64_t budgetFallbackCount = 0u;
+    uint64_t budgetFallbackCycleDelta = 0u;
+    uint64_t budgetFallbackWaitNanoseconds = 0u;
     uint64_t hazardBarrierCount = 0u;
     uint64_t hazardWaitNanoseconds = 0u;
     uint64_t hazardRequeueCount = 0u;
@@ -2470,7 +2473,8 @@ private:
         Vu1SpeculationResolution previousResolution);
     [[nodiscard]] Vu1CommandResult
     consumeVu1SpeculativeSliceAtEvent(
-        const ps2x::timing::EeEventService &service);
+        const ps2x::timing::EeEventService &service,
+        uint32_t cycleBudget);
     void resolveVu1SpeculationForShutdown() noexcept;
     [[nodiscard]] Vu1CommandResult submitVu1Command(
         Vu1CommandPayload payload,
@@ -2758,6 +2762,9 @@ private:
     std::atomic<uint64_t> m_vu1AsyncEventWaitCount{0u};
     std::atomic<uint64_t> m_vu1AsyncEventWaitNanoseconds{0u};
     std::atomic<uint64_t> m_vu1AsyncMaximumEventWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_vu1AsyncBudgetFallbackCount{0u};
+    std::atomic<uint64_t> m_vu1AsyncBudgetFallbackCycleDelta{0u};
+    std::atomic<uint64_t> m_vu1AsyncBudgetFallbackWaitNanoseconds{0u};
     std::atomic<uint64_t> m_vu1AsyncHazardBarrierCount{0u};
     std::atomic<uint64_t> m_vu1AsyncHazardWaitNanoseconds{0u};
     std::atomic<uint64_t> m_vu1AsyncHazardRequeueCount{0u};

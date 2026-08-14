@@ -2426,6 +2426,121 @@ void register_ps2_vu1_command_stream_tests()
                      "the event should report its forced host wait");
         });
 
+        tc.Run("runtime recomputes a speculative slice at a late EE service boundary", [](TestCase &t)
+        {
+            struct RunResult
+            {
+                uint64_t architecturalHash = 0u;
+                PS2Runtime::DebugVu1Timing timing{};
+                Vu1AsyncRuntimeStatistics statistics{};
+            };
+            const auto run =
+                [&](Vu1ExecutionMode mode) -> RunResult
+                {
+                    PS2RuntimeConfiguration configuration =
+                        defaultPs2RuntimeConfiguration();
+                    configuration.vu1ExecutionMode = mode;
+                    configuration.vu1CommandQueueCapacity = 1u;
+                    configuration.vu1CommandPayloadCapacityBytes =
+                        1024u * 1024u;
+                    configuration.captureVu1ArchitecturalStateHashes =
+                        true;
+                    PS2Runtime runtime(configuration);
+                    if (!runtime.memory().initialize() ||
+                        !runtime.syncCoreSubsystems())
+                    {
+                        t.Fail("late-service runtime should initialize");
+                        return {};
+                    }
+
+                    constexpr uint32_t kWorkPairs = 64u;
+                    for (uint32_t pair = 0u;
+                         pair < kWorkPairs; ++pair)
+                    {
+                        writeRuntimeVu1InstructionPair(
+                            runtime, pair * 8u,
+                            makeVuIaddiu(1u, 1u, 1),
+                            pair + 1u == kWorkPairs
+                                ? kVuUpperEnd
+                                : kVuUpperNop);
+                    }
+                    writeRuntimeVu1InstructionPair(
+                        runtime, kWorkPairs * 8u,
+                        0u, kVuUpperNop);
+                    const uint32_t mscal =
+                        makeVifCommand(0x14u, 0u, 0u);
+                    runtime.memory().processVIF1Data(
+                        reinterpret_cast<const uint8_t *>(&mscal),
+                        sizeof(mscal));
+
+                    if (mode == Vu1ExecutionMode::ThreadedAsync &&
+                        !waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return statistics.pendingSlice &&
+                                       statistics.owner.completedTickets ==
+                                           statistics.owner.submittedTickets;
+                            }))
+                    {
+                        t.Fail("the scheduled-budget slice should finish early");
+                        return {};
+                    }
+
+                    R5900Context &context = runtime.cpu();
+                    context.advanceEeCycleTicks(136u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    const std::shared_ptr<const Vu1Snapshot> snapshot =
+                        runtime.snapshotVu1Owner();
+                    return RunResult{
+                        .architecturalHash =
+                            vu1ArchitecturalStateHash(
+                                snapshot->state,
+                                snapshot->microMemory,
+                                snapshot->dataMemory,
+                                snapshot->vif,
+                                snapshot->codeGeneration),
+                        .timing = runtime.debugVu1TimingSnapshot(),
+                        .statistics = runtime.vu1AsyncStatistics(),
+                    };
+                };
+
+            const RunResult reference =
+                run(Vu1ExecutionMode::Inline);
+            const RunResult asynchronous =
+                run(Vu1ExecutionMode::ThreadedAsync);
+            t.Equals(
+                asynchronous.architecturalHash,
+                reference.architecturalHash,
+                "late service should recompute the exact inline architecture");
+            t.Equals(
+                asynchronous.timing.currentTick,
+                reference.timing.currentTick,
+                "late service should retain the canonical guest tick");
+            t.Equals(
+                asynchronous.timing.totalAdvancedCycles,
+                reference.timing.totalAdvancedCycles,
+                "late service should retain the canonical VU cycle count");
+            t.Equals(
+                asynchronous.statistics.slicesPublished, 1ull,
+                "the fallback should still publish one guest event slice");
+            t.Equals(
+                asynchronous.statistics.budgetFallbackCount, 1ull,
+                "the delayed boundary should use one budget fallback");
+            t.Equals(
+                asynchronous.statistics.budgetFallbackCycleDelta, 1ull,
+                "eight late EE ticks should add one VU cycle");
+            t.Equals(
+                asynchronous.statistics.resultsReadyAtEvent, 1ull,
+                "the discarded scheduled-budget result should be ready early");
+            t.IsTrue(
+                asynchronous.statistics.owner.speculation.rolledBackSlices >=
+                    1u,
+                "the incorrect scheduled-budget future must be rolled back");
+        });
+
         tc.Run("runtime reset cancels an in-flight speculative VU1 slice", [](TestCase &t)
         {
             std::mutex gateMutex;

@@ -1277,6 +1277,15 @@ struct PS2DebugServer::Impl
             "maximum_event_wait_ns",
             vu1Async.maximumEventWaitNanoseconds, allocator);
         vu1AsyncValue.AddMember(
+            "budget_fallback_count",
+            vu1Async.budgetFallbackCount, allocator);
+        vu1AsyncValue.AddMember(
+            "budget_fallback_cycle_delta",
+            vu1Async.budgetFallbackCycleDelta, allocator);
+        vu1AsyncValue.AddMember(
+            "budget_fallback_wait_ns",
+            vu1Async.budgetFallbackWaitNanoseconds, allocator);
+        vu1AsyncValue.AddMember(
             "hazard_barrier_count",
             vu1Async.hazardBarrierCount, allocator);
         vu1AsyncValue.AddMember(
