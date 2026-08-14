@@ -1766,6 +1766,69 @@ void register_ps2_vu1_command_stream_tests()
                      "one extended prefix should commit one checkpoint");
             t.Equals(statistics.speculation.rolledBackSlices, 0ull,
                      "late extension should not roll back its completed prefix");
+            const auto commandStatistics =
+                [&statistics](Vu1CommandType type)
+                    -> const ThreadedVu1CommandTypeStatistics &
+                {
+                    return statistics.commandTypes[
+                        vu1CommandTypeIndex(type)];
+                };
+            t.Equals(
+                commandStatistics(
+                    Vu1CommandType::AdvanceSlice).submitted,
+                2ull,
+                "the prefix and extension should be two advance transport tickets");
+            t.Equals(
+                commandStatistics(
+                    Vu1CommandType::AdvanceSlice).completed,
+                2ull,
+                "both advance transport tickets should complete");
+            t.Equals(
+                commandStatistics(
+                    Vu1CommandType::AdvanceSlice).resultWaitCount,
+                2ull,
+                "both advance transport tickets should record their waits");
+            t.Equals(
+                commandStatistics(
+                    Vu1CommandType::BindMemory).submitted,
+                1ull,
+                "binding should retain its own command-class count");
+            t.Equals(
+                commandStatistics(
+                    Vu1CommandType::MicroMemoryWrite).submitted,
+                1ull,
+                "micro upload should retain its own command-class count");
+            t.Equals(
+                commandStatistics(Vu1CommandType::Mscal).submitted,
+                1ull,
+                "MSCAL should retain its own command-class count");
+            t.Equals(
+                commandStatistics(Vu1CommandType::Snapshot).submitted,
+                1ull,
+                "snapshot should retain its own command-class count");
+            uint64_t submittedByType = 0u;
+            uint64_t completedByType = 0u;
+            uint64_t waitsByType = 0u;
+            uint64_t waitNanosecondsByType = 0u;
+            for (const ThreadedVu1CommandTypeStatistics &command :
+                 statistics.commandTypes)
+            {
+                submittedByType += command.submitted;
+                completedByType += command.completed;
+                waitsByType += command.resultWaitCount;
+                waitNanosecondsByType +=
+                    command.resultWaitNanoseconds;
+            }
+            t.Equals(submittedByType, statistics.submittedTickets,
+                     "command-class submissions should balance all tickets");
+            t.Equals(completedByType, statistics.completedTickets,
+                     "command-class completions should balance all tickets");
+            t.Equals(waitsByType, statistics.resultWaitCount,
+                     "command-class wait counts should balance the aggregate");
+            t.Equals(
+                waitNanosecondsByType,
+                statistics.resultWaitNanoseconds,
+                "command-class wait time should balance the aggregate");
         });
 
         tc.Run("threaded VU1 rolls back an unpublished slice before a hazard", [](TestCase &t)

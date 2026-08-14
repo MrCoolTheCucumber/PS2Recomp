@@ -1399,6 +1399,31 @@ struct PS2DebugServer::Impl
         vu1OwnerValue.AddMember(
             "result_wait_ns",
             vu1OwnerStats.resultWaitNanoseconds, allocator);
+        Value vu1CommandTypesValue(rapidjson::kObjectType);
+        for (size_t index = 0u;
+             index < kVu1CommandTypeCount; ++index)
+        {
+            const Vu1CommandType type =
+                static_cast<Vu1CommandType>(index);
+            const ThreadedVu1CommandTypeStatistics &statistics =
+                vu1OwnerStats.commandTypes[index];
+            Value commandValue(rapidjson::kObjectType);
+            commandValue.AddMember(
+                "submitted", statistics.submitted, allocator);
+            commandValue.AddMember(
+                "completed", statistics.completed, allocator);
+            commandValue.AddMember(
+                "result_wait_count",
+                statistics.resultWaitCount, allocator);
+            commandValue.AddMember(
+                "result_wait_ns",
+                statistics.resultWaitNanoseconds, allocator);
+            vu1CommandTypesValue.AddMember(
+                Value(vu1CommandTypeName(type), allocator),
+                commandValue, allocator);
+        }
+        vu1OwnerValue.AddMember(
+            "command_types", vu1CommandTypesValue, allocator);
         vu1OwnerValue.AddMember(
             "started", vu1OwnerStats.started, allocator);
         vu1OwnerValue.AddMember(

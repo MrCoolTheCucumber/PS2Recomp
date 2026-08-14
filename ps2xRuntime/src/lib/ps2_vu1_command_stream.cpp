@@ -2620,9 +2620,11 @@ Vu1CommandResult InlineVu1Executor::submitVifStateUpdate(
 Vu1CommandSubmission::Vu1CommandSubmission(
     uint64_t ticket,
     Vu1WorkIdentity identity,
+    Vu1CommandType type,
     std::future<Vu1CommandResult> completion)
     : m_ticket(ticket),
       m_identity(identity),
+      m_type(type),
       m_completion(std::move(completion))
 {
 }
@@ -3002,6 +3004,7 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
         .payload = std::move(payload),
     };
     const Vu1WorkIdentity identity = command.identity;
+    const Vu1CommandType commandType = command.type;
     WorkItem item{
         .ticket = ticket,
         .payloadBytes = payloadBytes,
@@ -3105,6 +3108,9 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
         generation, std::memory_order_release);
     m_submittedSequence.store(
         sequence, std::memory_order_release);
+    m_submittedCommandsByType[
+        vu1CommandTypeIndex(commandType)]
+        .fetch_add(1u, std::memory_order_relaxed);
     if (beginsSpeculativeSlice)
     {
         m_producerSpeculationCheckpoint.emplace(
@@ -3119,7 +3125,8 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
     submitLock.unlock();
 
     return Vu1CommandSubmission(
-        ticket, identity, std::move(completion));
+        ticket, identity, commandType,
+        std::move(completion));
 }
 
 Vu1CommandSubmission ThreadedVu1Executor::submitAsync(
@@ -3177,16 +3184,23 @@ ThreadedVu1Executor::commitExtendedSpeculativeAdvance(
 Vu1CommandResult ThreadedVu1Executor::wait(
     Vu1CommandSubmission submission)
 {
+    const size_t commandType =
+        vu1CommandTypeIndex(submission.type());
     const auto waitAt = std::chrono::steady_clock::now();
     Vu1CommandResult result = submission.wait();
-    m_resultWaitCount.fetch_add(
-        1u, std::memory_order_relaxed);
-    m_resultWaitNanoseconds.fetch_add(
+    const uint64_t waitNanoseconds =
         static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - waitAt)
-                .count()),
-        std::memory_order_relaxed);
+                .count());
+    m_resultWaitCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_resultWaitNanoseconds.fetch_add(
+        waitNanoseconds, std::memory_order_relaxed);
+    m_resultWaitCountByType[commandType].fetch_add(
+        1u, std::memory_order_relaxed);
+    m_resultWaitNanosecondsByType[commandType].fetch_add(
+        waitNanoseconds, std::memory_order_relaxed);
     if (result.disposition != Vu1CommandDisposition::Completed)
     {
         throw std::logic_error(
@@ -3351,6 +3365,8 @@ void ThreadedVu1Executor::workerMain() noexcept
         }
 
         signalSpaceAvailable();
+        const Vu1CommandType commandType =
+            item->command.type;
         const auto activeAt =
             std::chrono::steady_clock::now();
         try
@@ -3461,6 +3477,9 @@ void ThreadedVu1Executor::workerMain() noexcept
                 completedGeneration, std::memory_order_release);
             m_completedSequence.store(
                 completedSequence, std::memory_order_release);
+            m_completedCommandsByType[
+                vu1CommandTypeIndex(commandType)]
+                .fetch_add(1u, std::memory_order_relaxed);
             item->completion.set_value(std::move(result));
             releasePayload(item->payloadBytes);
         }
@@ -3609,6 +3628,25 @@ ThreadedVu1Executor::statistics() const
         .cancelRequested = m_cancelRequested.load(
             std::memory_order_acquire),
     };
+    for (size_t index = 0u;
+         index < kVu1CommandTypeCount; ++index)
+    {
+        result.commandTypes[index] =
+            ThreadedVu1CommandTypeStatistics{
+                .submitted =
+                    m_submittedCommandsByType[index].load(
+                        std::memory_order_acquire),
+                .completed =
+                    m_completedCommandsByType[index].load(
+                        std::memory_order_acquire),
+                .resultWaitCount =
+                    m_resultWaitCountByType[index].load(
+                        std::memory_order_acquire),
+                .resultWaitNanoseconds =
+                    m_resultWaitNanosecondsByType[index].load(
+                        std::memory_order_acquire),
+            };
+    }
     {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         result.started = m_started;

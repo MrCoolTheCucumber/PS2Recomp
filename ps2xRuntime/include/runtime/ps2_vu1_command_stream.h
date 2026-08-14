@@ -57,6 +57,15 @@ enum class Vu1CommandType : uint8_t
     Shutdown,
 };
 
+inline constexpr size_t kVu1CommandTypeCount =
+    static_cast<size_t>(Vu1CommandType::Shutdown) + 1u;
+
+[[nodiscard]] constexpr size_t vu1CommandTypeIndex(
+    Vu1CommandType type) noexcept
+{
+    return static_cast<size_t>(type);
+}
+
 [[nodiscard]] const char *vu1CommandTypeName(
     Vu1CommandType type) noexcept;
 
@@ -740,6 +749,14 @@ struct ThreadedVu1ExecutorOptions
     std::function<void(const Vu1CommandResult &, uint64_t)> beforePublish;
 };
 
+struct ThreadedVu1CommandTypeStatistics
+{
+    uint64_t submitted = 0u;
+    uint64_t completed = 0u;
+    uint64_t resultWaitCount = 0u;
+    uint64_t resultWaitNanoseconds = 0u;
+};
+
 struct ThreadedVu1ExecutorStatistics
 {
     size_t queueCapacity = 0u;
@@ -764,6 +781,9 @@ struct ThreadedVu1ExecutorStatistics
     uint64_t workerIdleNanoseconds = 0u;
     uint64_t resultWaitCount = 0u;
     uint64_t resultWaitNanoseconds = 0u;
+    std::array<ThreadedVu1CommandTypeStatistics,
+               kVu1CommandTypeCount>
+        commandTypes{};
     Vu1SpeculationStatistics speculation{};
     bool started = false;
     bool running = false;
@@ -793,6 +813,10 @@ public:
     {
         return m_identity;
     }
+    [[nodiscard]] Vu1CommandType type() const noexcept
+    {
+        return m_type;
+    }
     [[nodiscard]] Vu1CommandResult wait();
 
 private:
@@ -801,10 +825,12 @@ private:
     Vu1CommandSubmission(
         uint64_t ticket,
         Vu1WorkIdentity identity,
+        Vu1CommandType type,
         std::future<Vu1CommandResult> completion);
 
     uint64_t m_ticket = 0u;
     Vu1WorkIdentity m_identity{};
+    Vu1CommandType m_type = Vu1CommandType::Barrier;
     std::future<Vu1CommandResult> m_completion;
 };
 
@@ -961,6 +987,14 @@ private:
     std::atomic<uint64_t> m_workerIdleNanoseconds{0u};
     std::atomic<uint64_t> m_resultWaitCount{0u};
     std::atomic<uint64_t> m_resultWaitNanoseconds{0u};
+    std::array<std::atomic<uint64_t>, kVu1CommandTypeCount>
+        m_submittedCommandsByType{};
+    std::array<std::atomic<uint64_t>, kVu1CommandTypeCount>
+        m_completedCommandsByType{};
+    std::array<std::atomic<uint64_t>, kVu1CommandTypeCount>
+        m_resultWaitCountByType{};
+    std::array<std::atomic<uint64_t>, kVu1CommandTypeCount>
+        m_resultWaitNanosecondsByType{};
 };
 
 #endif
