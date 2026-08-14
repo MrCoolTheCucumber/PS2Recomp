@@ -571,7 +571,7 @@ struct PS2DebugServer::Impl
                                   std::chrono::seconds(30))
             : runtime(runtimeValue), resumeOnExit(!runtimeValue.debugIsPaused())
         {
-            if (!runtime.debugPause(timeout))
+            if (!runtime.debugPause(timeout, "debug-quiesce"))
             {
                 throw RequestError(-32002, "timed out waiting for a guest safe point");
             }
@@ -3457,6 +3457,30 @@ struct PS2DebugServer::Impl
         }
         Value result(rapidjson::kObjectType);
         addString(result, "reason", stop.reason, allocator);
+        if (!stop.pauseSource.empty())
+        {
+            addString(
+                result, "pause_source",
+                stop.pauseSource, allocator);
+        }
+        if (!stop.pauseWriter.empty())
+        {
+            addString(
+                result, "pause_writer",
+                stop.pauseWriter, allocator);
+        }
+        result.AddMember(
+            "control_generation",
+            stop.controlGeneration,
+            allocator);
+        result.AddMember(
+            "observed_control_generation",
+            stop.observedControlGeneration,
+            allocator);
+        result.AddMember(
+            "stale_boundary_stops",
+            stop.staleBoundaryStops,
+            allocator);
         addString(result, "cpu", "ee", allocator);
         addString(result, "pc", addressString(stop.pc), allocator);
         result.AddMember("fields", count, allocator);
@@ -4194,7 +4218,9 @@ struct PS2DebugServer::Impl
             const bool alreadyPaused = runtime.debugIsPaused();
             const bool quiescent =
                 alreadyPaused ||
-                runtime.debugPause(std::chrono::milliseconds(1500));
+                runtime.debugPause(
+                    std::chrono::milliseconds(1500),
+                    "watchdog-auto-bundle");
             resumeOnExit = quiescent && !alreadyPaused;
 
             std::filesystem::create_directories(partial);
@@ -4495,7 +4521,9 @@ struct PS2DebugServer::Impl
         }
         if (method == "execution.pause")
         {
-            if (!runtime.debugPause())
+            if (!runtime.debugPause(
+                    std::chrono::seconds(30),
+                    "execution.pause"))
             {
                 throw RequestError(-32002,
                                    "timed out waiting for a guest safe point");
@@ -4975,14 +5003,21 @@ struct PS2DebugServer::Impl
                 .enabled = true});
         runtime.vu0().setProgressTrackingEnabled(true);
         runtime.vu1().setProgressTrackingEnabled(true);
+        // Establish the requested initial execution state before the request
+        // thread can consume a client command. The socket is already
+        // listening here, so an eager client may queue a request, but that
+        // request must not overtake PS2DBG_START_PAUSED and leave a stale
+        // startup pause behind after execution.resume.
+        if (environmentFlagEnabled("PS2DBG_START_PAUSED"))
+        {
+            (void)runtime.debugPause(
+                std::chrono::milliseconds(0),
+                "startup");
+        }
         thread = std::thread([this]()
                              { mainLoop(); });
         watchdogThread = std::thread([this]()
                                      { watchdogLoop(); });
-        if (environmentFlagEnabled("PS2DBG_START_PAUSED"))
-        {
-            (void)runtime.debugPause(std::chrono::milliseconds(0));
-        }
         std::cout << "[ps2dbg] listening on " << socketPath << '\n';
         return true;
     }

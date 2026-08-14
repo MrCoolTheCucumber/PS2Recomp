@@ -156,6 +156,7 @@ namespace ps2x::ee
                 m_startFailure = {};
                 m_executorThreadId = {};
                 m_pausedAtBoundary = false;
+                m_debugControlGeneration = 0u;
                 m_publications.clear();
                 m_delayedPublications.clear();
                 m_nextPublicationSequence = 0u;
@@ -365,8 +366,18 @@ namespace ps2x::ee
 
         void debugRequestPause() noexcept
         {
-            m_boundaryExecutor.debugRequestPause();
-            notify();
+            const bool newlyRequested =
+                m_boundaryExecutor.debugRequestPause();
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (newlyRequested)
+                {
+                    ++m_debugControlGeneration;
+                    m_pausedAtBoundary = false;
+                }
+                ++m_wakeGeneration;
+            }
+            m_cv.notify_all();
         }
 
         [[nodiscard]] bool debugWaitUntilPaused(
@@ -390,7 +401,13 @@ namespace ps2x::ee
         void debugResume() noexcept
         {
             m_boundaryExecutor.debugResume();
-            notify();
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ++m_debugControlGeneration;
+                m_pausedAtBoundary = false;
+                ++m_wakeGeneration;
+            }
+            m_cv.notify_all();
         }
 
         [[nodiscard]] bool debugStepBoundaries(
@@ -401,7 +418,14 @@ namespace ps2x::ee
                     count);
             if (accepted)
             {
-                notify();
+                {
+                    std::lock_guard<std::mutex> lock(
+                        m_mutex);
+                    ++m_debugControlGeneration;
+                    m_pausedAtBoundary = false;
+                    ++m_wakeGeneration;
+                }
+                m_cv.notify_all();
             }
             return accepted;
         }
@@ -586,6 +610,7 @@ namespace ps2x::ee
         struct LoopSnapshot
         {
             uint64_t wakeGeneration = 0u;
+            uint64_t debugControlGeneration = 0u;
             bool stopRequested = false;
             EeSchedulerReschedulePolicy boundaryPolicy =
                 EeSchedulerReschedulePolicy::
@@ -652,6 +677,7 @@ namespace ps2x::ee
             }
             LoopSnapshot snapshot{
                 m_wakeGeneration,
+                m_debugControlGeneration,
                 m_stopRequested,
                 EeSchedulerReschedulePolicy::
                     HigherPriorityOnly,
@@ -723,13 +749,16 @@ namespace ps2x::ee
 
         [[nodiscard]] PublishedBoundaryState
         publishBoundary(
-            const EeSchedulerBoundaryResult &result)
+            const EeSchedulerBoundaryResult &result,
+            uint64_t debugControlGeneration)
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_statistics.modeledTick = result.tick;
             m_statistics.boundary =
                 m_boundaryExecutor.statistics();
             m_pausedAtBoundary =
+                debugControlGeneration ==
+                    m_debugControlGeneration &&
                 result.disposition ==
                 EeSchedulerExecutorDisposition::Paused;
             return {m_stopRequested};
@@ -833,7 +862,9 @@ namespace ps2x::ee
                     priorThreadId.reset();
                     elapsed = {};
                     const PublishedBoundaryState published =
-                        publishBoundary(boundary);
+                        publishBoundary(
+                            boundary,
+                            loop.debugControlGeneration);
                     m_cv.notify_all();
 
                     if (boundary.limitExceeded)
@@ -1057,6 +1088,7 @@ namespace ps2x::ee
         bool m_stopRequested = false;
         bool m_pausedAtBoundary = false;
         uint64_t m_wakeGeneration = 0u;
+        uint64_t m_debugControlGeneration = 0u;
         std::thread::id m_executorThreadId;
         std::deque<Publication> m_publications;
         std::deque<DelayedPublication>

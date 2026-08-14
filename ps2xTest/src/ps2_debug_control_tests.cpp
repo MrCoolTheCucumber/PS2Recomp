@@ -9,12 +9,19 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <thread>
+
+#if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
 
 namespace
 {
@@ -42,6 +49,99 @@ namespace
             g_moviePictures.fetch_add(1u, std::memory_order_relaxed) + 1u;
         ctx->pc = pictures >= 5u ? 0u : 0x00001000u;
     }
+
+#if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
+    bool resumeAsSoonAsDebugSocketListens(
+        const std::filesystem::path &socketPath,
+        std::string &error)
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(5);
+        int client = -1;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            client = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (client < 0)
+            {
+                error = "cannot create Unix-domain client socket";
+                return false;
+            }
+
+            sockaddr_un address{};
+            address.sun_family = AF_UNIX;
+            const std::string path = socketPath.string();
+            if (path.size() >= sizeof(address.sun_path))
+            {
+                close(client);
+                error = "debug socket path is too long";
+                return false;
+            }
+            std::memcpy(
+                address.sun_path, path.c_str(), path.size() + 1u);
+            if (connect(
+                    client,
+                    reinterpret_cast<const sockaddr *>(&address),
+                    sizeof(address)) == 0)
+            {
+                break;
+            }
+
+            close(client);
+            client = -1;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(1));
+        }
+        if (client < 0)
+        {
+            error = "debug socket did not begin listening";
+            return false;
+        }
+
+        const std::string request =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,"
+            "\"method\":\"execution.resume\"}\n";
+        size_t sent = 0u;
+        while (sent < request.size())
+        {
+            const ssize_t count = send(
+                client, request.data() + sent,
+                request.size() - sent, MSG_NOSIGNAL);
+            if (count <= 0)
+            {
+                close(client);
+                error = "cannot send early resume request";
+                return false;
+            }
+            sent += static_cast<size_t>(count);
+        }
+
+        std::string response;
+        std::array<char, 4096> buffer{};
+        while (response.find('\n') == std::string::npos)
+        {
+            const ssize_t count =
+                recv(client, buffer.data(), buffer.size(), 0);
+            if (count <= 0)
+            {
+                close(client);
+                error = "debug server closed the early resume request";
+                return false;
+            }
+            response.append(
+                buffer.data(), static_cast<size_t>(count));
+        }
+        close(client);
+        if (response.find("\"result\"") == std::string::npos ||
+            response.find("\"state\":\"running\"") ==
+                std::string::npos)
+        {
+            error = "early resume response did not report running state";
+            return false;
+        }
+        return true;
+    }
+#endif
 }
 
 void register_ps2_debug_control_tests()
@@ -746,6 +846,52 @@ void register_ps2_debug_control_tests()
                          "the isolated debug server should start");
                 t.IsTrue(runtime.debugIsPaused(),
                          "startup-paused mode should stop guest execution");
+                runtime.debugResume();
+                server.stop();
+            }
+
+            unsetenv("PS2DBG_START_PAUSED");
+            unsetenv("PS2DBG_SOCKET");
+            unsetenv("PS2DBG_ENABLE");
+            std::filesystem::remove_all(root);
+        });
+
+        tc.Run("startup pause precedes debug request dispatch", [](TestCase &t)
+        {
+            const auto unique = std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::filesystem::path root =
+                std::filesystem::temp_directory_path() /
+                ("ps2dbg-start-order-test-" + unique);
+            const std::filesystem::path socket = root / "debug.sock";
+            std::filesystem::create_directories(root);
+
+            setenv("PS2DBG_ENABLE", "1", 1);
+            setenv("PS2DBG_SOCKET", socket.c_str(), 1);
+            setenv("PS2DBG_START_PAUSED", "1", 1);
+
+            {
+                PS2Runtime runtime;
+                PS2DebugServer server(runtime);
+                std::string clientError;
+                bool resumed = false;
+                std::thread client(
+                    [&]()
+                    {
+                        resumed = resumeAsSoonAsDebugSocketListens(
+                            socket, clientError);
+                    });
+                t.IsTrue(server.start(),
+                         "the isolated debug server should start");
+                client.join();
+                t.IsTrue(
+                    resumed,
+                    clientError.empty()
+                        ? "the early resume request should complete"
+                        : clientError.c_str());
+                t.IsFalse(
+                    runtime.debugIsPaused(),
+                    "startup pause must be established before the server dispatches an early resume request");
                 runtime.debugResume();
                 server.stop();
             }

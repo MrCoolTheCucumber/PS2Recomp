@@ -330,6 +330,102 @@ namespace
         mutable bool m_releaseFirstProbe = false;
         int m_boundarySelections = 0;
     };
+
+    class DebugControlWindowHooks final
+        : public IEeSchedulerExecutorHooks
+    {
+    public:
+        void commitPriorContext(
+            std::optional<int>,
+            ps2x::timing::EeTickDelta,
+            ps2x::timing::EeTick) override
+        {
+        }
+
+        void publishSelectedContext(
+            std::optional<int>,
+            ps2x::timing::EeTick) override
+        {
+        }
+
+        void publishWaitCompletion(
+            int,
+            EeSchedulerCompletedWait,
+            ps2x::timing::EeTick) override
+        {
+        }
+
+        [[nodiscard]] bool
+        hasImmediateConsequence(
+            EeSchedulerConsequenceStage stage,
+            ps2x::timing::EeTick) const override
+        {
+            if (stage !=
+                EeSchedulerConsequenceStage::
+                    AsynchronousWake)
+            {
+                return false;
+            }
+
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (m_armed && !m_probeEntered)
+            {
+                m_probeEntered = true;
+                m_cv.notify_all();
+                m_cv.wait(
+                    lock,
+                    [this]()
+                    {
+                        return m_releaseProbe;
+                    });
+            }
+            return false;
+        }
+
+        [[nodiscard]]
+        EeSchedulerReschedulePolicy
+        applyNextConsequence(
+            EeSchedulerConsequenceStage,
+            ps2x::timing::EeTick,
+            EeThreadScheduler &) override
+        {
+            throw std::logic_error(
+                "debug control fixture has no consequence");
+        }
+
+        void arm()
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_armed = true;
+        }
+
+        bool waitForProbe()
+        {
+            return waitFor(
+                m_cv,
+                m_mutex,
+                [this]()
+                {
+                    return m_probeEntered;
+                });
+        }
+
+        void releaseProbe()
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_releaseProbe = true;
+            }
+            m_cv.notify_all();
+        }
+
+    private:
+        mutable std::mutex m_mutex;
+        mutable std::condition_variable m_cv;
+        mutable bool m_armed = false;
+        mutable bool m_probeEntered = false;
+        mutable bool m_releaseProbe = false;
+    };
 }
 
 void register_ee_runtime_executor_tests()
@@ -722,6 +818,56 @@ void register_ee_runtime_executor_tests()
                     "the paused executor should apply "
                     "commands and resume the same "
                     "continuation on request");
+            });
+
+        tc.Run(
+            "debug resume invalidates the prior boundary acknowledgement",
+            [](TestCase &t)
+            {
+                ScriptedRuntimeBackend backend;
+                DebugControlWindowHooks hooks;
+                EeRuntimeExecutor executor(
+                    backend, &hooks);
+                executor.start(
+                    [](EeThreadScheduler &,
+                       IEeExecutionBackend &)
+                    {
+                    });
+
+                executor.debugRequestPause();
+                const bool firstPause =
+                    executor.debugWaitUntilPaused(2s);
+                hooks.arm();
+                executor.debugResume();
+                const bool enteredResumeBoundary =
+                    hooks.waitForProbe();
+                const bool priorAcknowledgementCleared =
+                    !executor.debugPaused();
+
+                executor.debugRequestPause();
+                const bool newPauseNotAcknowledgedEarly =
+                    !executor.debugWaitUntilPaused(0ms);
+                hooks.releaseProbe();
+                const bool secondPause =
+                    executor.debugWaitUntilPaused(2s);
+
+                executor.requestStop();
+                executor.join();
+                executor.rethrowFailure();
+
+                t.IsTrue(
+                    firstPause && enteredResumeBoundary,
+                    "the fixture should hold the first "
+                    "resumed boundary before publication");
+                t.IsTrue(
+                    priorAcknowledgementCleared &&
+                        newPauseNotAcknowledgedEarly,
+                    "resume and a new request must not reuse "
+                    "the prior paused-boundary acknowledgement");
+                t.IsTrue(
+                    secondPause,
+                    "the new pause should be acknowledged by "
+                    "a boundary from its own control generation");
             });
 
         tc.Run(

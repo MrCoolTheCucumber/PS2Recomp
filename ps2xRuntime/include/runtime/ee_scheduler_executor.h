@@ -155,7 +155,9 @@ namespace ps2x::ee
         now() const noexcept;
         [[nodiscard]] const EeSchedulerExecutorStatistics &
         statistics() const noexcept;
-        void debugRequestPause() noexcept;
+        // True means this call created a new pause request. False means an
+        // existing request is still active and remains idempotent.
+        bool debugRequestPause() noexcept;
         void debugResume() noexcept;
         void debugRequestStop() noexcept;
         [[nodiscard]] bool debugStepBoundaries(

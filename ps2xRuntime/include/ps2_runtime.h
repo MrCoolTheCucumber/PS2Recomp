@@ -794,6 +794,11 @@ public:
         std::string reason;
         uint32_t pc = 0u;
         uint64_t sequence = 0u;
+        std::string pauseSource;
+        std::string pauseWriter;
+        uint64_t controlGeneration = 0u;
+        uint64_t observedControlGeneration = 0u;
+        uint64_t staleBoundaryStops = 0u;
     };
 
     struct DebugWatchpoint
@@ -1847,7 +1852,9 @@ public:
 
     // Debug-control operations are intentionally backend-neutral. They are used
     // by the local ps2dbg server and by focused runtime tests.
-    bool debugPause(std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    bool debugPause(
+        std::chrono::milliseconds timeout = std::chrono::seconds(30),
+        const char *source = "external");
     void debugResume();
     bool debugIsPaused() const;
     bool debugSetVuBackend(
@@ -2219,9 +2226,21 @@ private:
         (void)ctx;
     }
 #endif
-    void debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason);
+    bool debugBlockGuestAtBoundary(
+        R5900Context *ctx,
+        const char *reason,
+        std::optional<uint64_t> observedControlGeneration =
+            std::nullopt);
     void debugWaitUntilResumed();
-    void debugRecordStopLocked(const char *reason, uint32_t pc);
+    void debugRecordStopLocked(
+        const char *reason,
+        uint32_t pc,
+        uint64_t observedControlGeneration = 0u);
+    void debugSetPauseRequestedLocked(
+        bool requested,
+        const char *writer);
+    void debugAdvanceControlGenerationLocked(
+        const char *writer);
     void debugRefreshControlActiveLocked();
     void debugPublishVuBackendDiagnostics();
     void debugRecordBranch(uint32_t pc);
@@ -2819,6 +2838,10 @@ private:
     mutable std::condition_variable m_debugControlCv;
     uint64_t m_debugStopSequence = 0u;
     DebugStopInfo m_debugLastStop{};
+    std::string m_debugPauseSource;
+    std::string m_debugPauseWriter{"initial"};
+    uint64_t m_debugControlGeneration = 0u;
+    uint64_t m_debugStaleBoundaryStops = 0u;
     bool m_debugRunUntilActive = false;
     uint32_t m_debugRunUntilPc = 0u;
     bool m_debugRunUntilMpegUniquePicturesActive = false;

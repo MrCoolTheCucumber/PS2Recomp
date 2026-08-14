@@ -198,13 +198,13 @@ namespace ps2x::ee
         return m_statistics;
     }
 
-    void EeSchedulerExecutor::debugRequestPause()
+    bool EeSchedulerExecutor::debugRequestPause()
         noexcept
     {
         m_debugStepBoundariesRemaining.store(
             0u, std::memory_order_release);
-        m_debugPauseRequested.store(
-            true, std::memory_order_release);
+        return !m_debugPauseRequested.exchange(
+            true, std::memory_order_acq_rel);
     }
 
     void EeSchedulerExecutor::debugResume() noexcept
