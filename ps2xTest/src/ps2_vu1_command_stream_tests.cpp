@@ -1647,6 +1647,127 @@ void register_ps2_vu1_command_stream_tests()
                      "the ordinary publication path should not roll back");
         });
 
+        tc.Run("threaded VU1 extends and commits one speculative identity", [](TestCase &t)
+        {
+            VuUnit unit(VuUnitId::Vu1);
+            unit.setProgressTrackingEnabled(true);
+            Vu1CommandProcessor processor(
+                unit,
+                Vu1CommandProcessorConfiguration{
+                    .captureCommandDigests = true,
+                    .captureArchitecturalStateHashes = true,
+                });
+            ThreadedVu1Executor executor(
+                processor,
+                ThreadedVu1ExecutorOptions{
+                    .queueCapacity = 1u,
+                    .payloadCapacityBytes = 1024u * 1024u,
+                });
+            (void)executor.submit(Vu1BindMemoryCommand{
+                .microMemory =
+                    std::vector<uint8_t>(PS2_VU1_CODE_SIZE),
+                .dataMemory =
+                    std::vector<uint8_t>(PS2_VU1_DATA_SIZE),
+                .codeGeneration = 1u,
+                .deferredDiagnostics = true,
+            });
+            std::vector<uint8_t> program(65u * 8u, 0u);
+            for (uint32_t pair = 0u; pair < 64u; ++pair)
+            {
+                const auto words = instructionPair(
+                    makeVuIaddiu(1u, 1u, 1),
+                    pair == 63u
+                        ? kVuUpperEnd
+                        : kVuUpperNop);
+                std::copy(
+                    words.begin(), words.end(),
+                    program.begin() + pair * 8u);
+            }
+            (void)executor.submit(Vu1MicroMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = std::move(program),
+            });
+            (void)executor.submit(Vu1MscalCommand{}, 16u, 100u);
+
+            Vu1CommandSubmission pending =
+                executor.submitSpeculativeAdvance(
+                    Vu1AdvanceSliceCommand{
+                        .maximumCycles = 16u,
+                        .captureState = true,
+                    },
+                    Vu1SpeculationResolution::None,
+                    128u, 101u);
+            const Vu1CommandResult prefix =
+                executor.wait(std::move(pending));
+            const Vu1SliceResult *const prefixSlice =
+                sliceResult(prefix);
+            t.IsTrue(
+                prefixSlice && prefixSlice->state &&
+                    prefixSlice->state->vi[1] == 16,
+                "the speculative prefix should execute its scheduled budget");
+
+            const Vu1CommandResult extension =
+                executor.commitExtendedSpeculativeAdvance(
+                    Vu1AdvanceSliceCommand{
+                        .maximumCycles = 17u,
+                        .captureState = true,
+                    },
+                    1u, 136u, 101u);
+            const Vu1SliceResult *const extensionSlice =
+                sliceResult(extension);
+            t.IsTrue(
+                extensionSlice && extensionSlice->state &&
+                    extensionSlice->run.executedCycles == 1u &&
+                    extensionSlice->state->vi[1] == 17,
+                "the extension should continue from the private prefix state");
+            t.Equals(
+                extension.identity.sequence,
+                prefix.identity.sequence,
+                "an extension transport ticket must retain one logical sequence");
+            t.Equals(
+                extension.identity.generation,
+                prefix.identity.generation,
+                "an extension transport ticket must retain one logical generation");
+            t.Equals(extension.identity.guestTick, 136ull,
+                     "the committed identity should publish at the actual event tick");
+            Vu1Command expectedCommand{
+                .identity = extension.identity,
+                .type = Vu1CommandType::AdvanceSlice,
+                .payload = Vu1AdvanceSliceCommand{
+                    .maximumCycles = 17u,
+                    .captureState = true,
+                },
+            };
+            expectedCommand.payloadSize =
+                vu1CommandPayloadSize(expectedCommand.payload);
+            t.IsTrue(
+                extension.digest ==
+                    vu1CommandDigest(expectedCommand),
+                "the extension should publish the logical actual-budget digest");
+
+            const Vu1CommandResult snapshotResult =
+                executor.submit(Vu1SnapshotCommand{}, 144u, 102u);
+            const auto *const snapshot =
+                std::get_if<Vu1SnapshotResult>(
+                    &snapshotResult.payload);
+            t.IsTrue(
+                snapshot && snapshot->snapshot &&
+                    snapshot->snapshot->state.vi[1] == 17,
+                "the committed extension should become canonical owner state");
+            t.Equals(
+                snapshotResult.identity.sequence,
+                prefix.identity.sequence + 1u,
+                "the extension must not consume an extra semantic sequence");
+            const ThreadedVu1ExecutorStatistics statistics =
+                executor.statistics();
+            t.Equals(statistics.speculation.capturedSlices, 1ull,
+                     "one extended prefix should capture one checkpoint");
+            t.Equals(statistics.speculation.committedSlices, 1ull,
+                     "one extended prefix should commit one checkpoint");
+            t.Equals(statistics.speculation.rolledBackSlices, 0ull,
+                     "late extension should not roll back its completed prefix");
+        });
+
         tc.Run("threaded VU1 rolls back an unpublished slice before a hazard", [](TestCase &t)
         {
             VuUnit unit(VuUnitId::Vu1);
@@ -2913,7 +3034,7 @@ void register_ps2_vu1_command_stream_tests()
                      "the event should report its forced host wait");
         });
 
-        tc.Run("runtime recomputes a speculative slice at a late EE service boundary", [](TestCase &t)
+        tc.Run("runtime extends a speculative slice at a late EE service boundary", [](TestCase &t)
         {
             struct RunResult
             {
@@ -3057,13 +3178,19 @@ void register_ps2_vu1_command_stream_tests()
                 "late service should retain the canonical VU cycle count");
             t.Equals(
                 asynchronous.statistics.slicesPublished, 1ull,
-                "the fallback should still publish one guest event slice");
+                "the extension should publish one guest event slice");
             t.Equals(
-                asynchronous.statistics.budgetFallbackCount, 1ull,
-                "the delayed boundary should use one budget fallback");
+                asynchronous.statistics.budgetFallbackCount, 0ull,
+                "a positive late budget should not roll back and recompute");
             t.Equals(
-                asynchronous.statistics.budgetFallbackCycleDelta, 1ull,
-                "eight late EE ticks should add one VU cycle");
+                asynchronous.statistics.budgetExtensionCount, 1ull,
+                "the delayed boundary should extend one speculative prefix");
+            t.Equals(
+                asynchronous.statistics.budgetExtensionCycleDelta, 1ull,
+                "eight late EE ticks should add one logical VU cycle");
+            t.Equals(
+                asynchronous.statistics.budgetExtensionExecutedCycles, 1ull,
+                "the owner should execute only the one-cycle late suffix");
             t.Equals(
                 asynchronous.statistics.resultsReadyAtEvent, 1ull,
                 "the discarded scheduled-budget result should be ready early");
@@ -3076,7 +3203,124 @@ void register_ps2_vu1_command_stream_tests()
             t.IsTrue(
                 asynchronous.statistics.owner.speculation.rolledBackSlices >=
                     1u,
-                "the incorrect scheduled-budget future must be rolled back");
+                "explicit snapshot hazards should still roll back private futures");
+            t.Equals(
+                asynchronous.statistics.owner.speculation.committedSlices,
+                1ull,
+                "the late event should commit its completed speculative prefix");
+        });
+
+        tc.Run("runtime commits a completed speculative prefix at a late boundary", [](TestCase &t)
+        {
+            struct RunResult
+            {
+                uint64_t architecturalHash = 0u;
+                PS2Runtime::DebugVu1Timing timing{};
+                Vu1AsyncRuntimeStatistics statistics{};
+            };
+            const auto run =
+                [&](Vu1ExecutionMode mode) -> RunResult
+                {
+                    PS2RuntimeConfiguration configuration =
+                        defaultPs2RuntimeConfiguration();
+                    configuration.vu1ExecutionMode = mode;
+                    configuration.vu1CommandQueueCapacity = 1u;
+                    configuration.vu1CommandPayloadCapacityBytes =
+                        1024u * 1024u;
+                    configuration.captureVu1ArchitecturalStateHashes =
+                        true;
+                    PS2Runtime runtime(configuration);
+                    if (!runtime.memory().initialize() ||
+                        !runtime.syncCoreSubsystems())
+                    {
+                        t.Fail("completed-prefix runtime should initialize");
+                        return {};
+                    }
+
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 0u,
+                        makeVuIaddiu(1u, 0u, 9),
+                        kVuUpperEnd);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 8u, 0u, kVuUpperNop);
+                    const uint32_t mscal =
+                        makeVifCommand(0x14u, 0u, 0u);
+                    runtime.memory().processVIF1Data(
+                        reinterpret_cast<const uint8_t *>(&mscal),
+                        sizeof(mscal));
+
+                    if (mode == Vu1ExecutionMode::ThreadedAsync &&
+                        !waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return statistics.pendingSlice &&
+                                       statistics.owner.completedTickets ==
+                                           statistics.owner.submittedTickets;
+                            }))
+                    {
+                        t.Fail("the completed prefix should become ready");
+                        return {};
+                    }
+
+                    R5900Context &context = runtime.cpu();
+                    context.advanceEeCycleTicks(136u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    const std::shared_ptr<const Vu1Snapshot> snapshot =
+                        runtime.snapshotVu1Owner();
+                    return RunResult{
+                        .architecturalHash =
+                            vu1ArchitecturalStateHash(
+                                snapshot->state,
+                                snapshot->microMemory,
+                                snapshot->dataMemory,
+                                snapshot->vif,
+                                snapshot->codeGeneration),
+                        .timing = runtime.debugVu1TimingSnapshot(),
+                        .statistics = runtime.vu1AsyncStatistics(),
+                    };
+                };
+
+            const RunResult reference =
+                run(Vu1ExecutionMode::Inline);
+            const RunResult asynchronous =
+                run(Vu1ExecutionMode::ThreadedAsync);
+            t.Equals(
+                asynchronous.architecturalHash,
+                reference.architecturalHash,
+                "late publication of a completed prefix should match inline");
+            t.Equals(
+                asynchronous.timing.currentTick,
+                reference.timing.currentTick,
+                "a zero-work extension should retain the guest tick");
+            t.Equals(
+                asynchronous.timing.totalAdvancedCycles,
+                reference.timing.totalAdvancedCycles,
+                "a zero-work extension should retain executed cycles");
+            t.Equals(asynchronous.timing.totalAdvancedCycles, 2ull,
+                     "the completed program should execute only its two pairs");
+            t.Equals(
+                asynchronous.statistics.budgetFallbackCount, 0ull,
+                "a completed prefix should not be replayed");
+            t.Equals(
+                asynchronous.statistics.budgetExtensionCount, 1ull,
+                "the late event should commit through the extension path");
+            t.Equals(
+                asynchronous.statistics.budgetExtensionCycleDelta, 1ull,
+                "the late event should retain its logical cycle delta");
+            t.Equals(
+                asynchronous.statistics.budgetExtensionExecutedCycles, 0ull,
+                "an already completed prefix should execute no suffix");
+            t.Equals(
+                asynchronous.statistics.owner.speculation.committedSlices,
+                1ull,
+                "the completed prefix should commit its checkpoint once");
+            t.Equals(
+                asynchronous.statistics.owner.speculation.rolledBackSlices,
+                0ull,
+                "the completed prefix should never roll back");
         });
 
         tc.Run("runtime reset cancels an in-flight speculative VU1 slice", [](TestCase &t)
@@ -3468,7 +3712,8 @@ void register_ps2_vu1_command_stream_tests()
         {
             const auto run =
                 [&](uint32_t secondKickPair,
-                    size_t packetsAfterStartup)
+                    size_t packetsAfterStartup,
+                    uint64_t serviceTicks)
                 {
                     PS2RuntimeConfiguration configuration =
                         defaultPs2RuntimeConfiguration();
@@ -3561,7 +3806,7 @@ void register_ps2_vu1_command_stream_tests()
                              "ready XGKICK packets must remain private");
 
                     R5900Context &context = runtime.cpu();
-                    context.advanceEeCycleTicks(128u);
+                    context.advanceEeCycleTicks(serviceTicks);
                     runtime.serviceEeEventsAtBlockBoundary(
                         runtime.memory().getRDRAM(), &context);
                     t.Equals(
@@ -3595,10 +3840,27 @@ void register_ps2_vu1_command_stream_tests()
                                 secondPacket.end()),
                             "the second kick should follow in VU order");
                     }
+                    if (serviceTicks > 128u)
+                    {
+                        const Vu1AsyncRuntimeStatistics statistics =
+                            runtime.vu1AsyncStatistics();
+                        t.Equals(statistics.budgetFallbackCount, 0ull,
+                                 "the late XGKICK slice should not replay");
+                        t.Equals(statistics.budgetExtensionCount, 1ull,
+                                 "the late XGKICK slice should extend once");
+                        t.Equals(
+                            statistics.budgetExtensionExecutedCycles,
+                            1ull,
+                            "the second packet should be earned by one suffix cycle");
+                    }
                 };
 
-            run(3u, 2u);
-            run(18u, 1u);
+            run(3u, 2u, 128u);
+            run(18u, 1u, 128u);
+            // The second XGKICK is issued in the last scheduled cycle. It
+            // retains one cycle of PATH1 credit privately; the one-cycle
+            // late suffix earns the qword and must append it after packet 1.
+            run(15u, 2u, 136u);
         });
 
         tc.Run("runtime async checkpoints match inline under ready late and jitter schedules", [](TestCase &t)

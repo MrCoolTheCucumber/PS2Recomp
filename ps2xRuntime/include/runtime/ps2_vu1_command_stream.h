@@ -519,6 +519,10 @@ public:
         Vu1WorkIdentity identity,
         const Vu1AdvanceSliceCommand &command,
         bool speculative = false);
+    [[nodiscard]] Vu1CommandResult commitExtendedSpeculativeAdvance(
+        Vu1WorkIdentity identity,
+        const Vu1AdvanceSliceCommand &publishedCommand,
+        uint32_t extensionCycles);
     void resolveSpeculativeSlice(
         Vu1SpeculationResolution resolution);
     [[nodiscard]] Vu1SpeculationStatistics
@@ -833,6 +837,15 @@ public:
         Vu1SpeculationResolution resolution,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u);
+    // A late EE event may extend a completed speculative prefix without
+    // rolling it back. The extension consumes another transport ticket but
+    // remains the same logical VU command identity and commits the original
+    // checkpoint exactly once.
+    [[nodiscard]] Vu1CommandResult commitExtendedSpeculativeAdvance(
+        Vu1AdvanceSliceCommand publishedCommand,
+        uint32_t extensionCycles,
+        uint64_t guestTick,
+        uint64_t publicationToken);
     [[nodiscard]] Vu1CommandResult wait(
         Vu1CommandSubmission submission);
 
@@ -865,6 +878,8 @@ private:
         Vu1SpeculationResolution speculationResolution =
             Vu1SpeculationResolution::None;
         bool beginsSpeculativeSlice = false;
+        bool commitsExtendedSpeculativeAdvance = false;
+        uint32_t speculativeExtensionCycles = 0u;
         std::promise<Vu1CommandResult> completion;
     };
 
@@ -882,6 +897,8 @@ private:
         Vu1CommandPayload payload,
         Vu1SpeculationResolution resolution,
         bool beginsSpeculativeSlice,
+        bool commitsExtendedSpeculativeAdvance,
+        uint32_t speculativeExtensionCycles,
         uint64_t guestTick,
         uint64_t publicationToken);
     void ensureStarted();

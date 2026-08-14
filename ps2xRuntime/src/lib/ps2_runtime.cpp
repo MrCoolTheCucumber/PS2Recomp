@@ -3585,6 +3585,18 @@ PS2Runtime::vu1AsyncStatistics() const
         .budgetFallbackWaitNanoseconds =
             m_vu1AsyncBudgetFallbackWaitNanoseconds.load(
                 std::memory_order_acquire),
+        .budgetExtensionCount =
+            m_vu1AsyncBudgetExtensionCount.load(
+                std::memory_order_acquire),
+        .budgetExtensionCycleDelta =
+            m_vu1AsyncBudgetExtensionCycleDelta.load(
+                std::memory_order_acquire),
+        .budgetExtensionExecutedCycles =
+            m_vu1AsyncBudgetExtensionExecutedCycles.load(
+                std::memory_order_acquire),
+        .budgetExtensionWaitNanoseconds =
+            m_vu1AsyncBudgetExtensionWaitNanoseconds.load(
+                std::memory_order_acquire),
         .hazardBarrierCount =
             m_vu1AsyncHazardBarrierCount.load(
                 std::memory_order_acquire),
@@ -6676,11 +6688,135 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
     }
 
     Vu1CommandResult result{};
+    bool usedBudgetFallback = false;
+    bool usedBudgetExtension = false;
+    uint64_t budgetExtensionWaitNanoseconds = 0u;
     if (speculativeCycleBudget == cycleBudget)
     {
         result = std::move(speculativeResult);
         m_vu1SpeculationPublicationState =
             Vu1SpeculationPublicationState::Published;
+    }
+    else if (cycleBudget > speculativeCycleBudget)
+    {
+        Vu1SliceResult prefix = std::get<Vu1SliceResult>(
+            std::move(speculativeResult.payload));
+        if (prefix.run.executedCycles > cycleBudget)
+        {
+            throw std::logic_error(
+                "VU1 speculative prefix exceeds its late event budget");
+        }
+        const bool exhaustedPrefixBudget =
+            speculativeResult.active &&
+            prefix.run.reason == VuExitReason::CycleBudget;
+        const uint32_t extensionCycles =
+            exhaustedPrefixBudget
+                ? cycleBudget - prefix.run.executedCycles
+                : 0u;
+
+        const auto extensionAt =
+            std::chrono::steady_clock::now();
+        Vu1CommandResult extensionResult =
+            m_threadedVu1Executor
+                ->commitExtendedSpeculativeAdvance(
+                    Vu1AdvanceSliceCommand{
+                        .maximumCycles = cycleBudget,
+                    },
+                    extensionCycles,
+                    service.serviceTick.raw(),
+                    service.generation);
+        budgetExtensionWaitNanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() -
+                    extensionAt)
+                    .count());
+        if (extensionResult.identity.sequence !=
+                speculativeIdentity.sequence ||
+            extensionResult.identity.generation !=
+                speculativeIdentity.generation ||
+            extensionResult.identity.publicationToken !=
+                service.generation ||
+            extensionResult.identity.guestTick !=
+                service.serviceTick.raw() ||
+            extensionResult.digest.type !=
+                Vu1CommandType::AdvanceSlice ||
+            !std::holds_alternative<Vu1SliceResult>(
+                extensionResult.payload))
+        {
+            throw std::logic_error(
+                "VU1 speculative extension returned an invalid result");
+        }
+
+        Vu1SliceResult extension =
+            std::get<Vu1SliceResult>(
+                std::move(extensionResult.payload));
+        if (extensionCycles != 0u)
+        {
+            if (!speculativeResult.diagnostics.empty())
+            {
+                const auto *const boundary = std::get_if<
+                    Vu1TraceInvocationEndDiagnostic>(
+                    &speculativeResult.diagnostics.back());
+                if (boundary && boundary->hitCycleLimit)
+                {
+                    speculativeResult.diagnostics.pop_back();
+                }
+            }
+            prefix.path1Packets.reserve(
+                prefix.path1Packets.size() +
+                extension.path1Packets.size());
+            prefix.path1Packets.insert(
+                prefix.path1Packets.end(),
+                std::make_move_iterator(
+                    extension.path1Packets.begin()),
+                std::make_move_iterator(
+                    extension.path1Packets.end()));
+            prefix.run.executedCycles +=
+                extension.run.executedCycles;
+            prefix.run.reason = extension.run.reason;
+            prefix.run.activeAfter =
+                extension.run.activeAfter;
+            prefix.run.completed =
+                extension.run.completed;
+            prefix.state = std::move(extension.state);
+            prefix.architecturalStateHash =
+                extension.architecturalStateHash;
+            prefix.vifCanResume =
+                extension.vifCanResume;
+            prefix.fault = std::move(extension.fault);
+        }
+        prefix.run.requestedCycles = cycleBudget;
+
+        speculativeResult.diagnostics.reserve(
+            speculativeResult.diagnostics.size() +
+            extensionResult.diagnostics.size());
+        speculativeResult.diagnostics.insert(
+            speculativeResult.diagnostics.end(),
+            std::make_move_iterator(
+                extensionResult.diagnostics.begin()),
+            std::make_move_iterator(
+                extensionResult.diagnostics.end()));
+        extensionResult.diagnostics =
+            std::move(speculativeResult.diagnostics);
+        extensionResult.payload = std::move(prefix);
+        result = std::move(extensionResult);
+        m_vu1SpeculationPublicationState =
+            Vu1SpeculationPublicationState::None;
+        usedBudgetExtension = true;
+        m_vu1AsyncBudgetExtensionCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        m_vu1AsyncBudgetExtensionCycleDelta.fetch_add(
+            static_cast<uint64_t>(
+                cycleBudget - speculativeCycleBudget),
+            std::memory_order_relaxed);
+        m_vu1AsyncBudgetExtensionExecutedCycles.fetch_add(
+            extension.run.executedCycles,
+            std::memory_order_relaxed);
+        m_vu1AsyncBudgetExtensionWaitNanoseconds.fetch_add(
+            budgetExtensionWaitNanoseconds,
+            std::memory_order_relaxed);
     }
     else
     {
@@ -6703,10 +6839,11 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
             1u, std::memory_order_relaxed);
         m_vu1AsyncBudgetFallbackCycleDelta.fetch_add(
             cycleDelta, std::memory_order_relaxed);
+        usedBudgetFallback = true;
     }
 
     const uint64_t expectedResultGuestTick =
-        speculativeCycleBudget == cycleBudget
+        !usedBudgetFallback && !usedBudgetExtension
             ? speculativeIdentity.guestTick
             : service.serviceTick.raw();
     if (result.identity.publicationToken !=
@@ -6733,7 +6870,7 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
     updateAtomicMaximum(
         m_vu1AsyncMaximumEventWaitNanoseconds,
         waitNanoseconds);
-    if (speculativeCycleBudget != cycleBudget)
+    if (usedBudgetFallback)
     {
         m_vu1AsyncBudgetFallbackWaitNanoseconds.fetch_add(
             waitNanoseconds, std::memory_order_relaxed);

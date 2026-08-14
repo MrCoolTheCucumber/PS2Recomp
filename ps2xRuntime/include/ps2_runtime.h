@@ -145,6 +145,10 @@ struct Vu1AsyncRuntimeStatistics
     uint64_t budgetFallbackCount = 0u;
     uint64_t budgetFallbackCycleDelta = 0u;
     uint64_t budgetFallbackWaitNanoseconds = 0u;
+    uint64_t budgetExtensionCount = 0u;
+    uint64_t budgetExtensionCycleDelta = 0u;
+    uint64_t budgetExtensionExecutedCycles = 0u;
+    uint64_t budgetExtensionWaitNanoseconds = 0u;
     uint64_t hazardBarrierCount = 0u;
     uint64_t hazardWaitNanoseconds = 0u;
     uint64_t hazardRequeueCount = 0u;
@@ -2770,6 +2774,10 @@ private:
     std::atomic<uint64_t> m_vu1AsyncBudgetFallbackCount{0u};
     std::atomic<uint64_t> m_vu1AsyncBudgetFallbackCycleDelta{0u};
     std::atomic<uint64_t> m_vu1AsyncBudgetFallbackWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_vu1AsyncBudgetExtensionCount{0u};
+    std::atomic<uint64_t> m_vu1AsyncBudgetExtensionCycleDelta{0u};
+    std::atomic<uint64_t> m_vu1AsyncBudgetExtensionExecutedCycles{0u};
+    std::atomic<uint64_t> m_vu1AsyncBudgetExtensionWaitNanoseconds{0u};
     std::atomic<uint64_t> m_vu1AsyncHazardBarrierCount{0u};
     std::atomic<uint64_t> m_vu1AsyncHazardWaitNanoseconds{0u};
     std::atomic<uint64_t> m_vu1AsyncHazardRequeueCount{0u};

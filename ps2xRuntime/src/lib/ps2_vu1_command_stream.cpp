@@ -2157,6 +2157,112 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
     return result;
 }
 
+Vu1CommandResult
+Vu1CommandProcessor::commitExtendedSpeculativeAdvance(
+    Vu1WorkIdentity identity,
+    const Vu1AdvanceSliceCommand &publishedCommand,
+    uint32_t extensionCycles)
+{
+    assertOwnerThread();
+    if (!m_speculativeSliceCheckpoint)
+    {
+        throw std::logic_error(
+            "VU1 has no speculative slice to extend");
+    }
+    if (!m_pendingDiagnostics.empty())
+    {
+        throw std::logic_error(
+            "VU1 diagnostic journal was not published");
+    }
+    if (publishedCommand.maximumCycles == 0u ||
+        extensionCycles > publishedCommand.maximumCycles ||
+        identity.generation != m_generation ||
+        identity.sequence ==
+            std::numeric_limits<uint64_t>::max() ||
+        m_nextSequence != identity.sequence + 1u ||
+        !m_microMemory || !m_dataMemory)
+    {
+        throw std::logic_error(
+            "invalid VU1 speculative extension");
+    }
+
+    constexpr uint64_t payloadSize =
+        sizeof(publishedCommand.maximumCycles) +
+        sizeof(publishedCommand.captureState);
+    Vu1CommandResult result{
+        .identity = identity,
+        .digest = {
+            .sequence = identity.sequence,
+            .generation = identity.generation,
+            .guestTick = identity.guestTick,
+            .type = Vu1CommandType::AdvanceSlice,
+            .payloadSize = payloadSize,
+        },
+        .ownerGeneration = m_generation,
+        .codeGeneration = codeGeneration(),
+        .programCounter = m_unit.state().pc,
+        .active = m_unit.isActive(),
+        .progress = m_unit.getProgressSnapshot(),
+    };
+    if (m_configuration.captureCommandDigests)
+    {
+        const Vu1CommandPayload payload{publishedCommand};
+        result.digest.payloadHash =
+            vu1CommandPayloadHash(payload);
+    }
+
+    try
+    {
+        Vu1SliceResult extension{};
+        if (extensionCycles != 0u)
+        {
+            Vu1AdvanceSliceCommand extensionCommand =
+                publishedCommand;
+            extensionCommand.maximumCycles = extensionCycles;
+            extension = advanceSlice(extensionCommand);
+        }
+        else
+        {
+            const bool active = m_unit.isActive();
+            extension.run = {
+                .requestedCycles = 0u,
+                .executedCycles = 0u,
+                .reason = active
+                              ? VuExitReason::CycleBudget
+                              : VuExitReason::Inactive,
+                .activeBefore = active,
+                .activeAfter = active,
+                .completed = !active,
+            };
+            if (publishedCommand.captureState)
+            {
+                extension.state =
+                    std::make_unique<VuExecutionState>(
+                        m_unit.state());
+            }
+            extension.architecturalStateHash = stateHash();
+            extension.vifCanResume = !active;
+        }
+        result.payload = std::move(extension);
+        result.diagnostics = std::move(m_pendingDiagnostics);
+        m_pendingDiagnostics.clear();
+        result.codeGeneration = codeGeneration();
+        commitSpeculativeSlice();
+    }
+    catch (...)
+    {
+        if (m_speculativeSliceCheckpoint)
+            rollbackSpeculativeSlice();
+        throw;
+    }
+
+    result.ownerGeneration = m_generation;
+    result.programCounter = m_unit.state().pc;
+    result.active = m_unit.isActive();
+    result.progress = m_unit.getProgressSnapshot();
+    return result;
+}
+
 bool Vu1CommandProcessor::vuTraceEnabled() const
 {
     if (m_deferredDiagnostics)
@@ -2777,6 +2883,8 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
     Vu1CommandPayload payload,
     Vu1SpeculationResolution resolution,
     bool beginsSpeculativeSlice,
+    bool commitsExtendedSpeculativeAdvance,
+    uint32_t speculativeExtensionCycles,
     uint64_t guestTick,
     uint64_t publicationToken)
 {
@@ -2784,7 +2892,29 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
     if (!m_accepting.load(std::memory_order_acquire))
         throwSubmissionUnavailable();
 
-    if (resolution == Vu1SpeculationResolution::None)
+    std::optional<Vu1WorkIdentity> extendedIdentity;
+    if (commitsExtendedSpeculativeAdvance)
+    {
+        const auto *const advance =
+            std::get_if<Vu1AdvanceSliceCommand>(&payload);
+        if (resolution != Vu1SpeculationResolution::None ||
+            beginsSpeculativeSlice ||
+            !m_producerSpeculationCheckpoint ||
+            !advance ||
+            advance->maximumCycles == 0u ||
+            speculativeExtensionCycles >
+                advance->maximumCycles ||
+            publicationToken !=
+                m_producerSpeculationCheckpoint->
+                    identity.publicationToken)
+        {
+            throw std::logic_error(
+                "invalid threaded VU1 speculative extension");
+        }
+        extendedIdentity =
+            m_producerSpeculationCheckpoint->identity;
+    }
+    else if (resolution == Vu1SpeculationResolution::None)
     {
         if (m_producerSpeculationCheckpoint)
         {
@@ -2823,18 +2953,32 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
     const uint64_t previousLastGuestTick = m_lastGuestTick;
     guestTick = std::max(guestTick, m_lastGuestTick);
 
-    uint64_t generation = m_generation;
-    uint64_t sequence = m_nextSequence;
-    if (startsGeneration(payload))
+    uint64_t generation =
+        extendedIdentity
+            ? extendedIdentity->generation
+            : m_generation;
+    uint64_t sequence =
+        extendedIdentity
+            ? extendedIdentity->sequence
+            : m_nextSequence;
+    if (!extendedIdentity && startsGeneration(payload))
     {
         generation = checkedVu1Increment(
             generation, "generation");
         sequence = 1u;
     }
-    else if (sequence == 0u)
+    else if (!extendedIdentity && sequence == 0u)
     {
         throw std::overflow_error(
             "VU1 command sequence exhausted");
+    }
+    if (extendedIdentity &&
+        (generation != m_generation ||
+         sequence == std::numeric_limits<uint64_t>::max() ||
+         m_nextSequence != sequence + 1u))
+    {
+        throw std::logic_error(
+            "threaded VU1 speculative extension identity is stale");
     }
     const uint64_t ticket = checkedVu1Increment(
         m_nextTicket, "transport ticket");
@@ -2864,6 +3008,10 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
         .command = std::move(command),
         .speculationResolution = resolution,
         .beginsSpeculativeSlice = beginsSpeculativeSlice,
+        .commitsExtendedSpeculativeAdvance =
+            commitsExtendedSpeculativeAdvance,
+        .speculativeExtensionCycles =
+            speculativeExtensionCycles,
     };
     std::future<Vu1CommandResult> completion =
         item.completion.get_future();
@@ -2937,11 +3085,18 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
     }
     recordBlockedDuration();
 
-    m_generation = generation;
-    m_nextSequence =
-        sequence == std::numeric_limits<uint64_t>::max()
-            ? 0u
-            : sequence + 1u;
+    if (commitsExtendedSpeculativeAdvance)
+    {
+        m_producerSpeculationCheckpoint.reset();
+    }
+    else
+    {
+        m_generation = generation;
+        m_nextSequence =
+            sequence == std::numeric_limits<uint64_t>::max()
+                ? 0u
+                : sequence + 1u;
+    }
     m_nextTicket = ticket;
     m_lastGuestTick = guestTick;
     m_submittedTickets.store(
@@ -2975,7 +3130,8 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsync(
     return submitAsyncImpl(
         std::move(payload),
         Vu1SpeculationResolution::None,
-        false, guestTick, publicationToken);
+        false, false, 0u,
+        guestTick, publicationToken);
 }
 
 Vu1CommandSubmission
@@ -2987,7 +3143,7 @@ ThreadedVu1Executor::submitSpeculativeAdvance(
 {
     return submitAsyncImpl(
         Vu1CommandPayload{command},
-        previousResolution, true,
+        previousResolution, true, false, 0u,
         guestTick, publicationToken);
 }
 
@@ -3000,6 +3156,21 @@ ThreadedVu1Executor::submitResolvingSpeculation(
 {
     return wait(submitAsyncImpl(
         std::move(payload), resolution, false,
+        false, 0u,
+        guestTick, publicationToken));
+}
+
+Vu1CommandResult
+ThreadedVu1Executor::commitExtendedSpeculativeAdvance(
+    Vu1AdvanceSliceCommand publishedCommand,
+    uint32_t extensionCycles,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    return wait(submitAsyncImpl(
+        Vu1CommandPayload{publishedCommand},
+        Vu1SpeculationResolution::None,
+        false, true, extensionCycles,
         guestTick, publicationToken));
 }
 
@@ -3203,20 +3374,50 @@ void ThreadedVu1Executor::workerMain() noexcept
             }
 
             Vu1CommandResult result{};
-            m_processor.resolveSpeculativeSlice(
-                item->speculationResolution);
-            if (item->command.identity.generation <
+            const bool stale =
+                item->command.identity.generation <
                 m_minimumAcceptedGeneration.load(
-                    std::memory_order_acquire))
+                    std::memory_order_acquire);
+            if (item->commitsExtendedSpeculativeAdvance)
             {
-                result = makeStaleQueuedVu1Result(
-                    item->command,
-                    m_processor.generation(),
-                    m_processor.codeGeneration());
+                if (stale)
+                {
+                    m_processor.resolveSpeculativeSlice(
+                        Vu1SpeculationResolution::Rollback);
+                    result = makeStaleQueuedVu1Result(
+                        item->command,
+                        m_processor.generation(),
+                        m_processor.codeGeneration());
+                }
+                else
+                {
+                    const auto *const advance =
+                        std::get_if<Vu1AdvanceSliceCommand>(
+                            &item->command.payload);
+                    if (!advance)
+                    {
+                        throw std::logic_error(
+                            "threaded VU1 speculative extension is not an advance");
+                    }
+                    result =
+                        m_processor.commitExtendedSpeculativeAdvance(
+                            item->command.identity,
+                            *advance,
+                            item->speculativeExtensionCycles);
+                }
             }
             else
             {
-                if (item->beginsSpeculativeSlice)
+                m_processor.resolveSpeculativeSlice(
+                    item->speculationResolution);
+                if (stale)
+                {
+                    result = makeStaleQueuedVu1Result(
+                        item->command,
+                        m_processor.generation(),
+                        m_processor.codeGeneration());
+                }
+                else if (item->beginsSpeculativeSlice)
                 {
                     const auto *const advance =
                         std::get_if<Vu1AdvanceSliceCommand>(
@@ -3235,14 +3436,15 @@ void ThreadedVu1Executor::workerMain() noexcept
                     result = m_processor.process(
                         std::move(item->command));
                 }
-                if (result.disposition !=
+            }
+            if (!stale &&
+                result.disposition !=
                     Vu1CommandDisposition::Completed)
-                {
-                    throw std::logic_error(
-                        std::string(
-                            "VU1 owner rejected queued command: ") +
-                        vu1CommandTypeName(result.digest.type));
-                }
+            {
+                throw std::logic_error(
+                    std::string(
+                        "VU1 owner rejected queued command: ") +
+                    vu1CommandTypeName(result.digest.type));
             }
 
             const uint64_t completedGeneration =

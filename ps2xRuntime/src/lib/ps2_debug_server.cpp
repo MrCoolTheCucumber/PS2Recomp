@@ -1286,6 +1286,18 @@ struct PS2DebugServer::Impl
             "budget_fallback_wait_ns",
             vu1Async.budgetFallbackWaitNanoseconds, allocator);
         vu1AsyncValue.AddMember(
+            "budget_extension_count",
+            vu1Async.budgetExtensionCount, allocator);
+        vu1AsyncValue.AddMember(
+            "budget_extension_cycle_delta",
+            vu1Async.budgetExtensionCycleDelta, allocator);
+        vu1AsyncValue.AddMember(
+            "budget_extension_executed_cycles",
+            vu1Async.budgetExtensionExecutedCycles, allocator);
+        vu1AsyncValue.AddMember(
+            "budget_extension_wait_ns",
+            vu1Async.budgetExtensionWaitNanoseconds, allocator);
+        vu1AsyncValue.AddMember(
             "hazard_barrier_count",
             vu1Async.hazardBarrierCount, allocator);
         vu1AsyncValue.AddMember(
