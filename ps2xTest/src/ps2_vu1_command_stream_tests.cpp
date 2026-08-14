@@ -142,6 +142,19 @@ namespace
                (static_cast<uint32_t>(immediate) & 0x07ffu);
     }
 
+    uint32_t makeVuSq(
+        uint8_t destinationMask,
+        uint8_t sourceVf,
+        uint8_t baseVi,
+        int16_t immediate)
+    {
+        return (0x01u << 25u) |
+               (static_cast<uint32_t>(destinationMask & 0x0fu) << 21u) |
+               (static_cast<uint32_t>(baseVi & 0x0fu) << 16u) |
+               (static_cast<uint32_t>(sourceVf & 0x1fu) << 11u) |
+               (static_cast<uint32_t>(immediate) & 0x07ffu);
+    }
+
     uint32_t makeVuLowerSpecial(
         uint8_t specialOperation, uint8_t sourceVi)
     {
@@ -1518,6 +1531,217 @@ void register_ps2_vu1_command_stream_tests()
                 "restore and barrier should retain byte-exact owner state");
             t.IsTrue(threadedExecutor.statistics().resultWaitCount > 0u,
                      "synchronous mode should expose its conservative rendezvous cost");
+        });
+
+        tc.Run("threaded VU1 commits a completed speculative slice in order", [](TestCase &t)
+        {
+            VuUnit unit(VuUnitId::Vu1);
+            unit.setProgressTrackingEnabled(true);
+            Vu1CommandProcessor processor(
+                unit,
+                Vu1CommandProcessorConfiguration{
+                    .captureCommandDigests = true,
+                    .captureArchitecturalStateHashes = true,
+                });
+            ThreadedVu1Executor executor(
+                processor,
+                ThreadedVu1ExecutorOptions{
+                    .queueCapacity = 1u,
+                    .payloadCapacityBytes = 1024u * 1024u,
+                });
+            (void)executor.submit(Vu1BindMemoryCommand{
+                .microMemory =
+                    std::vector<uint8_t>(PS2_VU1_CODE_SIZE),
+                .dataMemory =
+                    std::vector<uint8_t>(PS2_VU1_DATA_SIZE),
+                .codeGeneration = 1u,
+                .deferredDiagnostics = true,
+            });
+            const auto pair = instructionPair(
+                makeVuIaddiu(1u, 0u, 7), kVuUpperEnd);
+            (void)executor.submit(Vu1MicroMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = std::vector<uint8_t>(
+                    pair.begin(), pair.end()),
+            });
+            (void)executor.submit(Vu1MscalCommand{}, 16u, 100u);
+
+            Vu1CommandSubmission pending =
+                executor.submitSpeculativeAdvance(
+                    Vu1AdvanceSliceCommand{
+                        .maximumCycles = 16u,
+                        .captureState = true,
+                    },
+                    Vu1SpeculationResolution::None,
+                    32u, 101u);
+            const Vu1CommandResult privateResult =
+                executor.wait(std::move(pending));
+            const Vu1SliceResult *const privateSlice =
+                sliceResult(privateResult);
+            t.IsTrue(
+                privateSlice && privateSlice->state &&
+                    privateSlice->state->vi[1] == 7,
+                "a ready speculative result should own its post-slice state");
+            t.IsTrue(
+                captureException(
+                    [&executor]()
+                    {
+                        (void)executor.submit(Vu1SnapshotCommand{});
+                    }) ==
+                    "threaded VU1 speculation requires an explicit resolution",
+                "ordinary owner work must not observe unresolved speculative state");
+
+            const Vu1CommandResult committed =
+                executor.submitResolvingSpeculation(
+                    Vu1SnapshotCommand{},
+                    Vu1SpeculationResolution::Commit,
+                    48u, 102u);
+            const auto *const snapshot =
+                std::get_if<Vu1SnapshotResult>(&committed.payload);
+            t.IsTrue(
+                snapshot && snapshot->snapshot &&
+                    snapshot->snapshot->state.vi[1] == 7,
+                "committing should make the private post-slice state canonical");
+            t.Equals(
+                committed.identity.sequence,
+                privateResult.identity.sequence + 1u,
+                "a committed speculative slice should consume one semantic sequence");
+            const ThreadedVu1ExecutorStatistics statistics =
+                executor.statistics();
+            t.Equals(statistics.speculation.capturedSlices, 1ull,
+                     "one speculative checkpoint should be captured");
+            t.Equals(statistics.speculation.committedSlices, 1ull,
+                     "the next ordered command should commit the checkpoint");
+            t.Equals(statistics.speculation.rolledBackSlices, 0ull,
+                     "the ordinary publication path should not roll back");
+        });
+
+        tc.Run("threaded VU1 rolls back an unpublished slice before a hazard", [](TestCase &t)
+        {
+            VuUnit unit(VuUnitId::Vu1);
+            unit.setProgressTrackingEnabled(true);
+            Vu1CommandProcessor processor(
+                unit,
+                Vu1CommandProcessorConfiguration{
+                    .captureCommandDigests = true,
+                    .captureArchitecturalStateHashes = true,
+                });
+            ThreadedVu1Executor executor(
+                processor,
+                ThreadedVu1ExecutorOptions{
+                    .queueCapacity = 2u,
+                    .payloadCapacityBytes = 1024u * 1024u,
+                });
+            (void)executor.submit(Vu1BindMemoryCommand{
+                .microMemory =
+                    std::vector<uint8_t>(PS2_VU1_CODE_SIZE),
+                .dataMemory =
+                    std::vector<uint8_t>(PS2_VU1_DATA_SIZE),
+                .codeGeneration = 1u,
+                .deferredDiagnostics = true,
+            });
+            std::vector<uint8_t> program(16u, 0u);
+            const auto storePair = instructionPair(
+                makeVuSq(0x0fu, 1u, 0u, 0),
+                kVuUpperEnd);
+            const auto delayPair = instructionPair(
+                0u, kVuUpperNop);
+            std::copy(
+                storePair.begin(), storePair.end(),
+                program.begin());
+            std::copy(
+                delayPair.begin(), delayPair.end(),
+                program.begin() + 8u);
+            (void)executor.submit(Vu1MicroMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = program,
+            });
+            const std::array<uint32_t, 4u> storedWords = {
+                0x3f800000u, 0x40000000u,
+                0x40400000u, 0x40800000u,
+            };
+            (void)executor.submit(Vu1RegisterWriteCommand{
+                .kind = Vu1RegisterKind::VectorFloat,
+                .index = 1u,
+                .laneMask = 0x0fu,
+                .words = storedWords,
+            });
+            (void)executor.submit(Vu1MscalCommand{}, 20u, 200u);
+
+            Vu1CommandSubmission first =
+                executor.submitSpeculativeAdvance(
+                    Vu1AdvanceSliceCommand{
+                        .maximumCycles = 16u,
+                    },
+                    Vu1SpeculationResolution::None,
+                    100u, 201u);
+            const Vu1CommandResult discarded =
+                executor.wait(std::move(first));
+
+            const Vu1CommandResult hazard =
+                executor.submitResolvingSpeculation(
+                    Vu1DataMemoryWriteCommand{
+                        .offset = 0u,
+                        .bytes = {0x99u},
+                    },
+                    Vu1SpeculationResolution::Rollback,
+                    30u, 202u);
+            t.Equals(
+                hazard.identity.sequence,
+                discarded.identity.sequence,
+                "rollback should reuse the unpublished semantic sequence");
+            t.Equals(hazard.identity.guestTick, 30ull,
+                     "rollback should restore the pre-slice guest-tick frontier");
+
+            Vu1CommandSubmission second =
+                executor.submitSpeculativeAdvance(
+                    Vu1AdvanceSliceCommand{
+                        .maximumCycles = 16u,
+                    },
+                    Vu1SpeculationResolution::None,
+                    100u, 201u);
+            const Vu1CommandResult published =
+                executor.wait(std::move(second));
+            t.Equals(
+                published.identity.sequence,
+                hazard.identity.sequence + 1u,
+                "the recomputed slice should follow the intervening hazard");
+            const Vu1CommandResult committed =
+                executor.submitResolvingSpeculation(
+                    Vu1SnapshotCommand{},
+                    Vu1SpeculationResolution::Commit,
+                    120u, 203u);
+            const auto *const snapshot =
+                std::get_if<Vu1SnapshotResult>(&committed.payload);
+            bool memoryMatches = snapshot && snapshot->snapshot;
+            if (memoryMatches)
+            {
+                std::array<uint32_t, 4u> observed{};
+                std::memcpy(
+                    observed.data(),
+                    snapshot->snapshot->dataMemory.data(),
+                    sizeof(observed));
+                memoryMatches = observed == storedWords;
+            }
+            t.IsTrue(memoryMatches,
+                     "the recomputed slice should apply after the ordered memory write");
+            t.IsTrue(
+                snapshot && snapshot->snapshot &&
+                    snapshot->snapshot->progress.invocations == 1u,
+                "rolled-back speculative work must not double-count progress");
+
+            const ThreadedVu1ExecutorStatistics statistics =
+                executor.statistics();
+            t.Equals(statistics.speculation.capturedSlices, 2ull,
+                     "both attempted slices should capture checkpoints");
+            t.Equals(statistics.speculation.rolledBackSlices, 1ull,
+                     "the intervening write should roll back one slice");
+            t.Equals(statistics.speculation.committedSlices, 1ull,
+                     "the recomputed result should commit once");
+            t.Equals(
+                statistics.speculation.checkpointBytesCopied,
+                uint64_t{2u * PS2_VU1_DATA_SIZE},
+                "each speculative slice should copy one bounded data image");
         });
 
         tc.Run("threaded VU1 defers diagnostics for EE publication", [](TestCase &t)

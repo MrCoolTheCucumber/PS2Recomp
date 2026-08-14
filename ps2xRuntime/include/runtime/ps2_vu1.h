@@ -20,6 +20,7 @@ class GS;
 class PS2Memory;
 class VuProgramCache;
 class VuRecompilerBackend;
+class Vu1CommandProcessor;
 enum class VuUnitId : uint8_t;
 struct VuExecutionState;
 struct VU1NativeEmitterSpikeAccess;
@@ -585,6 +586,7 @@ public:
     }
 
 private:
+    friend class Vu1CommandProcessor;
     friend class VuInterpreterBackend;
     friend class VuRecompilerBackend;
     friend struct VU1NativeEmitterSpikeAccess;

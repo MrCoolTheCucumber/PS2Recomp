@@ -429,6 +429,7 @@ struct Vu1CommandResult
     uint64_t codeGeneration = 0u;
     uint32_t programCounter = 0u;
     bool active = false;
+    VuProgressSnapshot progress{};
     std::vector<Vu1DiagnosticRecord> diagnostics;
     Vu1CommandResultPayload payload = Vu1NoResult{};
 };
@@ -465,6 +466,23 @@ struct Vu1CommandProcessorConfiguration
     bool captureArchitecturalStateHashes = false;
 };
 
+struct Vu1SpeculationStatistics
+{
+    uint64_t capturedSlices = 0u;
+    uint64_t checkpointBytesCopied = 0u;
+    uint64_t checkpointCaptureNanoseconds = 0u;
+    uint64_t committedSlices = 0u;
+    uint64_t rolledBackSlices = 0u;
+    uint64_t rollbackNanoseconds = 0u;
+};
+
+enum class Vu1SpeculationResolution : uint8_t
+{
+    None,
+    Commit,
+    Rollback,
+};
+
 // This is the sole semantic entry point for VU1 owner-facing work. A
 // BindMemory command transfers canonical micro/data images into processor-owned
 // storage; the pointer-binding helper remains only for standalone inline
@@ -499,7 +517,12 @@ public:
         const Vu1VifStateUpdateCommand &command);
     [[nodiscard]] Vu1CommandResult processAdvanceSlice(
         Vu1WorkIdentity identity,
-        const Vu1AdvanceSliceCommand &command);
+        const Vu1AdvanceSliceCommand &command,
+        bool speculative = false);
+    void resolveSpeculativeSlice(
+        Vu1SpeculationResolution resolution);
+    [[nodiscard]] Vu1SpeculationStatistics
+    speculationStatistics() const noexcept;
     [[nodiscard]] uint64_t generation() const noexcept
     {
         return m_generation;
@@ -544,7 +567,25 @@ public:
     void resetVuWorkloadProfileEpoch() override;
 
 private:
+    struct SpeculativeSliceCheckpoint
+    {
+        VuExecutionState state{};
+        Vu1VifState vif{};
+        VuProgressSnapshot progress{};
+        VuExitReason lastExitReason = VuExitReason::Inactive;
+        VuVerifyDiagnostics verify{};
+        IVuExecutionObserver *workloadProfileObserver = nullptr;
+        uint64_t generation = 0u;
+        uint64_t nextSequence = 0u;
+        uint64_t codeGeneration = 0u;
+        bool workloadProfileInvocationPending = false;
+        bool workloadProfileInvocationActive = false;
+    };
+
     void assertOwnerThread() const;
+    void captureSpeculativeSliceCheckpoint();
+    void rollbackSpeculativeSlice();
+    void commitSpeculativeSlice();
     [[nodiscard]] bool validMemoryRange(
         uint32_t offset, size_t size,
         uint32_t memorySize, bool wrap) const noexcept;
@@ -580,6 +621,15 @@ private:
     uint64_t m_nextSequence = 1u;
     std::thread::id m_ownerThread{};
     bool m_shutdown = false;
+    std::optional<SpeculativeSliceCheckpoint>
+        m_speculativeSliceCheckpoint;
+    std::vector<uint8_t> m_speculativeDataMemory;
+    std::atomic<uint64_t> m_speculativeSlicesCaptured{0u};
+    std::atomic<uint64_t> m_speculativeCheckpointBytesCopied{0u};
+    std::atomic<uint64_t> m_speculativeCheckpointCaptureNanoseconds{0u};
+    std::atomic<uint64_t> m_speculativeSlicesCommitted{0u};
+    std::atomic<uint64_t> m_speculativeSlicesRolledBack{0u};
+    std::atomic<uint64_t> m_speculativeRollbackNanoseconds{0u};
 };
 
 enum class Vu1ExecutionMode : uint8_t
@@ -710,6 +760,7 @@ struct ThreadedVu1ExecutorStatistics
     uint64_t workerIdleNanoseconds = 0u;
     uint64_t resultWaitCount = 0u;
     uint64_t resultWaitNanoseconds = 0u;
+    Vu1SpeculationStatistics speculation{};
     bool started = false;
     bool running = false;
     bool accepting = false;
@@ -772,6 +823,18 @@ public:
         Vu1CommandPayload payload,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u);
+    [[nodiscard]] Vu1CommandSubmission submitSpeculativeAdvance(
+        Vu1AdvanceSliceCommand command,
+        Vu1SpeculationResolution previousResolution,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+    [[nodiscard]] Vu1CommandResult submitResolvingSpeculation(
+        Vu1CommandPayload payload,
+        Vu1SpeculationResolution resolution,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+    [[nodiscard]] Vu1CommandResult wait(
+        Vu1CommandSubmission submission);
 
     [[nodiscard]] uint64_t generation() const override;
     [[nodiscard]] uint64_t lastSubmittedSequence() const;
@@ -799,11 +862,28 @@ private:
         uint64_t ticket = 0u;
         uint64_t payloadBytes = 0u;
         Vu1Command command{};
+        Vu1SpeculationResolution speculationResolution =
+            Vu1SpeculationResolution::None;
+        bool beginsSpeculativeSlice = false;
         std::promise<Vu1CommandResult> completion;
+    };
+
+    struct ProducerSpeculationCheckpoint
+    {
+        Vu1WorkIdentity identity{};
+        uint64_t generation = 0u;
+        uint64_t nextSequence = 0u;
+        uint64_t lastGuestTick = 0u;
     };
 
     [[nodiscard]] static bool startsGeneration(
         const Vu1CommandPayload &payload) noexcept;
+    [[nodiscard]] Vu1CommandSubmission submitAsyncImpl(
+        Vu1CommandPayload payload,
+        Vu1SpeculationResolution resolution,
+        bool beginsSpeculativeSlice,
+        uint64_t guestTick,
+        uint64_t publicationToken);
     void ensureStarted();
     [[nodiscard]] AdmissionResult tryEnqueue(WorkItem &item);
     [[noreturn]] void throwSubmissionUnavailable() const;
@@ -828,6 +908,8 @@ private:
     uint64_t m_nextSequence = 1u;
     uint64_t m_nextTicket = 0u;
     uint64_t m_lastGuestTick = 0u;
+    std::optional<ProducerSpeculationCheckpoint>
+        m_producerSpeculationCheckpoint;
 
     mutable std::mutex m_stateMutex;
     std::thread m_worker;

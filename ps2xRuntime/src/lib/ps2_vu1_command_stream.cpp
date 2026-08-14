@@ -1190,6 +1190,169 @@ void Vu1CommandProcessor::bindInlineDiagnosticsObserver(
     m_diagnosticsObserver = diagnosticsObserver;
 }
 
+void Vu1CommandProcessor::captureSpeculativeSliceCheckpoint()
+{
+    assertOwnerThread();
+    if (m_speculativeSliceCheckpoint)
+    {
+        throw std::logic_error(
+            "VU1 already has an unresolved speculative slice");
+    }
+    if (!m_dataMemory || m_dataMemorySize == 0u)
+    {
+        throw std::logic_error(
+            "VU1 speculation requires bound data memory");
+    }
+
+    const auto captureAt = std::chrono::steady_clock::now();
+    SpeculativeSliceCheckpoint checkpoint{
+        .state = m_unit.m_state,
+        .vif = m_vifState,
+        .progress = m_unit.getProgressSnapshot(),
+        .lastExitReason = m_unit.m_lastExitReason,
+        .verify = m_unit.m_verifyDiagnostics,
+        .workloadProfileObserver =
+            m_unit.m_workloadProfileObserver,
+        .generation = m_generation,
+        .nextSequence = m_nextSequence,
+        .codeGeneration = codeGeneration(),
+        .workloadProfileInvocationPending =
+            m_unit.m_workloadProfileInvocationPending,
+        .workloadProfileInvocationActive =
+            m_unit.m_workloadProfileInvocationActive,
+    };
+    m_speculativeDataMemory.resize(m_dataMemorySize);
+    std::memcpy(
+        m_speculativeDataMemory.data(),
+        m_dataMemory, m_dataMemorySize);
+    m_speculativeSliceCheckpoint.emplace(
+        std::move(checkpoint));
+
+    const uint64_t captureNanoseconds =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - captureAt)
+                .count());
+    m_speculativeSlicesCaptured.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_speculativeCheckpointBytesCopied.fetch_add(
+        m_dataMemorySize, std::memory_order_relaxed);
+    m_speculativeCheckpointCaptureNanoseconds.fetch_add(
+        captureNanoseconds, std::memory_order_relaxed);
+}
+
+void Vu1CommandProcessor::rollbackSpeculativeSlice()
+{
+    assertOwnerThread();
+    if (!m_speculativeSliceCheckpoint)
+    {
+        throw std::logic_error(
+            "VU1 has no speculative slice to roll back");
+    }
+
+    const auto rollbackAt = std::chrono::steady_clock::now();
+    SpeculativeSliceCheckpoint checkpoint =
+        std::move(*m_speculativeSliceCheckpoint);
+    m_unit.m_state = std::move(checkpoint.state);
+    m_vifState = checkpoint.vif;
+    m_unit.m_progressActive.store(
+        checkpoint.progress.active ? 1u : 0u,
+        std::memory_order_relaxed);
+    m_unit.m_progressInvocations.store(
+        checkpoint.progress.invocations,
+        std::memory_order_relaxed);
+    m_unit.m_progressCycles.store(
+        checkpoint.progress.cycles,
+        std::memory_order_relaxed);
+    m_unit.m_progressPc.store(
+        checkpoint.progress.pc,
+        std::memory_order_relaxed);
+    m_unit.m_lastExitReason = checkpoint.lastExitReason;
+    m_unit.m_verifyDiagnostics = std::move(checkpoint.verify);
+    m_unit.m_workloadProfileObserver =
+        checkpoint.workloadProfileObserver;
+    m_unit.m_workloadProfileInvocationPending =
+        checkpoint.workloadProfileInvocationPending;
+    m_unit.m_workloadProfileInvocationActive =
+        checkpoint.workloadProfileInvocationActive;
+    m_generation = checkpoint.generation;
+    m_nextSequence = checkpoint.nextSequence;
+    m_codeGeneration.store(
+        checkpoint.codeGeneration,
+        std::memory_order_relaxed);
+    std::memcpy(
+        m_dataMemory,
+        m_speculativeDataMemory.data(),
+        m_dataMemorySize);
+    m_pendingDiagnostics.clear();
+    m_speculativeSliceCheckpoint.reset();
+
+    const uint64_t rollbackNanoseconds =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - rollbackAt)
+                .count());
+    m_speculativeSlicesRolledBack.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_speculativeRollbackNanoseconds.fetch_add(
+        rollbackNanoseconds, std::memory_order_relaxed);
+}
+
+void Vu1CommandProcessor::commitSpeculativeSlice()
+{
+    assertOwnerThread();
+    if (!m_speculativeSliceCheckpoint)
+    {
+        throw std::logic_error(
+            "VU1 has no speculative slice to commit");
+    }
+    m_speculativeSliceCheckpoint.reset();
+    m_speculativeSlicesCommitted.fetch_add(
+        1u, std::memory_order_relaxed);
+}
+
+void Vu1CommandProcessor::resolveSpeculativeSlice(
+    Vu1SpeculationResolution resolution)
+{
+    assertOwnerThread();
+    if (resolution == Vu1SpeculationResolution::None)
+    {
+        if (m_speculativeSliceCheckpoint)
+        {
+            throw std::logic_error(
+                "VU1 speculative slice requires an explicit resolution");
+        }
+        return;
+    }
+    if (resolution == Vu1SpeculationResolution::Commit)
+        commitSpeculativeSlice();
+    else
+        rollbackSpeculativeSlice();
+}
+
+Vu1SpeculationStatistics
+Vu1CommandProcessor::speculationStatistics() const noexcept
+{
+    return Vu1SpeculationStatistics{
+        .capturedSlices = m_speculativeSlicesCaptured.load(
+            std::memory_order_acquire),
+        .checkpointBytesCopied =
+            m_speculativeCheckpointBytesCopied.load(
+                std::memory_order_acquire),
+        .checkpointCaptureNanoseconds =
+            m_speculativeCheckpointCaptureNanoseconds.load(
+                std::memory_order_acquire),
+        .committedSlices = m_speculativeSlicesCommitted.load(
+            std::memory_order_acquire),
+        .rolledBackSlices =
+            m_speculativeSlicesRolledBack.load(
+                std::memory_order_acquire),
+        .rollbackNanoseconds =
+            m_speculativeRollbackNanoseconds.load(
+                std::memory_order_acquire),
+    };
+}
+
 bool Vu1CommandProcessor::validMemoryRange(
     uint32_t offset, size_t size,
     uint32_t memorySize, bool wrap) const noexcept
@@ -1629,6 +1792,7 @@ Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
         .codeGeneration = codeGeneration(),
         .programCounter = m_unit.state().pc,
         .active = m_unit.isActive(),
+        .progress = m_unit.getProgressSnapshot(),
     };
     if (m_configuration.captureCommandDigests)
         result.digest = vu1CommandDigest(command);
@@ -1732,6 +1896,7 @@ Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
     result.ownerGeneration = m_generation;
     result.programCounter = m_unit.state().pc;
     result.active = m_unit.isActive();
+    result.progress = m_unit.getProgressSnapshot();
     return result;
 }
 
@@ -1760,6 +1925,7 @@ Vu1CommandResult Vu1CommandProcessor::processDecodedUnpack(
         .codeGeneration = codeGeneration(),
         .programCounter = m_unit.state().pc,
         .active = m_unit.isActive(),
+        .progress = m_unit.getProgressSnapshot(),
     };
     if (m_configuration.captureCommandDigests)
     {
@@ -1818,6 +1984,7 @@ Vu1CommandResult Vu1CommandProcessor::processDecodedUnpack(
     result.ownerGeneration = m_generation;
     result.programCounter = m_unit.state().pc;
     result.active = m_unit.isActive();
+    result.progress = m_unit.getProgressSnapshot();
     return result;
 }
 
@@ -1846,6 +2013,7 @@ Vu1CommandResult Vu1CommandProcessor::processVifStateUpdate(
         .codeGeneration = codeGeneration(),
         .programCounter = m_unit.state().pc,
         .active = m_unit.isActive(),
+        .progress = m_unit.getProgressSnapshot(),
     };
     if (m_configuration.captureCommandDigests)
     {
@@ -1893,12 +2061,14 @@ Vu1CommandResult Vu1CommandProcessor::processVifStateUpdate(
     result.ownerGeneration = m_generation;
     result.programCounter = m_unit.state().pc;
     result.active = m_unit.isActive();
+    result.progress = m_unit.getProgressSnapshot();
     return result;
 }
 
 Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
     Vu1WorkIdentity identity,
-    const Vu1AdvanceSliceCommand &command)
+    const Vu1AdvanceSliceCommand &command,
+    bool speculative)
 {
     assertOwnerThread();
     if (!m_pendingDiagnostics.empty())
@@ -1922,6 +2092,7 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
         .codeGeneration = codeGeneration(),
         .programCounter = m_unit.state().pc,
         .active = m_unit.isActive(),
+        .progress = m_unit.getProgressSnapshot(),
     };
     if (m_configuration.captureCommandDigests)
     {
@@ -1956,21 +2127,33 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
         result.disposition = Vu1CommandDisposition::Malformed;
         return result;
     }
-
-    result.payload = advanceSlice(command);
-    result.diagnostics = std::move(m_pendingDiagnostics);
-    m_pendingDiagnostics.clear();
-    result.codeGeneration = codeGeneration();
     if (m_nextSequence ==
         std::numeric_limits<uint64_t>::max())
     {
         throw std::overflow_error(
             "VU1 command sequence exhausted");
     }
-    ++m_nextSequence;
+
+    if (speculative)
+        captureSpeculativeSliceCheckpoint();
+    try
+    {
+        result.payload = advanceSlice(command);
+        result.diagnostics = std::move(m_pendingDiagnostics);
+        m_pendingDiagnostics.clear();
+        result.codeGeneration = codeGeneration();
+        ++m_nextSequence;
+    }
+    catch (...)
+    {
+        if (speculative && m_speculativeSliceCheckpoint)
+            rollbackSpeculativeSlice();
+        throw;
+    }
     result.ownerGeneration = m_generation;
     result.programCounter = m_unit.state().pc;
     result.active = m_unit.isActive();
+    result.progress = m_unit.getProgressSnapshot();
     return result;
 }
 
@@ -2590,8 +2773,10 @@ ThreadedVu1Executor::throwSubmissionUnavailable() const
         "threaded VU1 executor is not accepting work");
 }
 
-Vu1CommandSubmission ThreadedVu1Executor::submitAsync(
+Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
     Vu1CommandPayload payload,
+    Vu1SpeculationResolution resolution,
+    bool beginsSpeculativeSlice,
     uint64_t guestTick,
     uint64_t publicationToken)
 {
@@ -2599,7 +2784,43 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsync(
     if (!m_accepting.load(std::memory_order_acquire))
         throwSubmissionUnavailable();
 
+    if (resolution == Vu1SpeculationResolution::None)
+    {
+        if (m_producerSpeculationCheckpoint)
+        {
+            throw std::logic_error(
+                "threaded VU1 speculation requires an explicit resolution");
+        }
+    }
+    else
+    {
+        if (!m_producerSpeculationCheckpoint)
+        {
+            throw std::logic_error(
+                "threaded VU1 has no speculation to resolve");
+        }
+        if (resolution == Vu1SpeculationResolution::Rollback)
+        {
+            m_generation =
+                m_producerSpeculationCheckpoint->generation;
+            m_nextSequence =
+                m_producerSpeculationCheckpoint->nextSequence;
+            m_lastGuestTick =
+                m_producerSpeculationCheckpoint->lastGuestTick;
+        }
+        m_producerSpeculationCheckpoint.reset();
+    }
+    if (beginsSpeculativeSlice &&
+        !std::holds_alternative<Vu1AdvanceSliceCommand>(payload))
+    {
+        throw std::invalid_argument(
+            "only a VU1 advance may begin speculation");
+    }
+
     ensureStarted();
+    const uint64_t previousGeneration = m_generation;
+    const uint64_t previousNextSequence = m_nextSequence;
+    const uint64_t previousLastGuestTick = m_lastGuestTick;
     guestTick = std::max(guestTick, m_lastGuestTick);
 
     uint64_t generation = m_generation;
@@ -2641,6 +2862,8 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsync(
         .ticket = ticket,
         .payloadBytes = payloadBytes,
         .command = std::move(command),
+        .speculationResolution = resolution,
+        .beginsSpeculativeSlice = beginsSpeculativeSlice,
     };
     std::future<Vu1CommandResult> completion =
         item.completion.get_future();
@@ -2727,6 +2950,16 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsync(
         generation, std::memory_order_release);
     m_submittedSequence.store(
         sequence, std::memory_order_release);
+    if (beginsSpeculativeSlice)
+    {
+        m_producerSpeculationCheckpoint.emplace(
+            ProducerSpeculationCheckpoint{
+                .identity = identity,
+                .generation = previousGeneration,
+                .nextSequence = previousNextSequence,
+                .lastGuestTick = previousLastGuestTick,
+            });
+    }
     signalWorkAvailable();
     submitLock.unlock();
 
@@ -2734,14 +2967,46 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsync(
         ticket, identity, std::move(completion));
 }
 
-Vu1CommandResult ThreadedVu1Executor::submit(
+Vu1CommandSubmission ThreadedVu1Executor::submitAsync(
     Vu1CommandPayload payload,
     uint64_t guestTick,
     uint64_t publicationToken)
 {
+    return submitAsyncImpl(
+        std::move(payload),
+        Vu1SpeculationResolution::None,
+        false, guestTick, publicationToken);
+}
+
+Vu1CommandSubmission
+ThreadedVu1Executor::submitSpeculativeAdvance(
+    Vu1AdvanceSliceCommand command,
+    Vu1SpeculationResolution previousResolution,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    return submitAsyncImpl(
+        Vu1CommandPayload{command},
+        previousResolution, true,
+        guestTick, publicationToken);
+}
+
+Vu1CommandResult
+ThreadedVu1Executor::submitResolvingSpeculation(
+    Vu1CommandPayload payload,
+    Vu1SpeculationResolution resolution,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    return wait(submitAsyncImpl(
+        std::move(payload), resolution, false,
+        guestTick, publicationToken));
+}
+
+Vu1CommandResult ThreadedVu1Executor::wait(
+    Vu1CommandSubmission submission)
+{
     const auto waitAt = std::chrono::steady_clock::now();
-    Vu1CommandSubmission submission = submitAsync(
-        std::move(payload), guestTick, publicationToken);
     Vu1CommandResult result = submission.wait();
     m_resultWaitCount.fetch_add(
         1u, std::memory_order_relaxed);
@@ -2758,6 +3023,15 @@ Vu1CommandResult ThreadedVu1Executor::submit(
             vu1CommandTypeName(result.digest.type));
     }
     return result;
+}
+
+Vu1CommandResult ThreadedVu1Executor::submit(
+    Vu1CommandPayload payload,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    return wait(submitAsync(
+        std::move(payload), guestTick, publicationToken));
 }
 
 uint64_t ThreadedVu1Executor::generation() const
@@ -2929,6 +3203,8 @@ void ThreadedVu1Executor::workerMain() noexcept
             }
 
             Vu1CommandResult result{};
+            m_processor.resolveSpeculativeSlice(
+                item->speculationResolution);
             if (item->command.identity.generation <
                 m_minimumAcceptedGeneration.load(
                     std::memory_order_acquire))
@@ -2940,8 +3216,25 @@ void ThreadedVu1Executor::workerMain() noexcept
             }
             else
             {
-                result = m_processor.process(
-                    std::move(item->command));
+                if (item->beginsSpeculativeSlice)
+                {
+                    const auto *const advance =
+                        std::get_if<Vu1AdvanceSliceCommand>(
+                            &item->command.payload);
+                    if (!advance)
+                    {
+                        throw std::logic_error(
+                            "threaded VU1 speculative work is not an advance");
+                    }
+                    result = m_processor.processAdvanceSlice(
+                        item->command.identity,
+                        *advance, true);
+                }
+                else
+                {
+                    result = m_processor.process(
+                        std::move(item->command));
+                }
                 if (result.disposition !=
                     Vu1CommandDisposition::Completed)
                 {
@@ -3106,6 +3399,7 @@ ThreadedVu1Executor::statistics() const
         .resultWaitNanoseconds =
             m_resultWaitNanoseconds.load(
                 std::memory_order_acquire),
+        .speculation = m_processor.speculationStatistics(),
         .accepting = m_accepting.load(
             std::memory_order_acquire),
         .drainRequested = m_drainRequested.load(
