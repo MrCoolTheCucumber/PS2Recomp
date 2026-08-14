@@ -4,12 +4,131 @@
 #include "runtime/ps2_vu1_command_stream.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace
 {
+    using namespace std::chrono_literals;
+
+    template <typename Predicate>
+    bool waitFor(
+        std::condition_variable &cv,
+        std::mutex &mutex,
+        Predicate predicate)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(
+            lock, 2s, std::move(predicate));
+    }
+
+    template <typename Predicate>
+    bool waitUntil(Predicate predicate)
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() + 2s;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (predicate())
+                return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return predicate();
+    }
+
+    template <typename Operation>
+    std::string captureException(Operation operation)
+    {
+        try
+        {
+            operation();
+        }
+        catch (const std::exception &error)
+        {
+            return error.what();
+        }
+        catch (...)
+        {
+            return "non-standard exception";
+        }
+        return {};
+    }
+
+    class Vu1WorkerGate
+    {
+    public:
+        explicit Vu1WorkerGate(
+            uint64_t blockedTicket = 1u,
+            bool throwAfterRelease = false)
+            : m_blockedTicket(blockedTicket),
+              m_throwAfterRelease(throwAfterRelease)
+        {
+        }
+
+        void beforeProcess(
+            const Vu1Command &,
+            uint64_t ticket)
+        {
+            if (ticket != m_blockedTicket)
+                return;
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_entered = true;
+            m_cv.notify_all();
+            m_cv.wait(
+                lock,
+                [this]()
+                {
+                    return m_released;
+                });
+            if (m_throwAfterRelease)
+            {
+                throw std::runtime_error(
+                    "injected VU1 owner failure");
+            }
+        }
+
+        [[nodiscard]] bool waitUntilEntered()
+        {
+            return waitFor(
+                m_cv,
+                m_mutex,
+                [this]()
+                {
+                    return m_entered;
+                });
+        }
+
+        void release()
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_released = true;
+            }
+            m_cv.notify_all();
+        }
+
+    private:
+        std::mutex m_mutex;
+        std::condition_variable m_cv;
+        uint64_t m_blockedTicket = 1u;
+        bool m_throwAfterRelease = false;
+        bool m_entered = false;
+        bool m_released = false;
+    };
+
     constexpr uint32_t kVuUpperNop = 0x000002ffu;
     constexpr uint32_t kVuUpperEnd = 1u << 30u;
 
@@ -776,6 +895,624 @@ void register_ps2_vu1_command_stream_tests()
                 "restore should reproduce the complete architectural hash");
             t.Equals(fixture.unit.state().vi[3], int32_t{0x1234},
                      "restore should reproduce register state");
+        });
+
+        tc.Run("threaded VU1 queue applies bounded slot and payload backpressure", [](TestCase &t)
+        {
+            {
+                VuUnit unit(VuUnitId::Vu1);
+                Vu1CommandProcessor processor(unit);
+                const auto gate = std::make_shared<Vu1WorkerGate>();
+                ThreadedVu1Executor executor(
+                    processor,
+                    ThreadedVu1ExecutorOptions{
+                        .queueCapacity = 2u,
+                        .payloadCapacityBytes = 4096u,
+                        .beforeProcess =
+                            [gate](const Vu1Command &command, uint64_t ticket)
+                            {
+                                gate->beforeProcess(command, ticket);
+                            },
+                    });
+
+                Vu1CommandSubmission first =
+                    executor.submitAsync(Vu1BarrierCommand{});
+                t.IsTrue(gate->waitUntilEntered(),
+                         "the first command should remain owner-active");
+                Vu1CommandSubmission second =
+                    executor.submitAsync(Vu1BarrierCommand{});
+                Vu1CommandSubmission third =
+                    executor.submitAsync(Vu1BarrierCommand{});
+                t.Equals(executor.statistics().queueDepth, size_t{2u},
+                         "the ring should expose exactly its configured capacity");
+
+                std::atomic<bool> fourthSubmitted{false};
+                std::optional<Vu1CommandSubmission> fourth;
+                std::string fourthError;
+                std::thread producer([&]()
+                {
+                    try
+                    {
+                        fourth.emplace(
+                            executor.submitAsync(Vu1BarrierCommand{}));
+                        fourthSubmitted.store(
+                            true, std::memory_order_release);
+                    }
+                    catch (const std::exception &error)
+                    {
+                        fourthError = error.what();
+                    }
+                });
+                t.IsTrue(
+                    waitUntil([&]()
+                    {
+                        return executor.statistics().producerBlockCount >= 1u;
+                    }),
+                    "a producer should block at the bounded slot limit");
+                t.IsFalse(
+                    fourthSubmitted.load(std::memory_order_acquire),
+                    "the full ring must not admit another command");
+
+                gate->release();
+                producer.join();
+                t.IsTrue(fourthError.empty() && fourth.has_value(),
+                         "freeing a slot should wake one serialized producer");
+                t.IsTrue(
+                    first.wait().disposition == Vu1CommandDisposition::Completed &&
+                        second.wait().disposition == Vu1CommandDisposition::Completed &&
+                        third.wait().disposition == Vu1CommandDisposition::Completed &&
+                        fourth->wait().disposition == Vu1CommandDisposition::Completed,
+                    "slot pressure must preserve every FIFO completion");
+                const ThreadedVu1ExecutorStatistics statistics =
+                    executor.statistics();
+                t.Equals(statistics.queueHighWater, size_t{2u},
+                         "slot high-water should not exceed the ring bound");
+                t.IsTrue(statistics.producerSlotWaitCount >= 1u &&
+                             statistics.producerSlotWaitNanoseconds > 0u,
+                         "slot pressure should retain bounded wait evidence");
+
+                for (uint64_t index = 0u; index < 100u; ++index)
+                {
+                    (void)executor.submit(
+                        Vu1BarrierCommand{}, index);
+                }
+                t.Equals(executor.lastCompletedTicket(), 104ull,
+                         "repeated ring wrap and idle wakeups should lose no work");
+
+                const std::string ownerError = captureException([&]()
+                {
+                    (void)processor.process(Vu1Command{});
+                });
+                t.IsTrue(
+                    ownerError.find("outside its owner thread") !=
+                        std::string::npos,
+                    "the processor should reject direct non-owner mutation");
+                t.IsTrue(executor.ownerThreadId() != std::this_thread::get_id(),
+                         "the threaded processor should publish a distinct owner");
+            }
+
+            {
+                VuUnit unit(VuUnitId::Vu1);
+                std::vector<uint8_t> code(PS2_VU1_CODE_SIZE);
+                std::vector<uint8_t> data(PS2_VU1_DATA_SIZE);
+                Vu1CommandProcessor processor(unit);
+                processor.bindMemory(
+                    code.data(), static_cast<uint32_t>(code.size()),
+                    data.data(), static_cast<uint32_t>(data.size()), 1u);
+                const auto gate = std::make_shared<Vu1WorkerGate>();
+                const Vu1DataMemoryWriteCommand write{
+                    .offset = 0u,
+                    .bytes = std::vector<uint8_t>(256u, 0x5au),
+                };
+                const uint64_t payloadBytes =
+                    vu1CommandPayloadSize(Vu1CommandPayload{write});
+                ThreadedVu1Executor executor(
+                    processor,
+                    ThreadedVu1ExecutorOptions{
+                        .queueCapacity = 8u,
+                        .payloadCapacityBytes = payloadBytes * 2u,
+                        .beforeProcess =
+                            [gate](const Vu1Command &command, uint64_t ticket)
+                            {
+                                gate->beforeProcess(command, ticket);
+                            },
+                    });
+                Vu1CommandSubmission first = executor.submitAsync(write);
+                t.IsTrue(gate->waitUntilEntered(),
+                         "the first payload should remain owner-active");
+                Vu1CommandSubmission second = executor.submitAsync(write);
+                std::atomic<bool> thirdSubmitted{false};
+                std::optional<Vu1CommandSubmission> third;
+                std::thread producer([&]()
+                {
+                    third.emplace(executor.submitAsync(write));
+                    thirdSubmitted.store(true, std::memory_order_release);
+                });
+                t.IsTrue(
+                    waitUntil([&]()
+                    {
+                        return executor.statistics().producerBlockCount >= 1u;
+                    }),
+                    "the independent payload limit should block the producer");
+                t.IsFalse(
+                    thirdSubmitted.load(std::memory_order_acquire),
+                    "free command slots must not bypass the payload budget");
+                t.Equals(executor.statistics().payloadHighWaterBytes,
+                         payloadBytes * 2u,
+                         "payload high-water should stop at the byte bound");
+                gate->release();
+                producer.join();
+                (void)first.wait();
+                (void)second.wait();
+                (void)third->wait();
+                t.IsTrue(
+                    executor.statistics().producerPayloadWaitCount >= 1u,
+                    "the blocked wake should be classified as payload pressure");
+                t.Equals(executor.statistics().queuedPayloadBytes, 0ull,
+                         "retired results should release the full payload budget");
+            }
+        });
+
+        tc.Run("threaded VU1 cancellation opens reset and restore generations safely", [](TestCase &t)
+        {
+            VuUnit unit(VuUnitId::Vu1);
+            std::vector<uint8_t> code(PS2_VU1_CODE_SIZE);
+            std::vector<uint8_t> data(PS2_VU1_DATA_SIZE);
+            Vu1CommandProcessor processor(
+                unit, {.captureArchitecturalStateHashes = true});
+            processor.bindMemory(
+                code.data(), static_cast<uint32_t>(code.size()),
+                data.data(), static_cast<uint32_t>(data.size()), 1u);
+            const auto gate = std::make_shared<Vu1WorkerGate>();
+            ThreadedVu1Executor executor(
+                processor,
+                ThreadedVu1ExecutorOptions{
+                    .queueCapacity = 4u,
+                    .payloadCapacityBytes = 1024u * 1024u,
+                    .beforeProcess =
+                        [gate](const Vu1Command &command, uint64_t ticket)
+                        {
+                            gate->beforeProcess(command, ticket);
+                        },
+                });
+
+            Vu1CommandSubmission oldFirst =
+                executor.submitAsync(Vu1DataMemoryWriteCommand{
+                    .offset = 0u,
+                    .bytes = {0x11u},
+                });
+            t.IsTrue(gate->waitUntilEntered(),
+                     "the old generation should be held before mutation");
+            Vu1CommandSubmission oldSecond =
+                executor.submitAsync(Vu1BarrierCommand{});
+            Vu1CommandSubmission reset =
+                executor.submitAsync(Vu1ResetCommand{});
+            t.Equals(reset.identity().generation, 2ull,
+                     "reset should reserve the next owner generation");
+            t.Equals(reset.identity().sequence, 1ull,
+                     "reset should restart sequencing at one");
+            executor.cancelPendingBeforeGeneration(2u);
+            gate->release();
+
+            t.IsTrue(
+                oldFirst.wait().disposition ==
+                    Vu1CommandDisposition::StaleGeneration &&
+                    oldSecond.wait().disposition ==
+                        Vu1CommandDisposition::StaleGeneration,
+                "every skipped old-generation command should resolve stale");
+            const Vu1CommandResult resetResult = reset.wait();
+            t.IsTrue(
+                resetResult.disposition == Vu1CommandDisposition::Completed &&
+                    resetResult.ownerGeneration == 2u,
+                "the reset should become the canonical admitted generation");
+            t.Equals(data[0], uint8_t{0u},
+                     "cancelled owner work must not mutate VU data memory");
+
+            const Vu1CommandResult snapshotResult =
+                executor.submit(Vu1SnapshotCommand{});
+            const auto *snapshot =
+                std::get_if<Vu1SnapshotResult>(&snapshotResult.payload);
+            t.IsTrue(snapshot && snapshot->snapshot,
+                     "the quiesced owner should return a complete snapshot");
+            if (!snapshot || !snapshot->snapshot)
+                return;
+            (void)executor.submit(Vu1DataMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = {0x77u},
+            });
+            const Vu1CommandResult restoreResult =
+                executor.submit(Vu1RestoreCommand{
+                    .snapshot = snapshot->snapshot,
+                });
+            t.Equals(restoreResult.identity.generation, 3ull,
+                     "restore should open another explicit generation");
+            t.Equals(restoreResult.identity.sequence, 1ull,
+                     "restore should restart its generation sequence");
+            t.Equals(data[0], uint8_t{0u},
+                     "restore should reproduce owner memory exactly");
+            const Vu1CommandResult barrier =
+                executor.submit(Vu1BarrierCommand{});
+            t.Equals(barrier.identity.sequence, 2ull,
+                     "post-restore work should continue within the new generation");
+        });
+
+        tc.Run("threaded VU1 fatal failure reaches active queued and blocked work", [](TestCase &t)
+        {
+            VuUnit unit(VuUnitId::Vu1);
+            Vu1CommandProcessor processor(unit);
+            const auto gate =
+                std::make_shared<Vu1WorkerGate>(1u, true);
+            ThreadedVu1Executor executor(
+                processor,
+                ThreadedVu1ExecutorOptions{
+                    .queueCapacity = 1u,
+                    .payloadCapacityBytes = 4096u,
+                    .beforeProcess =
+                        [gate](const Vu1Command &command, uint64_t ticket)
+                        {
+                            gate->beforeProcess(command, ticket);
+                        },
+                });
+            Vu1CommandSubmission first =
+                executor.submitAsync(Vu1BarrierCommand{});
+            t.IsTrue(gate->waitUntilEntered(),
+                     "the injected failure should be held deterministically");
+            Vu1CommandSubmission second =
+                executor.submitAsync(Vu1BarrierCommand{});
+
+            std::string thirdError;
+            std::thread producer([&]()
+            {
+                thirdError = captureException([&]()
+                {
+                    (void)executor.submitAsync(Vu1BarrierCommand{});
+                });
+            });
+            t.IsTrue(
+                waitUntil([&]()
+                {
+                    return executor.statistics().producerBlockCount >= 1u;
+                }),
+                "the third command should wait on the full queue");
+            gate->release();
+            producer.join();
+
+            const std::string firstError = captureException([&]()
+            {
+                (void)first.wait();
+            });
+            const std::string secondError = captureException([&]()
+            {
+                (void)second.wait();
+            });
+            t.IsTrue(
+                firstError.find("injected VU1 owner failure") !=
+                        std::string::npos &&
+                    secondError.find("injected VU1 owner failure") !=
+                        std::string::npos &&
+                    thirdError.find("injected VU1 owner failure") !=
+                        std::string::npos,
+                "one owner failure should resolve every admitted or waiting command");
+            t.IsTrue(executor.statistics().failed,
+                     "fatal owner state should remain observable");
+            t.IsTrue(
+                captureException([&]()
+                {
+                    executor.rethrowFailure();
+                }).find("injected VU1 owner failure") != std::string::npos,
+                "later observers should receive the original owner exception");
+        });
+
+        tc.Run("threaded VU1 shutdown drains or cancels every accepted result", [](TestCase &t)
+        {
+            {
+                VuUnit unit(VuUnitId::Vu1);
+                Vu1CommandProcessor processor(unit);
+                ThreadedVu1Executor executor(processor);
+                executor.shutdown(Vu1ExecutorShutdownMode::Drain);
+                const ThreadedVu1ExecutorStatistics statistics =
+                    executor.statistics();
+                t.IsFalse(statistics.started || statistics.running ||
+                              statistics.accepting,
+                          "empty shutdown should not create an owner");
+            }
+
+            {
+                VuUnit unit(VuUnitId::Vu1);
+                Vu1CommandProcessor processor(unit);
+                ThreadedVu1Executor executor(
+                    processor,
+                    ThreadedVu1ExecutorOptions{
+                        .queueCapacity = 16u,
+                        .payloadCapacityBytes = 4096u,
+                    });
+                std::vector<Vu1CommandSubmission> submissions;
+                for (uint64_t index = 0u; index < 10u; ++index)
+                {
+                    submissions.push_back(
+                        executor.submitAsync(
+                            Vu1BarrierCommand{}, index));
+                }
+                executor.shutdown(Vu1ExecutorShutdownMode::Drain);
+                bool allCompleted = true;
+                for (Vu1CommandSubmission &submission : submissions)
+                {
+                    allCompleted = allCompleted &&
+                        submission.wait().disposition ==
+                            Vu1CommandDisposition::Completed;
+                }
+                t.IsTrue(allCompleted,
+                         "drain shutdown should retire every accepted command");
+            }
+
+            {
+                VuUnit unit(VuUnitId::Vu1);
+                Vu1CommandProcessor processor(unit);
+                const auto gate = std::make_shared<Vu1WorkerGate>();
+                ThreadedVu1Executor executor(
+                    processor,
+                    ThreadedVu1ExecutorOptions{
+                        .queueCapacity = 2u,
+                        .payloadCapacityBytes = 4096u,
+                        .beforeProcess =
+                            [gate](const Vu1Command &command, uint64_t ticket)
+                            {
+                                gate->beforeProcess(command, ticket);
+                            },
+                    });
+                Vu1CommandSubmission active =
+                    executor.submitAsync(Vu1BarrierCommand{});
+                t.IsTrue(gate->waitUntilEntered(),
+                         "cancel should cover an owner-active command");
+                Vu1CommandSubmission queued =
+                    executor.submitAsync(Vu1BarrierCommand{});
+                std::atomic<bool> shutdownReturned{false};
+                std::thread shutdownThread([&]()
+                {
+                    executor.shutdown(Vu1ExecutorShutdownMode::Cancel);
+                    shutdownReturned.store(true, std::memory_order_release);
+                });
+                t.IsTrue(
+                    waitUntil([&]()
+                    {
+                        return executor.statistics().cancelRequested;
+                    }),
+                    "cancel should publish its lifecycle state before join");
+                t.IsFalse(
+                    shutdownReturned.load(std::memory_order_acquire),
+                    "shutdown should wait for the active owner boundary");
+                gate->release();
+                shutdownThread.join();
+                t.IsFalse(captureException([&]()
+                {
+                    (void)active.wait();
+                }).empty(),
+                          "cancel should resolve active work exceptionally");
+                t.IsFalse(captureException([&]()
+                {
+                    (void)queued.wait();
+                }).empty(),
+                          "cancel should resolve queued work exceptionally");
+                const ThreadedVu1ExecutorStatistics statistics =
+                    executor.statistics();
+                t.Equals(statistics.queueDepth, size_t{0u},
+                         "cancel should empty the bounded queue");
+                t.Equals(statistics.queuedPayloadBytes, 0ull,
+                         "cancel should release all payload reservations");
+            }
+        });
+
+        tc.Run("threaded synchronous VU1 matches inline slices under worker jitter", [](TestCase &t)
+        {
+            VuUnit inlineUnit(VuUnitId::Vu1);
+            VuUnit threadedUnit(VuUnitId::Vu1);
+            std::vector<uint8_t> inlineCode(PS2_VU1_CODE_SIZE);
+            std::vector<uint8_t> threadedCode(PS2_VU1_CODE_SIZE);
+            std::vector<uint8_t> inlineData(PS2_VU1_DATA_SIZE);
+            std::vector<uint8_t> threadedData(PS2_VU1_DATA_SIZE);
+            constexpr Vu1CommandProcessorConfiguration processorConfig{
+                .captureCommandDigests = true,
+                .captureArchitecturalStateHashes = true,
+            };
+            Vu1CommandProcessor inlineProcessor(
+                inlineUnit, processorConfig);
+            Vu1CommandProcessor threadedProcessor(
+                threadedUnit, processorConfig);
+            InlineVu1Executor inlineExecutor(inlineProcessor);
+            ThreadedVu1Executor threadedExecutor(
+                threadedProcessor,
+                ThreadedVu1ExecutorOptions{
+                    .queueCapacity = 4u,
+                    .payloadCapacityBytes = 1024u * 1024u,
+                    .beforeProcess =
+                        [](const Vu1Command &, uint64_t ticket)
+                        {
+                            const uint64_t delay =
+                                ((ticket * 1103515245ull + 12345ull) >> 8u) %
+                                5u;
+                            std::this_thread::sleep_for(
+                                std::chrono::microseconds(delay * 20u));
+                        },
+                });
+
+            const auto compareResults = [&](
+                const Vu1CommandResult &inlineResult,
+                const Vu1CommandResult &threadedResult,
+                const char *message)
+            {
+                t.IsTrue(
+                    inlineResult.identity == threadedResult.identity &&
+                        inlineResult.digest == threadedResult.digest &&
+                        inlineResult.disposition == threadedResult.disposition &&
+                        inlineResult.ownerGeneration ==
+                            threadedResult.ownerGeneration &&
+                        inlineResult.codeGeneration ==
+                            threadedResult.codeGeneration &&
+                        inlineResult.programCounter ==
+                            threadedResult.programCounter &&
+                        inlineResult.active == threadedResult.active,
+                    message);
+            };
+            const auto submitBoth = [&](
+                Vu1CommandPayload inlinePayload,
+                Vu1CommandPayload threadedPayload,
+                uint64_t tick)
+            {
+                Vu1CommandResult inlineResult = inlineExecutor.submit(
+                    std::move(inlinePayload), tick, tick + 1000u);
+                Vu1CommandResult threadedResult = threadedExecutor.submit(
+                    std::move(threadedPayload), tick, tick + 1000u);
+                compareResults(
+                    inlineResult, threadedResult,
+                    "jitter must not alter command identity or digest");
+                return std::pair<Vu1CommandResult, Vu1CommandResult>{
+                    std::move(inlineResult),
+                    std::move(threadedResult),
+                };
+            };
+
+            (void)submitBoth(
+                Vu1BindMemoryCommand{
+                    .microMemory = inlineCode.data(),
+                    .microMemorySize = static_cast<uint32_t>(inlineCode.size()),
+                    .dataMemory = inlineData.data(),
+                    .dataMemorySize = static_cast<uint32_t>(inlineData.size()),
+                    .codeGeneration = 1u,
+                },
+                Vu1BindMemoryCommand{
+                    .microMemory = threadedCode.data(),
+                    .microMemorySize = static_cast<uint32_t>(threadedCode.size()),
+                    .dataMemory = threadedData.data(),
+                    .dataMemorySize = static_cast<uint32_t>(threadedData.size()),
+                    .codeGeneration = 1u,
+                },
+                0u);
+
+            std::vector<uint8_t> program;
+            for (uint32_t index = 0u; index < 300u; ++index)
+            {
+                const auto pair = instructionPair(
+                    makeVuIaddiu(1u, 1u, 1),
+                    index == 299u ? kVuUpperEnd : kVuUpperNop);
+                program.insert(program.end(), pair.begin(), pair.end());
+            }
+            (void)submitBoth(
+                Vu1MicroMemoryWriteCommand{
+                    .offset = 0u,
+                    .bytes = program,
+                },
+                Vu1MicroMemoryWriteCommand{
+                    .offset = 0u,
+                    .bytes = program,
+                },
+                16u);
+            (void)submitBoth(
+                Vu1MscalCommand{}, Vu1MscalCommand{}, 32u);
+
+            bool slicesMatch = true;
+            uint64_t tick = 48u;
+            uint32_t sliceIndex = 0u;
+            for (;;)
+            {
+                const uint32_t budget =
+                    sliceIndex == 0u ? 16u : 128u;
+                auto [inlineResult, threadedResult] = submitBoth(
+                    Vu1AdvanceSliceCommand{
+                        .maximumCycles = budget,
+                        .captureState = true,
+                    },
+                    Vu1AdvanceSliceCommand{
+                        .maximumCycles = budget,
+                        .captureState = true,
+                    },
+                    tick);
+                const Vu1SliceResult *inlineSlice =
+                    sliceResult(inlineResult);
+                const Vu1SliceResult *threadedSlice =
+                    sliceResult(threadedResult);
+                std::string difference;
+                slicesMatch = slicesMatch && inlineSlice && threadedSlice &&
+                    inlineSlice->run.executedCycles ==
+                        threadedSlice->run.executedCycles &&
+                    inlineSlice->run.reason == threadedSlice->run.reason &&
+                    inlineSlice->architecturalStateHash ==
+                        threadedSlice->architecturalStateHash &&
+                    inlineSlice->vifCanResume ==
+                        threadedSlice->vifCanResume &&
+                    inlineSlice->path1Packets.size() ==
+                        threadedSlice->path1Packets.size() &&
+                    inlineSlice->state && threadedSlice->state &&
+                    vuExecutionStatesEqual(
+                        *inlineSlice->state,
+                        *threadedSlice->state,
+                        &difference);
+                if (!inlineResult.active)
+                    break;
+                tick += 128u;
+                ++sliceIndex;
+                if (sliceIndex > 8u)
+                {
+                    slicesMatch = false;
+                    break;
+                }
+            }
+            t.IsTrue(slicesMatch,
+                     "each synchronous owner slice should match inline state exactly");
+            t.Equals(inlineUnit.state().vi[1], int32_t{300},
+                     "the differential program should execute all instruction pairs");
+
+            auto [inlineSnapshotResult, threadedSnapshotResult] = submitBoth(
+                Vu1SnapshotCommand{}, Vu1SnapshotCommand{}, tick + 128u);
+            const auto *inlineSnapshot =
+                std::get_if<Vu1SnapshotResult>(&inlineSnapshotResult.payload);
+            const auto *threadedSnapshot =
+                std::get_if<Vu1SnapshotResult>(&threadedSnapshotResult.payload);
+            t.IsTrue(
+                inlineSnapshot && threadedSnapshot &&
+                    inlineSnapshot->snapshot && threadedSnapshot->snapshot &&
+                    inlineSnapshot->architecturalStateHash ==
+                        threadedSnapshot->architecturalStateHash &&
+                    threadedSnapshot->snapshot->state.vi[1] == 300,
+                "quiesced snapshots should have identical architectural hashes");
+            if (!inlineSnapshot || !threadedSnapshot ||
+                !inlineSnapshot->snapshot || !threadedSnapshot->snapshot)
+            {
+                return;
+            }
+
+            (void)submitBoth(
+                Vu1DataMemoryWriteCommand{
+                    .offset = 0x40u,
+                    .bytes = {1u, 2u, 3u, 4u},
+                },
+                Vu1DataMemoryWriteCommand{
+                    .offset = 0x40u,
+                    .bytes = {1u, 2u, 3u, 4u},
+                },
+                tick + 256u);
+            (void)submitBoth(
+                Vu1RestoreCommand{
+                    .snapshot = inlineSnapshot->snapshot,
+                },
+                Vu1RestoreCommand{
+                    .snapshot = threadedSnapshot->snapshot,
+                },
+                tick + 384u);
+            auto [inlineBarrier, threadedBarrier] = submitBoth(
+                Vu1BarrierCommand{}, Vu1BarrierCommand{}, tick + 512u);
+            const auto *inlineHash =
+                std::get_if<Vu1BarrierResult>(&inlineBarrier.payload);
+            const auto *threadedHash =
+                std::get_if<Vu1BarrierResult>(&threadedBarrier.payload);
+            t.IsTrue(
+                inlineHash && threadedHash &&
+                    inlineHash->architecturalStateHash ==
+                        threadedHash->architecturalStateHash &&
+                    inlineCode == threadedCode &&
+                    inlineData == threadedData,
+                "restore and barrier should retain byte-exact owner state");
+            t.IsTrue(threadedExecutor.statistics().resultWaitCount > 0u,
+                     "synchronous mode should expose its conservative rendezvous cost");
         });
     });
 }

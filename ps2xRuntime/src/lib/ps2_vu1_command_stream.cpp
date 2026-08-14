@@ -1,6 +1,8 @@
 #include "runtime/ps2_vu1_command_stream.h"
 #include "runtime/ps2_build_config.h"
 
+#include "ThreadNaming.h"
+
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -14,6 +16,25 @@ namespace
 {
     constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ull;
     constexpr uint64_t kFnvPrime = 1099511628211ull;
+
+    uint64_t checkedVu1Increment(
+        uint64_t value, const char *identityName)
+    {
+        if (value == std::numeric_limits<uint64_t>::max())
+        {
+            throw std::overflow_error(
+                std::string("VU1 command ") +
+                identityName + " exhausted");
+        }
+        return value + 1u;
+    }
+
+    bool startsVu1Generation(
+        const Vu1CommandPayload &payload) noexcept
+    {
+        return std::holds_alternative<Vu1ResetCommand>(payload) ||
+               std::holds_alternative<Vu1RestoreCommand>(payload);
+    }
 
     class Vu1SliceSideEffectSink final : public IVuSideEffectSink
     {
@@ -660,7 +681,14 @@ namespace
             [](const auto &value) noexcept
             {
                 using T = std::decay_t<decltype(value)>;
-                if constexpr (
+                if constexpr (std::is_same_v<T, Vu1BindMemoryCommand>)
+                {
+                    return value.microMemory != nullptr &&
+                           value.microMemorySize != 0u &&
+                           value.dataMemory != nullptr &&
+                           value.dataMemorySize != 0u;
+                }
+                else if constexpr (
                     std::is_same_v<T, Vu1MicroMemoryWriteCommand> ||
                     std::is_same_v<T, Vu1DataMemoryWriteCommand>)
                 {
@@ -706,6 +734,8 @@ const char *vu1CommandTypeName(Vu1CommandType type) noexcept
 {
     switch (type)
     {
+    case Vu1CommandType::BindMemory:
+        return "bind-memory";
     case Vu1CommandType::MicroMemoryWrite:
         return "micro-memory-write";
     case Vu1CommandType::DataMemoryWrite:
@@ -745,7 +775,9 @@ Vu1CommandType vu1CommandType(
         [](const auto &value) noexcept
         {
             using T = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<T, Vu1MicroMemoryWriteCommand>)
+            if constexpr (std::is_same_v<T, Vu1BindMemoryCommand>)
+                return Vu1CommandType::BindMemory;
+            else if constexpr (std::is_same_v<T, Vu1MicroMemoryWriteCommand>)
                 return Vu1CommandType::MicroMemoryWrite;
             else if constexpr (std::is_same_v<T, Vu1DataMemoryWriteCommand>)
                 return Vu1CommandType::DataMemoryWrite;
@@ -784,7 +816,12 @@ uint64_t vu1CommandPayloadSize(
         [](const auto &value) -> uint64_t
         {
             using T = std::decay_t<decltype(value)>;
-            if constexpr (
+            if constexpr (std::is_same_v<T, Vu1BindMemoryCommand>)
+            {
+                return 2u * sizeof(uint32_t) + sizeof(uint64_t) +
+                       2u * sizeof(bool);
+            }
+            else if constexpr (
                 std::is_same_v<T, Vu1MicroMemoryWriteCommand> ||
                 std::is_same_v<T, Vu1DataMemoryWriteCommand>)
             {
@@ -850,7 +887,15 @@ uint64_t vu1CommandPayloadHash(
         [&](const auto &value)
         {
             using T = std::decay_t<decltype(value)>;
-            if constexpr (
+            if constexpr (std::is_same_v<T, Vu1BindMemoryCommand>)
+            {
+                hashScalar(hash, value.microMemorySize);
+                hashScalar(hash, value.dataMemorySize);
+                hashScalar(hash, value.codeGeneration);
+                hashScalar(hash, value.microMemory != nullptr);
+                hashScalar(hash, value.dataMemory != nullptr);
+            }
+            else if constexpr (
                 std::is_same_v<T, Vu1MicroMemoryWriteCommand> ||
                 std::is_same_v<T, Vu1DataMemoryWriteCommand>)
             {
@@ -965,12 +1010,34 @@ uint64_t vu1ArchitecturalStateHash(
 Vu1CommandProcessor::Vu1CommandProcessor(
     VuUnit &unit,
     Vu1CommandProcessorConfiguration configuration)
-    : m_unit(unit), m_configuration(configuration)
+    : m_unit(unit),
+      m_configuration(configuration),
+      m_ownerThread(std::this_thread::get_id())
 {
     if (unit.unitId() != VuUnitId::Vu1)
     {
         throw std::invalid_argument(
             "VU1 command processor requires a VU1 unit");
+    }
+}
+
+void Vu1CommandProcessor::claimOwnerThread(
+    std::thread::id owner)
+{
+    if (owner == std::thread::id{})
+    {
+        throw std::invalid_argument(
+            "VU1 owner thread id must be valid");
+    }
+    m_ownerThread = owner;
+}
+
+void Vu1CommandProcessor::assertOwnerThread() const
+{
+    if (m_ownerThread != std::this_thread::get_id())
+    {
+        throw std::logic_error(
+            "VU1 command processor accessed outside its owner thread");
     }
 }
 
@@ -980,6 +1047,7 @@ void Vu1CommandProcessor::bindMemory(
     uint64_t codeGeneration,
     IVuExecutionObserver *diagnosticsObserver)
 {
+    assertOwnerThread();
     if (!microMemory || microMemorySize == 0u ||
         !dataMemory || dataMemorySize == 0u)
     {
@@ -1122,7 +1190,16 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
         [&](const auto &value) -> Vu1CommandResultPayload
         {
             using T = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<T, Vu1MicroMemoryWriteCommand>)
+            if constexpr (std::is_same_v<T, Vu1BindMemoryCommand>)
+            {
+                bindMemory(
+                    value.microMemory, value.microMemorySize,
+                    value.dataMemory, value.dataMemorySize,
+                    value.codeGeneration,
+                    value.diagnosticsObserver);
+                return Vu1NoResult{};
+            }
+            else if constexpr (std::is_same_v<T, Vu1MicroMemoryWriteCommand>)
             {
                 if (!validMemoryRange(
                         value.offset, value.bytes.size(),
@@ -1281,13 +1358,6 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
                 if (value.clearDataMemory && m_dataMemory)
                     std::memset(m_dataMemory, 0, m_dataMemorySize);
                 m_vifState = {};
-                if (m_generation ==
-                    std::numeric_limits<uint64_t>::max())
-                {
-                    throw std::overflow_error(
-                        "VU1 command generation exhausted");
-                }
-                ++m_generation;
                 return Vu1NoResult{};
             }
             else if constexpr (std::is_same_v<T, Vu1SnapshotCommand>)
@@ -1328,13 +1398,6 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
                 m_codeGeneration.store(
                     snapshot.codeGeneration,
                     std::memory_order_relaxed);
-                if (m_generation ==
-                    std::numeric_limits<uint64_t>::max())
-                {
-                    throw std::overflow_error(
-                        "VU1 command generation exhausted");
-                }
-                ++m_generation;
                 return Vu1NoResult{};
             }
             else if constexpr (std::is_same_v<T, Vu1BarrierCommand>)
@@ -1354,9 +1417,13 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
 
 Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
 {
+    assertOwnerThread();
     Vu1CommandResult result{
         .identity = command.identity,
+        .ownerGeneration = m_generation,
         .codeGeneration = codeGeneration(),
+        .programCounter = m_unit.state().pc,
+        .active = m_unit.isActive(),
     };
     if (m_configuration.captureCommandDigests)
         result.digest = vu1CommandDigest(command);
@@ -1374,22 +1441,51 @@ Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
         result.disposition = Vu1CommandDisposition::Shutdown;
         return result;
     }
-    if (command.identity.generation < m_generation)
+    const bool opensGeneration =
+        startsVu1Generation(command.payload);
+    if (opensGeneration)
     {
-        result.disposition = Vu1CommandDisposition::StaleGeneration;
-        return result;
+        if (command.identity.generation <= m_generation)
+        {
+            result.disposition =
+                Vu1CommandDisposition::StaleGeneration;
+            return result;
+        }
+        if (m_generation == std::numeric_limits<uint64_t>::max() ||
+            command.identity.generation != m_generation + 1u)
+        {
+            result.disposition =
+                Vu1CommandDisposition::FutureGeneration;
+            return result;
+        }
+        if (command.identity.sequence != 1u)
+        {
+            result.disposition = Vu1CommandDisposition::OutOfOrder;
+            return result;
+        }
     }
-    if (command.identity.generation > m_generation)
+    else
     {
-        result.disposition = Vu1CommandDisposition::FutureGeneration;
-        return result;
-    }
-    if (command.identity.sequence != m_nextSequence)
-    {
-        result.disposition = Vu1CommandDisposition::OutOfOrder;
-        return result;
+        if (command.identity.generation < m_generation)
+        {
+            result.disposition =
+                Vu1CommandDisposition::StaleGeneration;
+            return result;
+        }
+        if (command.identity.generation > m_generation)
+        {
+            result.disposition =
+                Vu1CommandDisposition::FutureGeneration;
+            return result;
+        }
+        if (command.identity.sequence != m_nextSequence)
+        {
+            result.disposition = Vu1CommandDisposition::OutOfOrder;
+            return result;
+        }
     }
     const bool requiresBoundMemory =
+        command.type != Vu1CommandType::BindMemory &&
         command.type != Vu1CommandType::Reset &&
         command.type != Vu1CommandType::Barrier &&
         command.type != Vu1CommandType::Shutdown;
@@ -1407,14 +1503,25 @@ Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
     result.codeGeneration = codeGeneration();
     if (result.disposition == Vu1CommandDisposition::Completed)
     {
-        if (m_nextSequence ==
-            std::numeric_limits<uint64_t>::max())
+        if (opensGeneration)
         {
-            throw std::overflow_error(
-                "VU1 command sequence exhausted");
+            m_generation = command.identity.generation;
+            m_nextSequence = 2u;
         }
-        ++m_nextSequence;
+        else
+        {
+            if (m_nextSequence ==
+                std::numeric_limits<uint64_t>::max())
+            {
+                throw std::overflow_error(
+                    "VU1 command sequence exhausted");
+            }
+            ++m_nextSequence;
+        }
     }
+    result.ownerGeneration = m_generation;
+    result.programCounter = m_unit.state().pc;
+    result.active = m_unit.isActive();
     return result;
 }
 
@@ -1422,6 +1529,7 @@ Vu1CommandResult Vu1CommandProcessor::processDecodedUnpack(
     Vu1WorkIdentity identity,
     const Vu1DecodedUnpackCommand &command)
 {
+    assertOwnerThread();
     const uint64_t payloadSize =
         11u + sizeof(uint64_t) + command.bytes.size();
     Vu1CommandResult result{
@@ -1433,7 +1541,10 @@ Vu1CommandResult Vu1CommandProcessor::processDecodedUnpack(
             .type = Vu1CommandType::DecodedUnpack,
             .payloadSize = payloadSize,
         },
+        .ownerGeneration = m_generation,
         .codeGeneration = codeGeneration(),
+        .programCounter = m_unit.state().pc,
+        .active = m_unit.isActive(),
     };
     if (m_configuration.captureCommandDigests)
     {
@@ -1489,6 +1600,9 @@ Vu1CommandResult Vu1CommandProcessor::processDecodedUnpack(
         }
         ++m_nextSequence;
     }
+    result.ownerGeneration = m_generation;
+    result.programCounter = m_unit.state().pc;
+    result.active = m_unit.isActive();
     return result;
 }
 
@@ -1496,6 +1610,7 @@ Vu1CommandResult Vu1CommandProcessor::processVifStateUpdate(
     Vu1WorkIdentity identity,
     const Vu1VifStateUpdateCommand &command)
 {
+    assertOwnerThread();
     constexpr uint64_t payloadSize =
         12u * sizeof(uint32_t);
     Vu1CommandResult result{
@@ -1507,7 +1622,10 @@ Vu1CommandResult Vu1CommandProcessor::processVifStateUpdate(
             .type = Vu1CommandType::VifStateUpdate,
             .payloadSize = payloadSize,
         },
+        .ownerGeneration = m_generation,
         .codeGeneration = codeGeneration(),
+        .programCounter = m_unit.state().pc,
+        .active = m_unit.isActive(),
     };
     if (m_configuration.captureCommandDigests)
     {
@@ -1552,6 +1670,9 @@ Vu1CommandResult Vu1CommandProcessor::processVifStateUpdate(
             "VU1 command sequence exhausted");
     }
     ++m_nextSequence;
+    result.ownerGeneration = m_generation;
+    result.programCounter = m_unit.state().pc;
+    result.active = m_unit.isActive();
     return result;
 }
 
@@ -1559,6 +1680,7 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
     Vu1WorkIdentity identity,
     const Vu1AdvanceSliceCommand &command)
 {
+    assertOwnerThread();
     constexpr uint64_t payloadSize =
         sizeof(command.maximumCycles) +
         sizeof(command.captureState);
@@ -1571,7 +1693,10 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
             .type = Vu1CommandType::AdvanceSlice,
             .payloadSize = payloadSize,
         },
+        .ownerGeneration = m_generation,
         .codeGeneration = codeGeneration(),
+        .programCounter = m_unit.state().pc,
+        .active = m_unit.isActive(),
     };
     if (m_configuration.captureCommandDigests)
     {
@@ -1616,6 +1741,9 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
             "VU1 command sequence exhausted");
     }
     ++m_nextSequence;
+    result.ownerGeneration = m_generation;
+    result.programCounter = m_unit.state().pc;
+    result.active = m_unit.isActive();
     return result;
 }
 
@@ -1758,8 +1886,62 @@ Vu1CommandResult Vu1CommandExecutor::submitVifStateUpdate(
 InlineVu1Executor::InlineVu1Executor(
     Vu1CommandProcessor &processor)
     : m_processor(processor),
+      m_generation(processor.generation()),
       m_nextSequence(processor.nextSequence())
 {
+    m_processor.claimOwnerThread(std::this_thread::get_id());
+}
+
+Vu1WorkIdentity InlineVu1Executor::nextIdentity(
+    bool startsGeneration,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    guestTick = std::max(guestTick, m_lastGuestTick);
+    if (startsGeneration)
+    {
+        return {
+            .sequence = 1u,
+            .generation = checkedVu1Increment(
+                m_generation, "generation"),
+            .guestTick = guestTick,
+            .publicationToken = publicationToken,
+        };
+    }
+    if (m_nextSequence == 0u)
+    {
+        throw std::overflow_error(
+            "VU1 command sequence exhausted");
+    }
+    return {
+        .sequence = m_nextSequence,
+        .generation = m_generation,
+        .guestTick = guestTick,
+        .publicationToken = publicationToken,
+    };
+}
+
+void InlineVu1Executor::completeIdentity(
+    bool startsGeneration,
+    const Vu1CommandResult &result)
+{
+    if (result.disposition != Vu1CommandDisposition::Completed)
+        return;
+    if (startsGeneration)
+    {
+        m_generation = result.identity.generation;
+        m_nextSequence = 2u;
+    }
+    else if (result.identity.sequence ==
+             std::numeric_limits<uint64_t>::max())
+    {
+        m_nextSequence = 0u;
+    }
+    else
+    {
+        m_nextSequence = result.identity.sequence + 1u;
+    }
+    m_lastGuestTick = result.identity.guestTick;
 }
 
 Vu1CommandResult InlineVu1Executor::submit(
@@ -1767,36 +1949,18 @@ Vu1CommandResult InlineVu1Executor::submit(
     uint64_t guestTick,
     uint64_t publicationToken)
 {
-    if (m_nextSequence == 0u)
-    {
-        throw std::overflow_error(
-            "VU1 command sequence exhausted");
-    }
+    const bool opensGeneration = startsVu1Generation(payload);
+    const Vu1WorkIdentity identity = nextIdentity(
+        opensGeneration, guestTick, publicationToken);
     Vu1Command command{
-        .identity = {
-            .sequence = m_nextSequence,
-            .generation = m_processor.generation(),
-            .guestTick = guestTick,
-            .publicationToken = publicationToken,
-        },
+        .identity = identity,
         .type = vu1CommandType(payload),
         .payloadSize = vu1CommandPayloadSize(payload),
         .payload = std::move(payload),
     };
     Vu1CommandResult result =
         m_processor.process(std::move(command));
-    if (result.disposition == Vu1CommandDisposition::Completed)
-    {
-        if (m_nextSequence ==
-            std::numeric_limits<uint64_t>::max())
-        {
-            m_nextSequence = 0u;
-        }
-        else
-        {
-            ++m_nextSequence;
-        }
-    }
+    completeIdentity(opensGeneration, result);
     return result;
 }
 
@@ -1805,31 +1969,11 @@ Vu1CommandResult InlineVu1Executor::submitAdvanceSlice(
     uint64_t guestTick,
     uint64_t publicationToken)
 {
-    if (m_nextSequence == 0u)
-    {
-        throw std::overflow_error(
-            "VU1 command sequence exhausted");
-    }
-    const Vu1WorkIdentity identity{
-        .sequence = m_nextSequence,
-        .generation = m_processor.generation(),
-        .guestTick = guestTick,
-        .publicationToken = publicationToken,
-    };
+    const Vu1WorkIdentity identity = nextIdentity(
+        false, guestTick, publicationToken);
     Vu1CommandResult result =
         m_processor.processAdvanceSlice(identity, command);
-    if (result.disposition == Vu1CommandDisposition::Completed)
-    {
-        if (m_nextSequence ==
-            std::numeric_limits<uint64_t>::max())
-        {
-            m_nextSequence = 0u;
-        }
-        else
-        {
-            ++m_nextSequence;
-        }
-    }
+    completeIdentity(false, result);
     return result;
 }
 
@@ -1838,31 +1982,11 @@ Vu1CommandResult InlineVu1Executor::submitDecodedUnpack(
     uint64_t guestTick,
     uint64_t publicationToken)
 {
-    if (m_nextSequence == 0u)
-    {
-        throw std::overflow_error(
-            "VU1 command sequence exhausted");
-    }
-    const Vu1WorkIdentity identity{
-        .sequence = m_nextSequence,
-        .generation = m_processor.generation(),
-        .guestTick = guestTick,
-        .publicationToken = publicationToken,
-    };
+    const Vu1WorkIdentity identity = nextIdentity(
+        false, guestTick, publicationToken);
     Vu1CommandResult result =
         m_processor.processDecodedUnpack(identity, command);
-    if (result.disposition == Vu1CommandDisposition::Completed)
-    {
-        if (m_nextSequence ==
-            std::numeric_limits<uint64_t>::max())
-        {
-            m_nextSequence = 0u;
-        }
-        else
-        {
-            ++m_nextSequence;
-        }
-    }
+    completeIdentity(false, result);
     return result;
 }
 
@@ -1871,30 +1995,810 @@ Vu1CommandResult InlineVu1Executor::submitVifStateUpdate(
     uint64_t guestTick,
     uint64_t publicationToken)
 {
-    if (m_nextSequence == 0u)
+    const Vu1WorkIdentity identity = nextIdentity(
+        false, guestTick, publicationToken);
+    Vu1CommandResult result =
+        m_processor.processVifStateUpdate(identity, command);
+    completeIdentity(false, result);
+    return result;
+}
+
+Vu1CommandSubmission::Vu1CommandSubmission(
+    uint64_t ticket,
+    Vu1WorkIdentity identity,
+    std::future<Vu1CommandResult> completion)
+    : m_ticket(ticket),
+      m_identity(identity),
+      m_completion(std::move(completion))
+{
+}
+
+bool Vu1CommandSubmission::valid() const noexcept
+{
+    return m_completion.valid();
+}
+
+bool Vu1CommandSubmission::ready() const
+{
+    if (!m_completion.valid())
+        return false;
+    return m_completion.wait_for(
+               std::chrono::seconds(0)) ==
+           std::future_status::ready;
+}
+
+Vu1CommandResult Vu1CommandSubmission::wait()
+{
+    if (!m_completion.valid())
+    {
+        throw std::logic_error(
+            "VU1 command submission has no completion");
+    }
+    return m_completion.get();
+}
+
+namespace
+{
+    std::exception_ptr makeVu1ExecutorCancellation()
+    {
+        return std::make_exception_ptr(
+            std::runtime_error(
+                "threaded VU1 executor cancelled queued work"));
+    }
+
+    Vu1CommandResult makeStaleQueuedVu1Result(
+        Vu1Command &command,
+        uint64_t ownerGeneration,
+        uint64_t codeGeneration)
+    {
+        Vu1CommandResult result{};
+        result.identity = command.identity;
+        result.disposition =
+            Vu1CommandDisposition::StaleGeneration;
+        result.digest = {
+            .sequence = command.identity.sequence,
+            .generation = command.identity.generation,
+            .guestTick = command.identity.guestTick,
+            .type = command.type,
+            .payloadSize = command.payloadSize,
+            .payloadHash = 0u,
+        };
+        result.ownerGeneration = ownerGeneration;
+        result.codeGeneration = codeGeneration;
+        return result;
+    }
+
+    template <typename T>
+    void updateVu1AtomicMaximum(
+        std::atomic<T> &destination,
+        T candidate) noexcept
+    {
+        T current = destination.load(
+            std::memory_order_relaxed);
+        while (current < candidate &&
+               !destination.compare_exchange_weak(
+                   current, candidate,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed))
+        {
+        }
+    }
+}
+
+ThreadedVu1Executor::ThreadedVu1Executor(
+    Vu1CommandProcessor &processor,
+    ThreadedVu1ExecutorOptions options)
+    : m_processor(processor),
+      m_options(std::move(options)),
+      m_queue(m_options.queueCapacity),
+      m_generation(processor.generation()),
+      m_nextSequence(processor.nextSequence()),
+      m_minimumAcceptedGeneration(processor.generation())
+{
+    if (m_options.payloadCapacityBytes == 0u)
+    {
+        throw std::invalid_argument(
+            "threaded VU1 payload capacity must be non-zero");
+    }
+}
+
+ThreadedVu1Executor::~ThreadedVu1Executor()
+{
+    shutdown(Vu1ExecutorShutdownMode::Drain);
+}
+
+bool ThreadedVu1Executor::startsGeneration(
+    const Vu1CommandPayload &payload) noexcept
+{
+    return startsVu1Generation(payload);
+}
+
+void ThreadedVu1Executor::ensureStarted()
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    if (m_started)
+        return;
+    if (!m_accepting.load(std::memory_order_acquire))
+    {
+        throw std::runtime_error(
+            "threaded VU1 executor is not accepting work");
+    }
+
+    try
+    {
+        m_worker = std::thread(
+            [this]()
+            {
+                workerMain();
+            });
+        m_started = true;
+    }
+    catch (...)
+    {
+        m_fatalFailure = std::current_exception();
+        m_accepting.store(false, std::memory_order_release);
+        throw;
+    }
+}
+
+void ThreadedVu1Executor::updateQueueHighWater(
+    size_t depth) noexcept
+{
+    updateVu1AtomicMaximum(m_queueHighWater, depth);
+}
+
+void ThreadedVu1Executor::updatePayloadHighWater(
+    uint64_t bytes) noexcept
+{
+    updateVu1AtomicMaximum(m_payloadHighWaterBytes, bytes);
+}
+
+ThreadedVu1Executor::AdmissionResult
+ThreadedVu1Executor::tryEnqueue(WorkItem &item)
+{
+    if (m_queue.full())
+        return AdmissionResult::SlotCapacity;
+
+    const uint64_t currentPayload =
+        m_queuedPayloadBytes.load(std::memory_order_acquire);
+    if (item.payloadBytes >
+        m_options.payloadCapacityBytes -
+            std::min(
+                currentPayload,
+                m_options.payloadCapacityBytes))
+    {
+        return AdmissionResult::PayloadCapacity;
+    }
+
+    const size_t reservedDepth = m_queue.size() + 1u;
+    const uint64_t reserved =
+        m_queuedPayloadBytes.fetch_add(
+            item.payloadBytes,
+            std::memory_order_acq_rel) +
+        item.payloadBytes;
+    if (!m_queue.tryEmplace(std::move(item)))
+    {
+        m_queuedPayloadBytes.fetch_sub(
+            item.payloadBytes,
+            std::memory_order_acq_rel);
+        return AdmissionResult::SlotCapacity;
+    }
+
+    updateQueueHighWater(reservedDepth);
+    updatePayloadHighWater(reserved);
+    return AdmissionResult::Enqueued;
+}
+
+void ThreadedVu1Executor::signalWorkAvailable() noexcept
+{
+    uint64_t signals = m_workSignals.load(
+        std::memory_order_relaxed);
+    for (;;)
+    {
+        if (signals == std::numeric_limits<uint64_t>::max())
+            std::terminate();
+        if (m_workSignals.compare_exchange_weak(
+                signals, signals + 1u,
+                std::memory_order_release,
+                std::memory_order_relaxed))
+        {
+            break;
+        }
+    }
+    m_workSignals.notify_one();
+}
+
+bool ThreadedVu1Executor::tryAcquireWorkSignal() noexcept
+{
+    uint64_t signals = m_workSignals.load(
+        std::memory_order_acquire);
+    while (signals != 0u)
+    {
+        if (m_workSignals.compare_exchange_weak(
+                signals, signals - 1u,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ThreadedVu1Executor::acquireWorkSignal() noexcept
+{
+    while (!tryAcquireWorkSignal())
+    {
+        m_workSignals.wait(
+            0u, std::memory_order_acquire);
+    }
+}
+
+void ThreadedVu1Executor::signalSpaceAvailable() noexcept
+{
+    const uint64_t prior = m_spaceEpoch.fetch_add(
+        1u, std::memory_order_release);
+    if (prior == std::numeric_limits<uint64_t>::max())
+        std::terminate();
+    m_spaceEpoch.notify_all();
+}
+
+void ThreadedVu1Executor::closeAdmissionAndQuiesceProducer() noexcept
+{
+    m_accepting.store(false, std::memory_order_release);
+    signalSpaceAvailable();
+
+    std::lock_guard<std::mutex> submitLock(m_submitMutex);
+}
+
+[[noreturn]] void
+ThreadedVu1Executor::throwSubmissionUnavailable() const
+{
+    std::exception_ptr failure;
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        failure = m_fatalFailure;
+    }
+    if (failure)
+        std::rethrow_exception(failure);
+    throw std::runtime_error(
+        "threaded VU1 executor is not accepting work");
+}
+
+Vu1CommandSubmission ThreadedVu1Executor::submitAsync(
+    Vu1CommandPayload payload,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    std::unique_lock<std::mutex> submitLock(m_submitMutex);
+    if (!m_accepting.load(std::memory_order_acquire))
+        throwSubmissionUnavailable();
+
+    ensureStarted();
+    guestTick = std::max(guestTick, m_lastGuestTick);
+
+    uint64_t generation = m_generation;
+    uint64_t sequence = m_nextSequence;
+    if (startsGeneration(payload))
+    {
+        generation = checkedVu1Increment(
+            generation, "generation");
+        sequence = 1u;
+    }
+    else if (sequence == 0u)
     {
         throw std::overflow_error(
             "VU1 command sequence exhausted");
     }
-    const Vu1WorkIdentity identity{
-        .sequence = m_nextSequence,
-        .generation = m_processor.generation(),
-        .guestTick = guestTick,
-        .publicationToken = publicationToken,
-    };
-    Vu1CommandResult result =
-        m_processor.processVifStateUpdate(identity, command);
-    if (result.disposition == Vu1CommandDisposition::Completed)
+    const uint64_t ticket = checkedVu1Increment(
+        m_nextTicket, "transport ticket");
+    const uint64_t payloadBytes =
+        vu1CommandPayloadSize(payload);
+    if (payloadBytes > m_options.payloadCapacityBytes)
     {
-        if (m_nextSequence ==
-            std::numeric_limits<uint64_t>::max())
+        throw std::length_error(
+            "VU1 command exceeds the bounded payload capacity");
+    }
+
+    Vu1Command command{
+        .identity = {
+            .sequence = sequence,
+            .generation = generation,
+            .guestTick = guestTick,
+            .publicationToken = publicationToken,
+        },
+        .type = vu1CommandType(payload),
+        .payloadSize = payloadBytes,
+        .payload = std::move(payload),
+    };
+    const Vu1WorkIdentity identity = command.identity;
+    WorkItem item{
+        .ticket = ticket,
+        .payloadBytes = payloadBytes,
+        .command = std::move(command),
+    };
+    std::future<Vu1CommandResult> completion =
+        item.completion.get_future();
+
+    bool countedBlock = false;
+    std::chrono::steady_clock::time_point blockedAt{};
+    const auto recordBlockedDuration = [&]()
+    {
+        if (!countedBlock)
+            return;
+        const uint64_t nanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - blockedAt)
+                    .count());
+        m_producerBlockedNanoseconds.fetch_add(
+            nanoseconds, std::memory_order_relaxed);
+        countedBlock = false;
+    };
+    for (;;)
+    {
+        if (!m_accepting.load(std::memory_order_acquire))
         {
-            m_nextSequence = 0u;
+            recordBlockedDuration();
+            throwSubmissionUnavailable();
+        }
+
+        const uint64_t spaceEpoch = m_spaceEpoch.load(
+            std::memory_order_acquire);
+        const AdmissionResult admission = tryEnqueue(item);
+        if (admission == AdmissionResult::Enqueued)
+            break;
+        if (!countedBlock)
+        {
+            countedBlock = true;
+            blockedAt = std::chrono::steady_clock::now();
+            m_producerBlockCount.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+
+        if (!m_accepting.load(std::memory_order_acquire))
+        {
+            recordBlockedDuration();
+            throwSubmissionUnavailable();
+        }
+
+        const auto waitAt = std::chrono::steady_clock::now();
+        m_spaceEpoch.wait(
+            spaceEpoch, std::memory_order_acquire);
+        const uint64_t waitNanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - waitAt)
+                    .count());
+        if (admission == AdmissionResult::SlotCapacity)
+        {
+            m_producerSlotWaitCount.fetch_add(
+                1u, std::memory_order_relaxed);
+            m_producerSlotWaitNanoseconds.fetch_add(
+                waitNanoseconds, std::memory_order_relaxed);
         }
         else
         {
-            ++m_nextSequence;
+            m_producerPayloadWaitCount.fetch_add(
+                1u, std::memory_order_relaxed);
+            m_producerPayloadWaitNanoseconds.fetch_add(
+                waitNanoseconds, std::memory_order_relaxed);
         }
     }
+    recordBlockedDuration();
+
+    m_generation = generation;
+    m_nextSequence =
+        sequence == std::numeric_limits<uint64_t>::max()
+            ? 0u
+            : sequence + 1u;
+    m_nextTicket = ticket;
+    m_lastGuestTick = guestTick;
+    m_submittedTickets.store(
+        ticket, std::memory_order_release);
+    m_submittedGeneration.store(
+        generation, std::memory_order_release);
+    m_submittedSequence.store(
+        sequence, std::memory_order_release);
+    signalWorkAvailable();
+    submitLock.unlock();
+
+    return Vu1CommandSubmission(
+        ticket, identity, std::move(completion));
+}
+
+Vu1CommandResult ThreadedVu1Executor::submit(
+    Vu1CommandPayload payload,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    const auto waitAt = std::chrono::steady_clock::now();
+    Vu1CommandSubmission submission = submitAsync(
+        std::move(payload), guestTick, publicationToken);
+    Vu1CommandResult result = submission.wait();
+    m_resultWaitCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_resultWaitNanoseconds.fetch_add(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - waitAt)
+                .count()),
+        std::memory_order_relaxed);
+    if (result.disposition != Vu1CommandDisposition::Completed)
+    {
+        throw std::logic_error(
+            std::string("threaded VU1 command rejected: ") +
+            vu1CommandTypeName(result.digest.type));
+    }
     return result;
+}
+
+uint64_t ThreadedVu1Executor::generation() const
+{
+    std::lock_guard<std::mutex> lock(m_submitMutex);
+    return m_generation;
+}
+
+uint64_t ThreadedVu1Executor::lastSubmittedSequence() const
+{
+    std::lock_guard<std::mutex> lock(m_submitMutex);
+    return m_nextSequence == 0u
+        ? std::numeric_limits<uint64_t>::max()
+        : m_nextSequence - 1u;
+}
+
+uint64_t ThreadedVu1Executor::lastSubmittedTicket() const noexcept
+{
+    return m_submittedTickets.load(
+        std::memory_order_acquire);
+}
+
+uint64_t ThreadedVu1Executor::lastCompletedTicket() const noexcept
+{
+    return m_completedTickets.load(
+        std::memory_order_acquire);
+}
+
+void ThreadedVu1Executor::cancelPendingBeforeGeneration(
+    uint64_t generation)
+{
+    if (generation == 0u)
+    {
+        throw std::invalid_argument(
+            "VU1 cancellation generation must be non-zero");
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_submitMutex);
+        if (generation > m_generation)
+        {
+            throw std::invalid_argument(
+                "VU1 cancellation generation has not been submitted");
+        }
+    }
+
+    updateVu1AtomicMaximum(
+        m_minimumAcceptedGeneration,
+        generation);
+}
+
+void ThreadedVu1Executor::releasePayload(
+    uint64_t bytes) noexcept
+{
+    const uint64_t prior =
+        m_queuedPayloadBytes.fetch_sub(
+            bytes, std::memory_order_acq_rel);
+    if (prior < bytes)
+        std::terminate();
+    signalSpaceAvailable();
+}
+
+void ThreadedVu1Executor::recordFatalFailure(
+    std::exception_ptr failure) noexcept
+{
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        if (!m_fatalFailure)
+            m_fatalFailure = std::move(failure);
+    }
+    closeAdmissionAndQuiesceProducer();
+    m_cancelRequested.store(true, std::memory_order_release);
+    signalWorkAvailable();
+}
+
+void ThreadedVu1Executor::cancelQueued(
+    const std::exception_ptr &reason) noexcept
+{
+    while (std::optional<WorkItem> item = m_queue.tryPop())
+    {
+        try
+        {
+            item->completion.set_exception(reason);
+        }
+        catch (...)
+        {
+        }
+        releasePayload(item->payloadBytes);
+        m_completedTickets.store(
+            item->ticket, std::memory_order_release);
+    }
+}
+
+void ThreadedVu1Executor::workerMain() noexcept
+{
+    ThreadNaming::SetCurrentThreadName("PS2Vu1Owner");
+    try
+    {
+        m_processor.claimOwnerThread(
+            std::this_thread::get_id());
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            m_ownerThreadId = std::this_thread::get_id();
+        }
+    }
+    catch (...)
+    {
+        recordFatalFailure(std::current_exception());
+    }
+
+    for (;;)
+    {
+        if (!tryAcquireWorkSignal())
+        {
+            const auto idleAt =
+                std::chrono::steady_clock::now();
+            acquireWorkSignal();
+            const uint64_t idleNanoseconds =
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - idleAt)
+                        .count());
+            m_workerIdleNanoseconds.fetch_add(
+                idleNanoseconds, std::memory_order_relaxed);
+        }
+
+        if (m_cancelRequested.load(std::memory_order_acquire))
+        {
+            std::exception_ptr reason;
+            {
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                reason = m_fatalFailure;
+            }
+            if (!reason)
+                reason = makeVu1ExecutorCancellation();
+            cancelQueued(reason);
+            break;
+        }
+
+        std::optional<WorkItem> item = m_queue.tryPop();
+        if (!item)
+        {
+            if (m_drainRequested.load(std::memory_order_acquire))
+                break;
+            continue;
+        }
+
+        signalSpaceAvailable();
+        const auto activeAt =
+            std::chrono::steady_clock::now();
+        try
+        {
+            if (m_options.beforeProcess)
+            {
+                m_options.beforeProcess(
+                    item->command, item->ticket);
+            }
+
+            if (m_cancelRequested.load(std::memory_order_acquire))
+            {
+                const std::exception_ptr reason =
+                    makeVu1ExecutorCancellation();
+                item->completion.set_exception(reason);
+                releasePayload(item->payloadBytes);
+                m_completedTickets.store(
+                    item->ticket, std::memory_order_release);
+                cancelQueued(reason);
+                break;
+            }
+
+            Vu1CommandResult result{};
+            if (item->command.identity.generation <
+                m_minimumAcceptedGeneration.load(
+                    std::memory_order_acquire))
+            {
+                result = makeStaleQueuedVu1Result(
+                    item->command,
+                    m_processor.generation(),
+                    m_processor.codeGeneration());
+            }
+            else
+            {
+                result = m_processor.process(
+                    std::move(item->command));
+                if (result.disposition !=
+                    Vu1CommandDisposition::Completed)
+                {
+                    throw std::logic_error(
+                        std::string(
+                            "VU1 owner rejected queued command: ") +
+                        vu1CommandTypeName(result.digest.type));
+                }
+            }
+
+            const uint64_t completedGeneration =
+                result.identity.generation;
+            const uint64_t completedSequence =
+                result.identity.sequence;
+            if (m_options.beforePublish)
+            {
+                m_options.beforePublish(result, item->ticket);
+            }
+            m_completedTickets.store(
+                item->ticket, std::memory_order_release);
+            m_completedGeneration.store(
+                completedGeneration, std::memory_order_release);
+            m_completedSequence.store(
+                completedSequence, std::memory_order_release);
+            item->completion.set_value(std::move(result));
+            releasePayload(item->payloadBytes);
+        }
+        catch (...)
+        {
+            const std::exception_ptr failure =
+                std::current_exception();
+            try
+            {
+                item->completion.set_exception(failure);
+            }
+            catch (...)
+            {
+            }
+            m_completedTickets.store(
+                item->ticket, std::memory_order_release);
+            recordFatalFailure(failure);
+            releasePayload(item->payloadBytes);
+            cancelQueued(failure);
+            const uint64_t activeNanoseconds =
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - activeAt)
+                        .count());
+            m_workerActiveNanoseconds.fetch_add(
+                activeNanoseconds, std::memory_order_relaxed);
+            break;
+        }
+
+        const uint64_t activeNanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - activeAt)
+                    .count());
+        m_workerActiveNanoseconds.fetch_add(
+            activeNanoseconds, std::memory_order_relaxed);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_workerExited = true;
+    }
+    signalSpaceAvailable();
+}
+
+void ThreadedVu1Executor::shutdown(
+    Vu1ExecutorShutdownMode mode) noexcept
+{
+    std::lock_guard<std::mutex> shutdownLock(m_shutdownMutex);
+    closeAdmissionAndQuiesceProducer();
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        if (mode == Vu1ExecutorShutdownMode::Cancel)
+        {
+            m_cancelRequested.store(
+                true, std::memory_order_release);
+        }
+        else
+        {
+            m_drainRequested.store(
+                true, std::memory_order_release);
+        }
+        if (!m_started)
+            m_workerExited = true;
+    }
+    signalWorkAvailable();
+
+    if (m_worker.joinable())
+    {
+        if (m_worker.get_id() == std::this_thread::get_id())
+            std::terminate();
+        m_worker.join();
+    }
+}
+
+void ThreadedVu1Executor::rethrowFailure() const
+{
+    std::exception_ptr failure;
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        failure = m_fatalFailure;
+    }
+    if (failure)
+        std::rethrow_exception(failure);
+}
+
+ThreadedVu1ExecutorStatistics
+ThreadedVu1Executor::statistics() const
+{
+    ThreadedVu1ExecutorStatistics result{
+        .queueCapacity = m_queue.capacity(),
+        .payloadCapacityBytes = m_options.payloadCapacityBytes,
+        .queueDepth = m_queue.size(),
+        .queueHighWater = m_queueHighWater.load(
+            std::memory_order_acquire),
+        .queuedPayloadBytes = m_queuedPayloadBytes.load(
+            std::memory_order_acquire),
+        .payloadHighWaterBytes = m_payloadHighWaterBytes.load(
+            std::memory_order_acquire),
+        .submittedTickets = m_submittedTickets.load(
+            std::memory_order_acquire),
+        .completedTickets = m_completedTickets.load(
+            std::memory_order_acquire),
+        .submittedGeneration = m_submittedGeneration.load(
+            std::memory_order_acquire),
+        .submittedSequence = m_submittedSequence.load(
+            std::memory_order_acquire),
+        .completedGeneration = m_completedGeneration.load(
+            std::memory_order_acquire),
+        .completedSequence = m_completedSequence.load(
+            std::memory_order_acquire),
+        .producerBlockCount = m_producerBlockCount.load(
+            std::memory_order_acquire),
+        .producerBlockedNanoseconds =
+            m_producerBlockedNanoseconds.load(
+                std::memory_order_acquire),
+        .producerSlotWaitCount = m_producerSlotWaitCount.load(
+            std::memory_order_acquire),
+        .producerSlotWaitNanoseconds =
+            m_producerSlotWaitNanoseconds.load(
+                std::memory_order_acquire),
+        .producerPayloadWaitCount =
+            m_producerPayloadWaitCount.load(
+                std::memory_order_acquire),
+        .producerPayloadWaitNanoseconds =
+            m_producerPayloadWaitNanoseconds.load(
+                std::memory_order_acquire),
+        .workerActiveNanoseconds =
+            m_workerActiveNanoseconds.load(
+                std::memory_order_acquire),
+        .workerIdleNanoseconds =
+            m_workerIdleNanoseconds.load(
+                std::memory_order_acquire),
+        .resultWaitCount = m_resultWaitCount.load(
+            std::memory_order_acquire),
+        .resultWaitNanoseconds =
+            m_resultWaitNanoseconds.load(
+                std::memory_order_acquire),
+        .accepting = m_accepting.load(
+            std::memory_order_acquire),
+        .drainRequested = m_drainRequested.load(
+            std::memory_order_acquire),
+        .cancelRequested = m_cancelRequested.load(
+            std::memory_order_acquire),
+    };
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        result.started = m_started;
+        result.running = m_started && !m_workerExited;
+        result.failed = static_cast<bool>(m_fatalFailure);
+    }
+    return result;
+}
+
+std::thread::id ThreadedVu1Executor::ownerThreadId() const
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    return m_ownerThreadId;
 }

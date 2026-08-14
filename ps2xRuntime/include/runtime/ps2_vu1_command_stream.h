@@ -3,15 +3,23 @@
 
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu_program_cache.h"
+#include "runtime/ps2_spsc_queue.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -29,6 +37,7 @@ struct Vu1WorkIdentity
 
 enum class Vu1CommandType : uint8_t
 {
+    BindMemory,
     MicroMemoryWrite,
     DataMemoryWrite,
     DecodedUnpack,
@@ -47,6 +56,16 @@ enum class Vu1CommandType : uint8_t
 
 [[nodiscard]] const char *vu1CommandTypeName(
     Vu1CommandType type) noexcept;
+
+struct Vu1BindMemoryCommand
+{
+    uint8_t *microMemory = nullptr;
+    uint32_t microMemorySize = 0u;
+    uint8_t *dataMemory = nullptr;
+    uint32_t dataMemorySize = 0u;
+    uint64_t codeGeneration = 0u;
+    IVuExecutionObserver *diagnosticsObserver = nullptr;
+};
 
 struct Vu1MicroMemoryWriteCommand
 {
@@ -182,6 +201,7 @@ struct Vu1ShutdownCommand
 };
 
 using Vu1CommandPayload = std::variant<
+    Vu1BindMemoryCommand,
     Vu1MicroMemoryWriteCommand,
     Vu1DataMemoryWriteCommand,
     Vu1DecodedUnpackCommand,
@@ -282,7 +302,10 @@ struct Vu1CommandResult
     Vu1CommandDisposition disposition =
         Vu1CommandDisposition::Completed;
     Vu1CommandDigest digest{};
+    uint64_t ownerGeneration = 0u;
     uint64_t codeGeneration = 0u;
+    uint32_t programCounter = 0u;
+    bool active = false;
     Vu1CommandResultPayload payload = Vu1NoResult{};
 };
 
@@ -329,6 +352,11 @@ public:
         uint8_t *dataMemory, uint32_t dataMemorySize,
         uint64_t codeGeneration,
         IVuExecutionObserver *diagnosticsObserver = nullptr);
+    void claimOwnerThread(std::thread::id owner);
+    [[nodiscard]] std::thread::id ownerThreadId() const noexcept
+    {
+        return m_ownerThread;
+    }
 
     [[nodiscard]] Vu1CommandResult process(
         Vu1Command command);
@@ -385,6 +413,7 @@ public:
     void resetVuWorkloadProfileEpoch() override;
 
 private:
+    void assertOwnerThread() const;
     [[nodiscard]] bool validMemoryRange(
         uint32_t offset, size_t size,
         uint32_t memorySize, bool wrap) const noexcept;
@@ -411,8 +440,31 @@ private:
     Vu1VifState m_vifState{};
     uint64_t m_generation = 1u;
     uint64_t m_nextSequence = 1u;
+    std::thread::id m_ownerThread{};
     bool m_shutdown = false;
 };
+
+enum class Vu1ExecutionMode : uint8_t
+{
+    Inline,
+    ThreadedSynchronous,
+    ThreadedAsync,
+};
+
+[[nodiscard]] constexpr const char *vu1ExecutionModeName(
+    Vu1ExecutionMode mode) noexcept
+{
+    switch (mode)
+    {
+    case Vu1ExecutionMode::Inline:
+        return "inline";
+    case Vu1ExecutionMode::ThreadedSynchronous:
+        return "threaded-sync";
+    case Vu1ExecutionMode::ThreadedAsync:
+        return "threaded-async";
+    }
+    return "unknown";
+}
 
 class Vu1CommandExecutor
 {
@@ -438,7 +490,7 @@ public:
         Vu1VifStateUpdateCommand command,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u);
-    [[nodiscard]] virtual uint64_t generation() const noexcept = 0;
+    [[nodiscard]] virtual uint64_t generation() const = 0;
 };
 
 class InlineVu1Executor final : public Vu1CommandExecutor
@@ -462,14 +514,216 @@ public:
         Vu1VifStateUpdateCommand command,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u) override;
-    [[nodiscard]] uint64_t generation() const noexcept override
+    [[nodiscard]] uint64_t generation() const override
     {
-        return m_processor.generation();
+        return m_generation;
     }
 
 private:
+    [[nodiscard]] Vu1WorkIdentity nextIdentity(
+        bool startsGeneration,
+        uint64_t guestTick,
+        uint64_t publicationToken);
+    void completeIdentity(
+        bool startsGeneration,
+        const Vu1CommandResult &result);
+
     Vu1CommandProcessor &m_processor;
+    uint64_t m_generation = 1u;
     uint64_t m_nextSequence = 1u;
+    uint64_t m_lastGuestTick = 0u;
+};
+
+enum class Vu1ExecutorShutdownMode : uint8_t
+{
+    Drain,
+    Cancel,
+};
+
+struct ThreadedVu1ExecutorOptions
+{
+    size_t queueCapacity = 64u;
+    uint64_t payloadCapacityBytes = 8u * 1024u * 1024u;
+    std::function<void(const Vu1Command &, uint64_t)> beforeProcess;
+    std::function<void(const Vu1CommandResult &, uint64_t)> beforePublish;
+};
+
+struct ThreadedVu1ExecutorStatistics
+{
+    size_t queueCapacity = 0u;
+    uint64_t payloadCapacityBytes = 0u;
+    size_t queueDepth = 0u;
+    size_t queueHighWater = 0u;
+    uint64_t queuedPayloadBytes = 0u;
+    uint64_t payloadHighWaterBytes = 0u;
+    uint64_t submittedTickets = 0u;
+    uint64_t completedTickets = 0u;
+    uint64_t submittedGeneration = 0u;
+    uint64_t submittedSequence = 0u;
+    uint64_t completedGeneration = 0u;
+    uint64_t completedSequence = 0u;
+    uint64_t producerBlockCount = 0u;
+    uint64_t producerBlockedNanoseconds = 0u;
+    uint64_t producerSlotWaitCount = 0u;
+    uint64_t producerSlotWaitNanoseconds = 0u;
+    uint64_t producerPayloadWaitCount = 0u;
+    uint64_t producerPayloadWaitNanoseconds = 0u;
+    uint64_t workerActiveNanoseconds = 0u;
+    uint64_t workerIdleNanoseconds = 0u;
+    uint64_t resultWaitCount = 0u;
+    uint64_t resultWaitNanoseconds = 0u;
+    bool started = false;
+    bool running = false;
+    bool accepting = false;
+    bool drainRequested = false;
+    bool cancelRequested = false;
+    bool failed = false;
+};
+
+class Vu1CommandSubmission
+{
+public:
+    Vu1CommandSubmission() = default;
+    Vu1CommandSubmission(Vu1CommandSubmission &&) noexcept = default;
+    Vu1CommandSubmission &operator=(Vu1CommandSubmission &&) noexcept = default;
+
+    Vu1CommandSubmission(const Vu1CommandSubmission &) = delete;
+    Vu1CommandSubmission &operator=(const Vu1CommandSubmission &) = delete;
+
+    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] bool ready() const;
+    [[nodiscard]] uint64_t ticket() const noexcept
+    {
+        return m_ticket;
+    }
+    [[nodiscard]] Vu1WorkIdentity identity() const noexcept
+    {
+        return m_identity;
+    }
+    [[nodiscard]] Vu1CommandResult wait();
+
+private:
+    friend class ThreadedVu1Executor;
+
+    Vu1CommandSubmission(
+        uint64_t ticket,
+        Vu1WorkIdentity identity,
+        std::future<Vu1CommandResult> completion);
+
+    uint64_t m_ticket = 0u;
+    Vu1WorkIdentity m_identity{};
+    std::future<Vu1CommandResult> m_completion;
+};
+
+class ThreadedVu1Executor final : public Vu1CommandExecutor
+{
+public:
+    explicit ThreadedVu1Executor(
+        Vu1CommandProcessor &processor,
+        ThreadedVu1ExecutorOptions options = {});
+    ~ThreadedVu1Executor() override;
+
+    ThreadedVu1Executor(const ThreadedVu1Executor &) = delete;
+    ThreadedVu1Executor &operator=(const ThreadedVu1Executor &) = delete;
+
+    [[nodiscard]] Vu1CommandResult submit(
+        Vu1CommandPayload payload,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u) override;
+    [[nodiscard]] Vu1CommandSubmission submitAsync(
+        Vu1CommandPayload payload,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+
+    [[nodiscard]] uint64_t generation() const override;
+    [[nodiscard]] uint64_t lastSubmittedSequence() const;
+    [[nodiscard]] uint64_t lastSubmittedTicket() const noexcept;
+    [[nodiscard]] uint64_t lastCompletedTicket() const noexcept;
+
+    void cancelPendingBeforeGeneration(uint64_t generation);
+    void shutdown(
+        Vu1ExecutorShutdownMode mode =
+            Vu1ExecutorShutdownMode::Drain) noexcept;
+    void rethrowFailure() const;
+    [[nodiscard]] ThreadedVu1ExecutorStatistics statistics() const;
+    [[nodiscard]] std::thread::id ownerThreadId() const;
+
+private:
+    enum class AdmissionResult : uint8_t
+    {
+        Enqueued,
+        SlotCapacity,
+        PayloadCapacity,
+    };
+
+    struct WorkItem
+    {
+        uint64_t ticket = 0u;
+        uint64_t payloadBytes = 0u;
+        Vu1Command command{};
+        std::promise<Vu1CommandResult> completion;
+    };
+
+    [[nodiscard]] static bool startsGeneration(
+        const Vu1CommandPayload &payload) noexcept;
+    void ensureStarted();
+    [[nodiscard]] AdmissionResult tryEnqueue(WorkItem &item);
+    [[noreturn]] void throwSubmissionUnavailable() const;
+    void signalWorkAvailable() noexcept;
+    [[nodiscard]] bool tryAcquireWorkSignal() noexcept;
+    void acquireWorkSignal() noexcept;
+    void signalSpaceAvailable() noexcept;
+    void closeAdmissionAndQuiesceProducer() noexcept;
+    void workerMain() noexcept;
+    void cancelQueued(const std::exception_ptr &reason) noexcept;
+    void recordFatalFailure(std::exception_ptr failure) noexcept;
+    void releasePayload(uint64_t bytes) noexcept;
+    void updateQueueHighWater(size_t depth) noexcept;
+    void updatePayloadHighWater(uint64_t bytes) noexcept;
+
+    Vu1CommandProcessor &m_processor;
+    ThreadedVu1ExecutorOptions m_options;
+    BoundedSpscQueue<WorkItem> m_queue;
+
+    mutable std::mutex m_submitMutex;
+    uint64_t m_generation = 1u;
+    uint64_t m_nextSequence = 1u;
+    uint64_t m_nextTicket = 0u;
+    uint64_t m_lastGuestTick = 0u;
+
+    mutable std::mutex m_stateMutex;
+    std::thread m_worker;
+    std::thread::id m_ownerThreadId{};
+    std::exception_ptr m_fatalFailure;
+    bool m_started = false;
+    bool m_workerExited = false;
+
+    mutable std::mutex m_shutdownMutex;
+    std::atomic<bool> m_accepting{true};
+    std::atomic<bool> m_drainRequested{false};
+    std::atomic<bool> m_cancelRequested{false};
+    std::atomic<uint64_t> m_workSignals{0u};
+    std::atomic<uint64_t> m_spaceEpoch{0u};
+    std::atomic<uint64_t> m_minimumAcceptedGeneration{1u};
+    std::atomic<uint64_t> m_queuedPayloadBytes{0u};
+    std::atomic<size_t> m_queueHighWater{0u};
+    std::atomic<uint64_t> m_payloadHighWaterBytes{0u};
+    std::atomic<uint64_t> m_submittedTickets{0u};
+    std::atomic<uint64_t> m_completedTickets{0u};
+    std::atomic<uint64_t> m_submittedGeneration{0u};
+    std::atomic<uint64_t> m_submittedSequence{0u};
+    std::atomic<uint64_t> m_completedGeneration{0u};
+    std::atomic<uint64_t> m_completedSequence{0u};
+    std::atomic<uint64_t> m_producerBlockCount{0u};
+    std::atomic<uint64_t> m_producerBlockedNanoseconds{0u};
+    std::atomic<uint64_t> m_producerSlotWaitCount{0u};
+    std::atomic<uint64_t> m_producerSlotWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_producerPayloadWaitCount{0u};
+    std::atomic<uint64_t> m_producerPayloadWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_workerActiveNanoseconds{0u};
+    std::atomic<uint64_t> m_workerIdleNanoseconds{0u};
+    std::atomic<uint64_t> m_resultWaitCount{0u};
+    std::atomic<uint64_t> m_resultWaitNanoseconds{0u};
 };
 
 #endif
