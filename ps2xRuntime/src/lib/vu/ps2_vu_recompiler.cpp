@@ -273,6 +273,12 @@ namespace
         uint32_t maximumCycles,
         const NativeContextView *view);
 
+    // These feature bits are part of the backend capability contract even
+    // when the native emitter is compiled out.  Keep them available to the
+    // shared opcode predicates used by interpreter-only builds.
+    constexpr uint64_t kHostFeatureAvx = 1u << 2u;
+    constexpr uint64_t kHostFeatureFma = 1u << 4u;
+
 #if PS2X_HAS_VU_X64_RECOMPILER
     constexpr uint32_t kMxcsrRoundingMask = 3u << 13u;
     constexpr uint32_t kMxcsrRoundTowardZero = 3u << 13u;
@@ -282,8 +288,6 @@ namespace
         kMxcsrRoundTowardZero |
         kMxcsrDenormalsAreZero |
         kMxcsrFlushToZero;
-    constexpr uint64_t kHostFeatureAvx = 1u << 2u;
-    constexpr uint64_t kHostFeatureFma = 1u << 4u;
     constexpr size_t kEmitterCapacity = 128u * 1024u;
 
     static_assert(
