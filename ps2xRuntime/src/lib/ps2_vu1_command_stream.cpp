@@ -233,6 +233,95 @@ namespace
         return (bits + 7u) / 8u;
     }
 
+    bool validDecodedUnpackPayload(
+        const Vu1DecodedUnpackCommand &command) noexcept
+    {
+        return !command.bytes.empty() &&
+               command.writeVectorCount != 0u &&
+               command.sourceVectorCount != 0u;
+    }
+
+    uint64_t decodedUnpackPayloadSize(
+        const Vu1DecodedUnpackCommand &command) noexcept
+    {
+        return 11u + sizeof(uint64_t) + command.bytes.size() +
+               (command.vifStateBefore
+                    ? 12u * sizeof(uint32_t)
+                    : 0u);
+    }
+
+    uint64_t decodedUnpackBatchPayloadSize(
+        const Vu1DecodedUnpackBatch &batch) noexcept
+    {
+        uint64_t size = sizeof(uint64_t);
+        for (const Vu1DecodedUnpackCommand &command :
+             batch.commands)
+        {
+            const uint64_t commandSize =
+                decodedUnpackPayloadSize(command);
+            if (commandSize >
+                std::numeric_limits<uint64_t>::max() - size)
+            {
+                return std::numeric_limits<uint64_t>::max();
+            }
+            size += commandSize;
+        }
+        return size;
+    }
+
+    uint64_t decodedUnpackOperationCount(
+        const Vu1CommandPayload &payload) noexcept
+    {
+        return std::visit(
+            [](const auto &value) noexcept -> uint64_t
+            {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (
+                    std::is_same_v<T, Vu1DecodedUnpackCommand>)
+                {
+                    return 1u;
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1DecodedUnpackBatchCommand>)
+                {
+                    return value.batch
+                        ? value.batch->commands.size()
+                        : 0u;
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1MscalCommand> ||
+                    std::is_same_v<T, Vu1MscalfCommand> ||
+                    std::is_same_v<T, Vu1MscntCommand>)
+                {
+                    return value.unpacksBefore
+                        ? value.unpacksBefore->commands.size()
+                        : 0u;
+                }
+                else
+                {
+                    return 0u;
+                }
+            },
+            payload);
+    }
+
+    void hashDecodedUnpack(
+        uint64_t &hash,
+        const Vu1DecodedUnpackCommand &command)
+    {
+        hashScalar(hash, command.immediate);
+        hashScalar(hash, command.vectorLength);
+        hashScalar(hash, command.componentCount);
+        hashScalar(hash, command.writeVectorCount);
+        hashScalar(hash, command.sourceVectorCount);
+        hashScalar(hash, command.sourceWordAlignment);
+        hashScalar(hash, command.maskEnabled);
+        hashScalar(hash, command.zeroExtend);
+        hashVector(hash, command.bytes);
+        if (command.vifStateBefore)
+            hashVifState(hash, *command.vifStateBefore);
+    }
+
     void copyWrappedBytes(
         uint8_t *destination, uint32_t destinationSize,
         uint32_t destinationOffset, const uint8_t *source,
@@ -675,6 +764,29 @@ namespace
         return sourceIndex == command.sourceVectorCount;
     }
 
+    bool applyVu1DecodedUnpackBatchImpl(
+        const Vu1DecodedUnpackBatch &batch,
+        Vu1VifState &vif,
+        uint8_t *dataMemory,
+        uint32_t dataMemorySize)
+    {
+        if (batch.commands.empty())
+            return false;
+        for (const Vu1DecodedUnpackCommand &command :
+             batch.commands)
+        {
+            if (command.vifStateBefore)
+                vif = *command.vifStateBefore;
+            if (!applyVu1DecodedUnpackImpl(
+                    command, vif, dataMemory,
+                    dataMemorySize))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool validPayload(const Vu1CommandPayload &payload) noexcept
     {
         return std::visit(
@@ -699,9 +811,29 @@ namespace
                 else if constexpr (
                     std::is_same_v<T, Vu1DecodedUnpackCommand>)
                 {
-                    return !value.bytes.empty() &&
-                           value.writeVectorCount != 0u &&
-                           value.sourceVectorCount != 0u;
+                    return validDecodedUnpackPayload(value);
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1DecodedUnpackBatchCommand>)
+                {
+                    return value.batch &&
+                           !value.batch->commands.empty() &&
+                           std::all_of(
+                               value.batch->commands.begin(),
+                               value.batch->commands.end(),
+                               validDecodedUnpackPayload);
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1MscalCommand> ||
+                    std::is_same_v<T, Vu1MscalfCommand> ||
+                    std::is_same_v<T, Vu1MscntCommand>)
+                {
+                    return !value.unpacksBefore ||
+                           (!value.unpacksBefore->commands.empty() &&
+                            std::all_of(
+                                value.unpacksBefore->commands.begin(),
+                                value.unpacksBefore->commands.end(),
+                                validDecodedUnpackPayload));
                 }
                 else if constexpr (
                     std::is_same_v<T, Vu1AdvanceSliceCommand>)
@@ -791,7 +923,9 @@ Vu1CommandType vu1CommandType(
                 return Vu1CommandType::MicroMemoryWrite;
             else if constexpr (std::is_same_v<T, Vu1DataMemoryWriteCommand>)
                 return Vu1CommandType::DataMemoryWrite;
-            else if constexpr (std::is_same_v<T, Vu1DecodedUnpackCommand>)
+            else if constexpr (
+                std::is_same_v<T, Vu1DecodedUnpackCommand> ||
+                std::is_same_v<T, Vu1DecodedUnpackBatchCommand>)
                 return Vu1CommandType::DecodedUnpack;
             else if constexpr (std::is_same_v<T, Vu1VifStateUpdateCommand>)
                 return Vu1CommandType::VifStateUpdate;
@@ -851,10 +985,14 @@ uint64_t vu1CommandPayloadSize(
             else if constexpr (
                 std::is_same_v<T, Vu1DecodedUnpackCommand>)
             {
-                return 11u + sizeof(uint64_t) + value.bytes.size() +
-                       (value.vifStateBefore
-                            ? 12u * sizeof(uint32_t)
-                            : 0u);
+                return decodedUnpackPayloadSize(value);
+            }
+            else if constexpr (
+                std::is_same_v<T, Vu1DecodedUnpackBatchCommand>)
+            {
+                return value.batch
+                    ? decodedUnpackBatchPayloadSize(*value.batch)
+                    : sizeof(uint64_t);
             }
             else if constexpr (
                 std::is_same_v<T, Vu1VifStateUpdateCommand>)
@@ -871,6 +1009,10 @@ uint64_t vu1CommandPayloadSize(
                 std::is_same_v<T, Vu1MscalfCommand>)
             {
                 return 3u * sizeof(uint32_t) +
+                       (value.unpacksBefore
+                            ? decodedUnpackBatchPayloadSize(
+                                  *value.unpacksBefore)
+                            : 0u) +
                        (value.vifStateBefore
                             ? 12u * sizeof(uint32_t)
                             : 0u);
@@ -878,6 +1020,10 @@ uint64_t vu1CommandPayloadSize(
             else if constexpr (std::is_same_v<T, Vu1MscntCommand>)
             {
                 return 2u * sizeof(uint32_t) +
+                       (value.unpacksBefore
+                            ? decodedUnpackBatchPayloadSize(
+                                  *value.unpacksBefore)
+                            : 0u) +
                        (value.vifStateBefore
                             ? 12u * sizeof(uint32_t)
                             : 0u);
@@ -952,17 +1098,23 @@ uint64_t vu1CommandPayloadHash(
             else if constexpr (
                 std::is_same_v<T, Vu1DecodedUnpackCommand>)
             {
-                hashScalar(hash, value.immediate);
-                hashScalar(hash, value.vectorLength);
-                hashScalar(hash, value.componentCount);
-                hashScalar(hash, value.writeVectorCount);
-                hashScalar(hash, value.sourceVectorCount);
-                hashScalar(hash, value.sourceWordAlignment);
-                hashScalar(hash, value.maskEnabled);
-                hashScalar(hash, value.zeroExtend);
-                hashVector(hash, value.bytes);
-                if (value.vifStateBefore)
-                    hashVifState(hash, *value.vifStateBefore);
+                hashDecodedUnpack(hash, value);
+            }
+            else if constexpr (
+                std::is_same_v<T, Vu1DecodedUnpackBatchCommand>)
+            {
+                const uint64_t count = value.batch
+                    ? value.batch->commands.size()
+                    : 0u;
+                hashScalar(hash, count);
+                if (value.batch)
+                {
+                    for (const Vu1DecodedUnpackCommand &command :
+                         value.batch->commands)
+                    {
+                        hashDecodedUnpack(hash, command);
+                    }
+                }
             }
             else if constexpr (
                 std::is_same_v<T, Vu1VifStateUpdateCommand>)
@@ -985,6 +1137,18 @@ uint64_t vu1CommandPayloadHash(
                 hashScalar(hash, value.startPc);
                 hashScalar(hash, value.top);
                 hashScalar(hash, value.itop);
+                if (value.unpacksBefore)
+                {
+                    hashScalar(
+                        hash,
+                        static_cast<uint64_t>(
+                            value.unpacksBefore->commands.size()));
+                    for (const Vu1DecodedUnpackCommand &command :
+                         value.unpacksBefore->commands)
+                    {
+                        hashDecodedUnpack(hash, command);
+                    }
+                }
                 if (value.vifStateBefore)
                     hashVifState(hash, *value.vifStateBefore);
             }
@@ -992,6 +1156,18 @@ uint64_t vu1CommandPayloadHash(
             {
                 hashScalar(hash, value.top);
                 hashScalar(hash, value.itop);
+                if (value.unpacksBefore)
+                {
+                    hashScalar(
+                        hash,
+                        static_cast<uint64_t>(
+                            value.unpacksBefore->commands.size()));
+                    for (const Vu1DecodedUnpackCommand &command :
+                         value.unpacksBefore->commands)
+                    {
+                        hashDecodedUnpack(hash, command);
+                    }
+                }
                 if (value.vifStateBefore)
                     hashVifState(hash, *value.vifStateBefore);
             }
@@ -1618,6 +1794,18 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
                 }
                 return Vu1VifStateResult{m_vifState};
             }
+            else if constexpr (
+                std::is_same_v<T, Vu1DecodedUnpackBatchCommand>)
+            {
+                if (!value.batch ||
+                    !applyVu1DecodedUnpackBatchImpl(
+                        *value.batch, m_vifState,
+                        m_dataMemory, m_dataMemorySize))
+                {
+                    disposition = Vu1CommandDisposition::Malformed;
+                }
+                return Vu1VifStateResult{m_vifState};
+            }
             else if constexpr (std::is_same_v<T, Vu1VifStateUpdateCommand>)
             {
                 m_vifState = value.state;
@@ -1696,6 +1884,14 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
             }
             else if constexpr (std::is_same_v<T, Vu1MscalCommand>)
             {
+                if (value.unpacksBefore &&
+                    !applyVu1DecodedUnpackBatchImpl(
+                        *value.unpacksBefore, m_vifState,
+                        m_dataMemory, m_dataMemorySize))
+                {
+                    disposition = Vu1CommandDisposition::Malformed;
+                    return Vu1NoResult{};
+                }
                 if (value.vifStateBefore)
                     m_vifState = *value.vifStateBefore;
                 m_unit.start(
@@ -1707,6 +1903,14 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
             }
             else if constexpr (std::is_same_v<T, Vu1MscalfCommand>)
             {
+                if (value.unpacksBefore &&
+                    !applyVu1DecodedUnpackBatchImpl(
+                        *value.unpacksBefore, m_vifState,
+                        m_dataMemory, m_dataMemorySize))
+                {
+                    disposition = Vu1CommandDisposition::Malformed;
+                    return Vu1NoResult{};
+                }
                 if (value.vifStateBefore)
                     m_vifState = *value.vifStateBefore;
                 m_unit.start(
@@ -1718,6 +1922,14 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
             }
             else if constexpr (std::is_same_v<T, Vu1MscntCommand>)
             {
+                if (value.unpacksBefore &&
+                    !applyVu1DecodedUnpackBatchImpl(
+                        *value.unpacksBefore, m_vifState,
+                        m_dataMemory, m_dataMemorySize))
+                {
+                    disposition = Vu1CommandDisposition::Malformed;
+                    return Vu1NoResult{};
+                }
                 if (value.vifStateBefore)
                     m_vifState = *value.vifStateBefore;
                 m_unit.resumeState(
@@ -3014,6 +3226,8 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
         m_nextTicket, "transport ticket");
     const uint64_t payloadBytes =
         vu1CommandPayloadSize(payload);
+    const uint64_t decodedUnpackOperations =
+        decodedUnpackOperationCount(payload);
     if (payloadBytes > m_options.payloadCapacityBytes)
     {
         throw std::length_error(
@@ -3036,6 +3250,8 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
     WorkItem item{
         .ticket = ticket,
         .payloadBytes = payloadBytes,
+        .decodedUnpackOperations =
+            decodedUnpackOperations,
         .command = std::move(command),
         .speculationResolution = resolution,
         .beginsSpeculativeSlice = beginsSpeculativeSlice,
@@ -3139,6 +3355,9 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
     m_submittedCommandsByType[
         vu1CommandTypeIndex(commandType)]
         .fetch_add(1u, std::memory_order_relaxed);
+    m_submittedDecodedUnpackOperations.fetch_add(
+        decodedUnpackOperations,
+        std::memory_order_relaxed);
     if (beginsSpeculativeSlice)
     {
         m_producerSpeculationCheckpoint.emplace(
@@ -3490,6 +3709,12 @@ void ThreadedVu1Executor::workerMain() noexcept
                         "VU1 owner rejected queued command: ") +
                     vu1CommandTypeName(result.digest.type));
             }
+            if (!stale)
+            {
+                m_executedDecodedUnpackOperations.fetch_add(
+                    item->decodedUnpackOperations,
+                    std::memory_order_relaxed);
+            }
 
             const uint64_t completedGeneration =
                 result.identity.generation;
@@ -3647,6 +3872,12 @@ ThreadedVu1Executor::statistics() const
             std::memory_order_acquire),
         .resultWaitNanoseconds =
             m_resultWaitNanoseconds.load(
+                std::memory_order_acquire),
+        .submittedDecodedUnpackOperations =
+            m_submittedDecodedUnpackOperations.load(
+                std::memory_order_acquire),
+        .executedDecodedUnpackOperations =
+            m_executedDecodedUnpackOperations.load(
                 std::memory_order_acquire),
         .speculation = m_processor.speculationStatistics(),
         .accepting = m_accepting.load(

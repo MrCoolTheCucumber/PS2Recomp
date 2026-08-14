@@ -351,8 +351,20 @@ is immutable owned input on the next decoded UNPACK or MSCAL-family command;
 if no such consumer follows, one state-update command is emitted before the
 parser batch closes. This removes redundant transport rendezvous without
 reordering an owner-visible command, borrowing parser memory, or carrying the
-state across a VIF service/event boundary. Inline and threaded-synchronous
-command streams retain their original command identities and digests.
+pending mutation across a VIF service/event boundary. A synchronized EE shadow
+of the last full state may persist only to classify whether a later UNPACK
+requires ROW feedback. Inline and threaded-synchronous command streams retain
+their original command identities and digests.
+
+The same parser batch may retain consecutive decoded UNPACK inputs while their
+VIF mode cannot update ROW. The owner receives those immutable inputs either
+as one standalone batch or folded immediately before the following
+MSCAL/MSCALF/MSCNT operation. A mode-2 UNPACK remains synchronous so its ROW
+feedback is published to the EE parser before another command is decoded.
+Capacity limits force an ordered early batch flush, and any other owner-visible
+command flushes preceding UNPACKs first. Submitted/executed UNPACK-operation
+counters remain separate from transport-ticket counters so batching cannot
+hide dropped semantic work.
 
 The public accessors are not exemptions from this matrix. Milestones 2 and 6
 must reduce their production visibility or add diagnostic owner assertions so

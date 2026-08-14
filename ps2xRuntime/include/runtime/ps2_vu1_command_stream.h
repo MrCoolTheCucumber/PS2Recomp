@@ -135,6 +135,19 @@ struct Vu1DecodedUnpackCommand
     std::shared_ptr<const Vu1VifState> vifStateBefore;
 };
 
+// One parser-local owner mutation. The EE still owns VIF byte framing while
+// the immutable batch lets the VU1 owner apply consecutive decoded UNPACKs in
+// their original order with one transport ticket.
+struct Vu1DecodedUnpackBatch
+{
+    std::vector<Vu1DecodedUnpackCommand> commands;
+};
+
+struct Vu1DecodedUnpackBatchCommand
+{
+    std::shared_ptr<const Vu1DecodedUnpackBatch> batch;
+};
+
 struct Vu1VifStateUpdateCommand
 {
     Vu1VifState state{};
@@ -169,6 +182,7 @@ struct Vu1MscalCommand
     uint32_t startPc = 0u;
     uint32_t top = 0u;
     uint32_t itop = 0u;
+    std::shared_ptr<const Vu1DecodedUnpackBatch> unpacksBefore;
     std::shared_ptr<const Vu1VifState> vifStateBefore;
 };
 
@@ -177,6 +191,7 @@ struct Vu1MscalfCommand
     uint32_t startPc = 0u;
     uint32_t top = 0u;
     uint32_t itop = 0u;
+    std::shared_ptr<const Vu1DecodedUnpackBatch> unpacksBefore;
     std::shared_ptr<const Vu1VifState> vifStateBefore;
 };
 
@@ -184,6 +199,7 @@ struct Vu1MscntCommand
 {
     uint32_t top = 0u;
     uint32_t itop = 0u;
+    std::shared_ptr<const Vu1DecodedUnpackBatch> unpacksBefore;
     std::shared_ptr<const Vu1VifState> vifStateBefore;
 };
 
@@ -262,6 +278,7 @@ using Vu1CommandPayload = std::variant<
     Vu1MicroMemoryWriteCommand,
     Vu1DataMemoryWriteCommand,
     Vu1DecodedUnpackCommand,
+    Vu1DecodedUnpackBatchCommand,
     Vu1VifStateUpdateCommand,
     Vu1RegisterWriteCommand,
     Vu1MscalCommand,
@@ -787,6 +804,8 @@ struct ThreadedVu1ExecutorStatistics
     uint64_t workerIdleNanoseconds = 0u;
     uint64_t resultWaitCount = 0u;
     uint64_t resultWaitNanoseconds = 0u;
+    uint64_t submittedDecodedUnpackOperations = 0u;
+    uint64_t executedDecodedUnpackOperations = 0u;
     std::array<ThreadedVu1CommandTypeStatistics,
                kVu1CommandTypeCount>
         commandTypes{};
@@ -906,6 +925,7 @@ private:
     {
         uint64_t ticket = 0u;
         uint64_t payloadBytes = 0u;
+        uint64_t decodedUnpackOperations = 0u;
         Vu1Command command{};
         Vu1SpeculationResolution speculationResolution =
             Vu1SpeculationResolution::None;
@@ -993,6 +1013,10 @@ private:
     std::atomic<uint64_t> m_workerIdleNanoseconds{0u};
     std::atomic<uint64_t> m_resultWaitCount{0u};
     std::atomic<uint64_t> m_resultWaitNanoseconds{0u};
+    std::atomic<uint64_t>
+        m_submittedDecodedUnpackOperations{0u};
+    std::atomic<uint64_t>
+        m_executedDecodedUnpackOperations{0u};
     std::array<std::atomic<uint64_t>, kVu1CommandTypeCount>
         m_submittedCommandsByType{};
     std::array<std::atomic<uint64_t>, kVu1CommandTypeCount>

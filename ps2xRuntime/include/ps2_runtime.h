@@ -2516,6 +2516,10 @@ private:
         Vu1VifStateUpdateCommand command,
         uint64_t guestTick,
         uint64_t publicationToken);
+    [[nodiscard]] std::shared_ptr<
+        const Vu1DecodedUnpackBatch>
+    takeBatchedVu1DecodedUnpacks();
+    void flushBatchedVu1DecodedUnpacks();
     void flushBatchedVu1VifStateUpdate();
     void refreshVu1DiagnosticsConfiguration(
         uint64_t guestTick,
@@ -2758,6 +2762,8 @@ private:
     ThreadedVu1Executor *m_threadedVu1Executor = nullptr;
     Vu1ExecutionMode m_vu1ExecutionMode =
         Vu1ExecutionMode::Inline;
+    uint64_t m_vu1CommandPayloadCapacityBytes =
+        8u * 1024u * 1024u;
     std::atomic<bool> m_publishedVu1Active{false};
     std::atomic<uint32_t> m_publishedVu1ProgramCounter{0u};
     std::atomic<uint64_t> m_publishedVu1CodeGeneration{0u};
@@ -2784,6 +2790,12 @@ private:
     Vu1SynchronousCommandBarrier
         m_batchedVu1SynchronousCommandBarrier{};
     std::optional<Vu1VifState> m_batchedVu1VifState;
+    std::optional<Vu1VifState> m_knownVu1VifState;
+    std::vector<Vu1DecodedUnpackCommand>
+        m_batchedVu1DecodedUnpacks;
+    std::optional<Vu1VifState>
+        m_batchedVu1DecodedUnpackFinalVifState;
+    uint64_t m_batchedVu1DecodedUnpackPayloadBytes = 0u;
     bool m_vu1SynchronousCommandBatchActive = false;
     std::atomic<bool> m_vu1AsyncPendingSlice{false};
     std::atomic<bool> m_vu1AsyncDeferredSlice{false};

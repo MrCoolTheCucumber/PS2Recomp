@@ -2576,11 +2576,15 @@ void register_ps2_vu1_command_stream_tests()
 
                     constexpr uint32_t kVif1 = 0x10009000u;
                     constexpr uint32_t kSource = 0x00030000u;
-                    const std::array<uint32_t, 4u> vifCommands = {
+                    const std::array<uint32_t, 8u> vifCommands = {
                         makeVifCommand(0x05u, 0u, 1u),
                         makeVifCommand(0x6fu, 1u, 0u),
                         0x00001234u,
+                        makeVifCommand(0x6fu, 1u, 1u),
+                        0x00005678u,
                         makeVifCommand(0x05u, 0u, 3u),
+                        makeVifCommand(0x00u, 0u, 0u),
+                        makeVifCommand(0x00u, 0u, 0u),
                     };
                     std::memcpy(
                         runtime.memory().getRDRAM() + kSource,
@@ -2588,7 +2592,7 @@ void register_ps2_vu1_command_stream_tests()
                     if (!runtime.memory().writeIORegister(
                             kVif1 + 0x10u, kSource) ||
                         !runtime.memory().writeIORegister(
-                            kVif1 + 0x20u, 1u) ||
+                            kVif1 + 0x20u, 2u) ||
                         !runtime.memory().writeIORegister(
                             kVif1, 0x100u))
                     {
@@ -2604,9 +2608,9 @@ void register_ps2_vu1_command_stream_tests()
                         runtime.vu1AsyncStatistics();
 
                     // The payload schedules a finalization-only VIF1 service
-                    // two EE cycles later. Keep the invalidated slice as a
+                    // four EE cycles later. Keep the invalidated slice as a
                     // plan until that known earlier callback has completed.
-                    context.advanceEeCycleTicks(16u);
+                    context.advanceEeCycleTicks(32u);
                     runtime.serviceEeEventsAtBlockBoundary(
                         runtime.memory().getRDRAM(), &context);
                     const Vu1AsyncRuntimeStatistics afterEmptyService =
@@ -2672,7 +2676,7 @@ void register_ps2_vu1_command_stream_tests()
                         asynchronous.beforePayload,
                         Vu1CommandType::DecodedUnpack),
                 1ull,
-                "the parser batch should submit its decoded UNPACK once");
+                "the parser batch should submit both decoded UNPACKs in one owner ticket");
             t.Equals(
                 commandCount(
                     asynchronous.afterPayload,
@@ -4030,6 +4034,190 @@ void register_ps2_vu1_command_stream_tests()
                 "pending shutdown should resolve without a lifecycle hang");
             t.Equals(advanceAttempts->load(std::memory_order_acquire), 1ull,
                      "shutdown should not requeue discarded future work");
+        });
+
+        tc.Run("runtime folds parser-local UNPACKs into MSCAL", [](TestCase &t)
+        {
+            std::atomic<uint64_t> foldedUnpacks{0u};
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedAsync;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.vu1BeforeProcess =
+                [&foldedUnpacks](
+                    const Vu1Command &command, uint64_t)
+                {
+                    if (command.type != Vu1CommandType::Mscal)
+                        return;
+                    const auto *const mscal =
+                        std::get_if<Vu1MscalCommand>(
+                            &command.payload);
+                    if (mscal && mscal->unpacksBefore)
+                    {
+                        foldedUnpacks.store(
+                            mscal->unpacksBefore->commands.size(),
+                            std::memory_order_release);
+                    }
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "UNPACK-fold runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "UNPACK-fold runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u, 0u, kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kSource = 0x00032000u;
+            const std::array<uint32_t, 8u> vifCommands = {
+                makeVifCommand(0x05u, 0u, 1u),
+                makeVifCommand(0x6fu, 1u, 0u),
+                0x00001234u,
+                makeVifCommand(0x6fu, 1u, 1u),
+                0x00005678u,
+                makeVifCommand(0x14u, 0u, 0u),
+                makeVifCommand(0x00u, 0u, 0u),
+                makeVifCommand(0x00u, 0u, 0u),
+            };
+            std::memcpy(
+                runtime.memory().getRDRAM() + kSource,
+                vifCommands.data(), sizeof(vifCommands));
+            const Vu1AsyncRuntimeStatistics before =
+                runtime.vu1AsyncStatistics();
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kVif1 + 0x10u, kSource) &&
+                    runtime.memory().writeIORegister(
+                        kVif1 + 0x20u, 2u) &&
+                    runtime.memory().writeIORegister(
+                        kVif1, 0x100u),
+                "the UNPACK-fold VIF1 DMA should start");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const Vu1AsyncRuntimeStatistics after =
+                runtime.vu1AsyncStatistics();
+            const auto commandCount =
+                [](const Vu1AsyncRuntimeStatistics &statistics,
+                   Vu1CommandType type)
+                {
+                    return statistics.owner.commandTypes[
+                        vu1CommandTypeIndex(type)].submitted;
+                };
+            t.Equals(
+                foldedUnpacks.load(std::memory_order_acquire),
+                2ull,
+                "MSCAL should own both preceding decoded UNPACKs");
+            t.Equals(
+                commandCount(after, Vu1CommandType::DecodedUnpack) -
+                    commandCount(before, Vu1CommandType::DecodedUnpack),
+                0ull,
+                "folded UNPACKs should not submit a separate owner ticket");
+            t.Equals(
+                commandCount(after, Vu1CommandType::Mscal) -
+                    commandCount(before, Vu1CommandType::Mscal),
+                1ull,
+                "the parser batch should retain one MSCAL owner ticket");
+            t.Equals(
+                after.owner.submittedDecodedUnpackOperations -
+                    before.owner.submittedDecodedUnpackOperations,
+                2ull,
+                "the owner telemetry should retain both submitted UNPACK operations");
+            t.Equals(
+                after.owner.executedDecodedUnpackOperations -
+                    before.owner.executedDecodedUnpackOperations,
+                2ull,
+                "the owner telemetry should retain both executed UNPACK operations");
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            t.IsTrue(
+                std::any_of(
+                    snapshot->dataMemory.begin(),
+                    snapshot->dataMemory.begin() + 32u,
+                    [](uint8_t value) { return value != 0u; }),
+                "the folded UNPACKs should mutate canonical owner data");
+        });
+
+        tc.Run("runtime synchronizes mode-2 UNPACK row feedback", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedAsync;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "mode-2 runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "mode-2 runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u, 0u, kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kSource = 0x00033000u;
+            const std::array<uint32_t, 12u> vifCommands = {
+                makeVifCommand(0x05u, 0u, 2u),
+                makeVifCommand(0x30u, 0u, 0u),
+                1u, 2u, 3u, 4u,
+                makeVifCommand(0x6cu, 1u, 0u),
+                10u, 20u, 30u, 40u,
+                makeVifCommand(0x14u, 0u, 0u),
+            };
+            std::memcpy(
+                runtime.memory().getRDRAM() + kSource,
+                vifCommands.data(), sizeof(vifCommands));
+            const Vu1AsyncRuntimeStatistics before =
+                runtime.vu1AsyncStatistics();
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kVif1 + 0x10u, kSource) &&
+                    runtime.memory().writeIORegister(
+                        kVif1 + 0x20u, 3u) &&
+                    runtime.memory().writeIORegister(
+                        kVif1, 0x100u),
+                "the mode-2 VIF1 DMA should start");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const Vu1AsyncRuntimeStatistics after =
+                runtime.vu1AsyncStatistics();
+            const auto decodedCount =
+                [](const Vu1AsyncRuntimeStatistics &statistics)
+                {
+                    return statistics.owner.commandTypes[
+                        vu1CommandTypeIndex(
+                            Vu1CommandType::DecodedUnpack)]
+                        .submitted;
+                };
+            t.Equals(
+                decodedCount(after) - decodedCount(before),
+                1ull,
+                "mode-2 row feedback should retain a synchronous UNPACK ticket");
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            t.IsTrue(
+                snapshot->vif.row ==
+                    std::array<uint32_t, 4u>{11u, 22u, 33u, 44u},
+                "mode-2 row feedback should reach both parser and owner state");
+            t.IsTrue(
+                std::equal(
+                    std::begin(runtime.memory().vif1_regs.row),
+                    std::end(runtime.memory().vif1_regs.row),
+                    snapshot->vif.row.begin()),
+                "the EE parser row should match the canonical owner row");
         });
 
         tc.Run("runtime chains MSCAL MSCNT and VIF waits through async events", [](TestCase &t)

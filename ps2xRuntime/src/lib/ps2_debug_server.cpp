@@ -1399,6 +1399,14 @@ struct PS2DebugServer::Impl
         vu1OwnerValue.AddMember(
             "result_wait_ns",
             vu1OwnerStats.resultWaitNanoseconds, allocator);
+        vu1OwnerValue.AddMember(
+            "submitted_decoded_unpack_operations",
+            vu1OwnerStats.submittedDecodedUnpackOperations,
+            allocator);
+        vu1OwnerValue.AddMember(
+            "executed_decoded_unpack_operations",
+            vu1OwnerStats.executedDecodedUnpackOperations,
+            allocator);
         Value vu1CommandTypesValue(rapidjson::kObjectType);
         for (size_t index = 0u;
              index < kVu1CommandTypeCount; ++index)
