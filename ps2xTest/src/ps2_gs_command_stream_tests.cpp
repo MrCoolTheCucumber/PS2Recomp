@@ -583,6 +583,11 @@ void register_ps2_gs_command_stream_tests()
             t.IsTrue(stats.producerBlockCount >= 1u &&
                          stats.producerBlockedNanoseconds > 0u,
                      "backpressure should retain bounded wait evidence");
+            t.IsTrue(stats.producerSlotWaitCount >= 1u &&
+                         stats.producerSlotWaitNanoseconds > 0u,
+                     "a full ring should be classified as slot backpressure");
+            t.Equals(stats.producerPayloadWaitCount, 0ull,
+                     "ample payload capacity should not report payload waits");
 
             for (uint64_t index = 0u; index < 100u; ++index)
             {
@@ -656,6 +661,13 @@ void register_ps2_gs_command_stream_tests()
                      "payload backpressure should preserve every completion");
             t.IsTrue(executor.statistics().queueHighWater < 8u,
                      "the payload gate should distinguish itself from slot exhaustion");
+            const ThreadedGsExecutorStatistics statistics =
+                executor.statistics();
+            t.IsTrue(statistics.producerPayloadWaitCount >= 1u &&
+                         statistics.producerPayloadWaitNanoseconds > 0u,
+                     "the byte bound should be classified as payload backpressure");
+            t.Equals(statistics.producerSlotWaitCount, 0ull,
+                     "free command slots should not report slot waits");
         });
 
         tc.Run("threaded GS barriers retire in FIFO order after prior mutations", [](TestCase &t)
@@ -975,12 +987,18 @@ void register_ps2_gs_command_stream_tests()
                             std::memory_order_acquire);
                     }),
                     "the shutdown thread should start within the bounded test interval");
+                const bool cancellationRequested = waitUntil([&]()
+                {
+                    return executor.statistics().cancelRequested;
+                });
                 t.IsFalse(
                     shutdownReturned.load(
                         std::memory_order_acquire),
                     "shutdown should join an owner still inside a command boundary");
                 gate->release();
                 shutdownThread.join();
+                t.IsTrue(cancellationRequested,
+                         "the fixture should observe cancellation before releasing the owner");
                 bool everyCancelled = true;
                 for (GsCommandSubmission &submission : submissions)
                 {
@@ -1035,6 +1053,93 @@ void register_ps2_gs_command_stream_tests()
                          static_cast<uint8_t>(1u),
                          "drain shutdown should preserve the final ordered mutation");
             }
+        });
+
+        tc.Run("threaded GS shutdown closes and wakes a capacity-blocked producer", [](TestCase &t)
+        {
+            GsFixture fixture;
+            const auto gate = std::make_shared<WorkerGate>();
+            ThreadedGsExecutor executor(
+                fixture.processor,
+                ThreadedGsExecutorOptions{
+                    .queueCapacity = 1u,
+                    .payloadCapacityBytes = 4096u,
+                    .beforeProcess =
+                        [gate](const GsCommand &command, uint64_t ticket)
+                        {
+                            gate->beforeProcess(command, ticket);
+                        },
+                });
+            GsCommandSubmission active =
+                executor.submitAsync(GsBarrierCommand{});
+            t.IsTrue(gate->waitUntilEntered(),
+                     "the owner should be held with one active command");
+            GsCommandSubmission queued =
+                executor.submitAsync(GsBarrierCommand{});
+
+            std::atomic<bool> producerReturned{false};
+            std::string producerError;
+            std::thread producer([&]()
+            {
+                producerError = captureException([&]()
+                {
+                    (void)executor.submitAsync(GsBarrierCommand{});
+                });
+                producerReturned.store(true, std::memory_order_release);
+            });
+            t.IsTrue(
+                waitUntil([&]()
+                {
+                    return executor.statistics().producerBlockCount >= 1u;
+                }),
+                "the extra producer should block on the full ring");
+
+            std::atomic<bool> shutdownReturned{false};
+            std::thread shutdownThread([&]()
+            {
+                executor.shutdown(GsExecutorShutdownMode::Cancel);
+                shutdownReturned.store(true, std::memory_order_release);
+            });
+            const bool producerWokeBeforeOwner = waitUntil([&]()
+            {
+                return producerReturned.load(std::memory_order_acquire);
+            });
+            const bool cancellationRequested = waitUntil([&]()
+            {
+                return executor.statistics().cancelRequested;
+            });
+            t.IsFalse(shutdownReturned.load(std::memory_order_acquire),
+                      "shutdown should still be joining the held owner");
+
+            gate->release();
+            producer.join();
+            shutdownThread.join();
+            t.IsTrue(producerWokeBeforeOwner,
+                     "admission closure should wake the blocked producer before owner exit");
+            t.IsTrue(cancellationRequested,
+                     "shutdown should request cancellation before the owner is released");
+            t.IsTrue(
+                producerError.find("not accepting work") !=
+                    std::string::npos,
+                "the blocked producer should observe intentional admission closure");
+            t.IsFalse(captureException([&]()
+            {
+                (void)active.wait();
+            }).empty(),
+                      "cancel should resolve the active completion exceptionally");
+            t.IsFalse(captureException([&]()
+            {
+                (void)queued.wait();
+            }).empty(),
+                      "cancel should resolve the queued completion exceptionally");
+            const ThreadedGsExecutorStatistics statistics =
+                executor.statistics();
+            t.IsFalse(statistics.running || statistics.accepting,
+                      "the closed owner should be stopped and reject future work");
+            t.Equals(statistics.queueDepth, static_cast<size_t>(0u),
+                     "cancel should leave no queued work");
+            t.Equals(statistics.queuedPayloadBytes, 0ull,
+                     "cancel should release every admitted payload byte");
         });
 
         tc.Run("threaded synchronous and inline streams match under deterministic worker jitter", [](TestCase &t)

@@ -10,7 +10,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <condition_variable>
 #include <exception>
 #include <functional>
 #include <future>
@@ -602,6 +601,10 @@ struct ThreadedGsExecutorStatistics
     uint64_t completedSequence = 0u;
     uint64_t producerBlockCount = 0u;
     uint64_t producerBlockedNanoseconds = 0u;
+    uint64_t producerSlotWaitCount = 0u;
+    uint64_t producerSlotWaitNanoseconds = 0u;
+    uint64_t producerPayloadWaitCount = 0u;
+    uint64_t producerPayloadWaitNanoseconds = 0u;
     uint64_t workerActiveNanoseconds = 0u;
     uint64_t workerIdleNanoseconds = 0u;
     uint64_t barriersCompleted = 0u;
@@ -614,6 +617,8 @@ struct ThreadedGsExecutorStatistics
     bool started = false;
     bool running = false;
     bool accepting = false;
+    bool drainRequested = false;
+    bool cancelRequested = false;
     bool failed = false;
 };
 
@@ -697,6 +702,13 @@ public:
     [[nodiscard]] std::thread::id ownerThreadId() const;
 
 private:
+    enum class AdmissionResult : uint8_t
+    {
+        Enqueued,
+        SlotCapacity,
+        PayloadCapacity,
+    };
+
     struct WorkItem
     {
         uint64_t ticket = 0u;
@@ -710,8 +722,13 @@ private:
     void assertHotProducerThread(
         const GsCommandPayload &payload);
     void ensureStarted();
-    [[nodiscard]] bool tryEnqueue(WorkItem &item);
+    [[nodiscard]] AdmissionResult tryEnqueue(WorkItem &item);
     [[noreturn]] void throwSubmissionUnavailable() const;
+    void signalWorkAvailable() noexcept;
+    [[nodiscard]] bool tryAcquireWorkSignal() noexcept;
+    void acquireWorkSignal() noexcept;
+    void signalSpaceAvailable() noexcept;
+    void closeAdmissionAndQuiesceProducer() noexcept;
     void workerMain() noexcept;
     void cancelQueued(const std::exception_ptr &reason) noexcept;
     void recordFatalFailure(std::exception_ptr failure) noexcept;
@@ -733,8 +750,6 @@ private:
 #endif
 
     mutable std::mutex m_stateMutex;
-    std::condition_variable m_workCv;
-    std::condition_variable m_spaceCv;
     std::thread m_worker;
     std::thread::id m_ownerThreadId{};
     std::exception_ptr m_fatalFailure;
@@ -745,6 +760,11 @@ private:
     std::atomic<bool> m_accepting{true};
     std::atomic<bool> m_drainRequested{false};
     std::atomic<bool> m_cancelRequested{false};
+    // Successful producer/consumer traffic uses only the SPSC ring and these
+    // counted atomic signals. State locking is reserved for lifecycle and
+    // low-frequency observation.
+    std::atomic<uint64_t> m_workSignals{0u};
+    std::atomic<uint64_t> m_spaceEpoch{0u};
     std::atomic<uint64_t> m_minimumAcceptedGeneration{1u};
     std::atomic<uint64_t> m_queuedPayloadBytes{0u};
     std::atomic<size_t> m_queueHighWater{0u};
@@ -757,6 +777,10 @@ private:
     std::atomic<uint64_t> m_completedSequence{0u};
     std::atomic<uint64_t> m_producerBlockCount{0u};
     std::atomic<uint64_t> m_producerBlockedNanoseconds{0u};
+    std::atomic<uint64_t> m_producerSlotWaitCount{0u};
+    std::atomic<uint64_t> m_producerSlotWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_producerPayloadWaitCount{0u};
+    std::atomic<uint64_t> m_producerPayloadWaitNanoseconds{0u};
     std::atomic<uint64_t> m_workerActiveNanoseconds{0u};
     std::atomic<uint64_t> m_workerIdleNanoseconds{0u};
     std::atomic<uint64_t> m_barriersCompleted{0u};

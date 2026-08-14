@@ -1207,10 +1207,11 @@ void ThreadedGsExecutor::updatePayloadHighWater(
     updateAtomicMaximum(m_payloadHighWaterBytes, bytes);
 }
 
-bool ThreadedGsExecutor::tryEnqueue(WorkItem &item)
+ThreadedGsExecutor::AdmissionResult
+ThreadedGsExecutor::tryEnqueue(WorkItem &item)
 {
     if (m_queue.full())
-        return false;
+        return AdmissionResult::SlotCapacity;
 
     const uint64_t currentPayload =
         m_queuedPayloadBytes.load(std::memory_order_acquire);
@@ -1220,7 +1221,7 @@ bool ThreadedGsExecutor::tryEnqueue(WorkItem &item)
                 currentPayload,
                 m_options.payloadCapacityBytes))
     {
-        return false;
+        return AdmissionResult::PayloadCapacity;
     }
 
     const size_t reservedDepth = m_queue.size() + 1u;
@@ -1234,12 +1235,77 @@ bool ThreadedGsExecutor::tryEnqueue(WorkItem &item)
         m_queuedPayloadBytes.fetch_sub(
             item.payloadBytes,
             std::memory_order_acq_rel);
-        return false;
+        return AdmissionResult::SlotCapacity;
     }
 
     updateQueueHighWater(reservedDepth);
     updatePayloadHighWater(reserved);
-    return true;
+    return AdmissionResult::Enqueued;
+}
+
+void ThreadedGsExecutor::signalWorkAvailable() noexcept
+{
+    uint64_t signals = m_workSignals.load(
+        std::memory_order_relaxed);
+    for (;;)
+    {
+        if (signals == std::numeric_limits<uint64_t>::max())
+            std::terminate();
+        if (m_workSignals.compare_exchange_weak(
+                signals, signals + 1u,
+                std::memory_order_release,
+                std::memory_order_relaxed))
+        {
+            break;
+        }
+    }
+    m_workSignals.notify_one();
+}
+
+bool ThreadedGsExecutor::tryAcquireWorkSignal() noexcept
+{
+    uint64_t signals = m_workSignals.load(
+        std::memory_order_acquire);
+    while (signals != 0u)
+    {
+        if (m_workSignals.compare_exchange_weak(
+                signals, signals - 1u,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ThreadedGsExecutor::acquireWorkSignal() noexcept
+{
+    while (!tryAcquireWorkSignal())
+    {
+        m_workSignals.wait(
+            0u, std::memory_order_acquire);
+    }
+}
+
+void ThreadedGsExecutor::signalSpaceAvailable() noexcept
+{
+    const uint64_t prior = m_spaceEpoch.fetch_add(
+        1u, std::memory_order_release);
+    if (prior == std::numeric_limits<uint64_t>::max())
+        std::terminate();
+    m_spaceEpoch.notify_all();
+}
+
+void ThreadedGsExecutor::closeAdmissionAndQuiesceProducer() noexcept
+{
+    m_accepting.store(false, std::memory_order_release);
+    signalSpaceAvailable();
+
+    // A producer that passed its admission check may finish publishing. Once
+    // this lock has been acquired and released, every such publication has a
+    // matching work signal and later producers can only observe closure.
+    std::lock_guard<std::mutex> submitLock(m_submitMutex);
 }
 
 [[noreturn]] void
@@ -1318,58 +1384,10 @@ GsCommandSubmission ThreadedGsExecutor::submitAsync(
 
     bool countedBlock = false;
     std::chrono::steady_clock::time_point blockedAt{};
-    for (;;)
+    const auto recordBlockedDuration = [&]()
     {
-        bool accepting = false;
-        bool enqueued = false;
-        {
-            // The correctness-first transport keeps a conservative admission
-            // lock. Closing the executor takes the same lock, so no producer
-            // can publish after fatal/cancel/drain has begun. M5 profiles and
-            // narrows this lock without weakening that lifecycle guarantee.
-            std::lock_guard<std::mutex> stateLock(
-                m_stateMutex);
-            accepting = m_accepting.load(
-                std::memory_order_acquire);
-            if (accepting && !m_fatalFailure)
-                enqueued = tryEnqueue(item);
-        }
-        if (enqueued)
-            break;
-        if (!accepting)
-            throwSubmissionUnavailable();
         if (!countedBlock)
-        {
-            countedBlock = true;
-            blockedAt = std::chrono::steady_clock::now();
-            m_producerBlockCount.fetch_add(
-                1u, std::memory_order_relaxed);
-        }
-
-        std::unique_lock<std::mutex> stateLock(
-            m_stateMutex);
-        m_spaceCv.wait(
-            stateLock,
-            [this, payloadBytes]()
-            {
-                if (!m_accepting.load(
-                        std::memory_order_acquire) ||
-                    m_fatalFailure)
-                {
-                    return true;
-                }
-                const uint64_t queued =
-                    m_queuedPayloadBytes.load(
-                        std::memory_order_acquire);
-                return !m_queue.full() &&
-                       queued <=
-                           m_options.payloadCapacityBytes &&
-                       payloadBytes <=
-                           m_options.payloadCapacityBytes - queued;
-            });
-    }
-    if (countedBlock)
-    {
+            return;
         const uint64_t nanoseconds =
             static_cast<uint64_t>(
                 std::chrono::duration_cast<
@@ -1378,7 +1396,63 @@ GsCommandSubmission ThreadedGsExecutor::submitAsync(
                     .count());
         m_producerBlockedNanoseconds.fetch_add(
             nanoseconds, std::memory_order_relaxed);
+        countedBlock = false;
+    };
+    for (;;)
+    {
+        if (!m_accepting.load(std::memory_order_acquire))
+        {
+            recordBlockedDuration();
+            throwSubmissionUnavailable();
+        }
+
+        // Load the epoch before rechecking capacity. A consumer publication
+        // or lifecycle close either makes this attempt succeed or changes the
+        // value observed by atomic::wait, eliminating lost wakeups.
+        const uint64_t spaceEpoch = m_spaceEpoch.load(
+            std::memory_order_acquire);
+        const AdmissionResult admission = tryEnqueue(item);
+        if (admission == AdmissionResult::Enqueued)
+            break;
+        if (!countedBlock)
+        {
+            countedBlock = true;
+            blockedAt = std::chrono::steady_clock::now();
+            m_producerBlockCount.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+
+        if (!m_accepting.load(std::memory_order_acquire))
+        {
+            recordBlockedDuration();
+            throwSubmissionUnavailable();
+        }
+
+        const auto waitAt = std::chrono::steady_clock::now();
+        m_spaceEpoch.wait(
+            spaceEpoch, std::memory_order_acquire);
+        const uint64_t waitNanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - waitAt)
+                    .count());
+        if (admission == AdmissionResult::SlotCapacity)
+        {
+            m_producerSlotWaitCount.fetch_add(
+                1u, std::memory_order_relaxed);
+            m_producerSlotWaitNanoseconds.fetch_add(
+                waitNanoseconds, std::memory_order_relaxed);
+        }
+        else
+        {
+            m_producerPayloadWaitCount.fetch_add(
+                1u, std::memory_order_relaxed);
+            m_producerPayloadWaitNanoseconds.fetch_add(
+                waitNanoseconds, std::memory_order_relaxed);
+        }
     }
+    recordBlockedDuration();
 
     m_generation = generation;
     m_nextSequence = sequence;
@@ -1397,8 +1471,8 @@ GsCommandSubmission ThreadedGsExecutor::submitAsync(
         m_lastSubmittedFieldSequence.store(
             fieldSequence, std::memory_order_release);
     }
+    signalWorkAvailable();
     submitLock.unlock();
-    m_workCv.notify_one();
 
     return GsCommandSubmission(
         ticket, identity, std::move(completion));
@@ -1482,7 +1556,6 @@ void ThreadedGsExecutor::cancelPendingBeforeGeneration(
     updateAtomicMaximum(
         m_minimumAcceptedGeneration,
         generation);
-    m_workCv.notify_one();
 }
 
 void ThreadedGsExecutor::releasePayload(
@@ -1493,7 +1566,7 @@ void ThreadedGsExecutor::releasePayload(
             bytes, std::memory_order_acq_rel);
     if (prior < bytes)
         std::terminate();
-    m_spaceCv.notify_all();
+    signalSpaceAvailable();
 }
 
 void ThreadedGsExecutor::recordFatalFailure(
@@ -1503,11 +1576,10 @@ void ThreadedGsExecutor::recordFatalFailure(
         std::lock_guard<std::mutex> lock(m_stateMutex);
         if (!m_fatalFailure)
             m_fatalFailure = std::move(failure);
-        m_accepting.store(false, std::memory_order_release);
     }
+    closeAdmissionAndQuiesceProducer();
     m_cancelRequested.store(true, std::memory_order_release);
-    m_workCv.notify_all();
-    m_spaceCv.notify_all();
+    signalWorkAvailable();
 }
 
 void ThreadedGsExecutor::cancelQueued(
@@ -1527,7 +1599,6 @@ void ThreadedGsExecutor::cancelQueued(
         m_completedTickets.store(
             item->ticket, std::memory_order_release);
     }
-    m_spaceCv.notify_all();
 }
 
 void ThreadedGsExecutor::workerMain() noexcept
@@ -1540,25 +1611,11 @@ void ThreadedGsExecutor::workerMain() noexcept
 
     for (;;)
     {
-        std::optional<WorkItem> item =
-            m_queue.tryPop();
-        if (!item)
+        if (!tryAcquireWorkSignal())
         {
             const auto idleAt =
                 std::chrono::steady_clock::now();
-            std::unique_lock<std::mutex> lock(
-                m_stateMutex);
-            m_workCv.wait(
-                lock,
-                [this]()
-                {
-                    return !m_queue.empty() ||
-                           m_cancelRequested.load(
-                               std::memory_order_acquire) ||
-                           m_drainRequested.load(
-                               std::memory_order_acquire) ||
-                           m_fatalFailure;
-                });
+            acquireWorkSignal();
             const uint64_t idleNanoseconds =
                 static_cast<uint64_t>(
                     std::chrono::duration_cast<
@@ -1567,29 +1624,35 @@ void ThreadedGsExecutor::workerMain() noexcept
                         .count());
             m_workerIdleNanoseconds.fetch_add(
                 idleNanoseconds, std::memory_order_relaxed);
+        }
 
-            if (m_cancelRequested.load(
-                    std::memory_order_acquire) ||
-                m_fatalFailure)
+        if (m_cancelRequested.load(
+                std::memory_order_acquire))
+        {
+            std::exception_ptr reason;
             {
-                const std::exception_ptr reason =
-                    m_fatalFailure
-                        ? m_fatalFailure
-                        : makeGsExecutorCancellation();
-                lock.unlock();
-                cancelQueued(reason);
-                break;
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                reason = m_fatalFailure;
             }
+            if (!reason)
+                reason = makeGsExecutorCancellation();
+            cancelQueued(reason);
+            break;
+        }
+
+        std::optional<WorkItem> item =
+            m_queue.tryPop();
+        if (!item)
+        {
             if (m_drainRequested.load(
-                    std::memory_order_acquire) &&
-                m_queue.empty())
+                    std::memory_order_acquire))
             {
                 break;
             }
             continue;
         }
 
-        m_spaceCv.notify_all();
+        signalSpaceAvailable();
         const auto activeAt =
             std::chrono::steady_clock::now();
         try
@@ -1695,10 +1758,10 @@ void ThreadedGsExecutor::workerMain() noexcept
             catch (...)
             {
             }
-            releasePayload(item->payloadBytes);
             m_completedTickets.store(
                 item->ticket, std::memory_order_release);
             recordFatalFailure(failure);
+            releasePayload(item->payloadBytes);
             cancelQueued(failure);
             const uint64_t activeNanoseconds =
                 static_cast<uint64_t>(
@@ -1725,8 +1788,7 @@ void ThreadedGsExecutor::workerMain() noexcept
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_workerExited = true;
     }
-    m_spaceCv.notify_all();
-    m_workCv.notify_all();
+    signalSpaceAvailable();
 }
 
 void ThreadedGsExecutor::shutdown(
@@ -1734,9 +1796,9 @@ void ThreadedGsExecutor::shutdown(
 {
     std::lock_guard<std::mutex> shutdownLock(
         m_shutdownMutex);
+    closeAdmissionAndQuiesceProducer();
     {
         std::lock_guard<std::mutex> lock(m_stateMutex);
-        m_accepting.store(false, std::memory_order_release);
         if (mode == GsExecutorShutdownMode::Cancel)
         {
             m_cancelRequested.store(
@@ -1750,8 +1812,7 @@ void ThreadedGsExecutor::shutdown(
         if (!m_started)
             m_workerExited = true;
     }
-    m_workCv.notify_all();
-    m_spaceCv.notify_all();
+    signalWorkAvailable();
 
     if (m_worker.joinable())
     {
@@ -1815,6 +1876,18 @@ ThreadedGsExecutor::statistics() const
         .producerBlockedNanoseconds =
             m_producerBlockedNanoseconds.load(
                 std::memory_order_acquire),
+        .producerSlotWaitCount =
+            m_producerSlotWaitCount.load(
+                std::memory_order_acquire),
+        .producerSlotWaitNanoseconds =
+            m_producerSlotWaitNanoseconds.load(
+                std::memory_order_acquire),
+        .producerPayloadWaitCount =
+            m_producerPayloadWaitCount.load(
+                std::memory_order_acquire),
+        .producerPayloadWaitNanoseconds =
+            m_producerPayloadWaitNanoseconds.load(
+                std::memory_order_acquire),
         .workerActiveNanoseconds =
             m_workerActiveNanoseconds.load(
                 std::memory_order_acquire),
@@ -1843,6 +1916,10 @@ ThreadedGsExecutor::statistics() const
             m_lastCompletedFieldSequence.load(
                 std::memory_order_acquire),
         .accepting = m_accepting.load(
+            std::memory_order_acquire),
+        .drainRequested = m_drainRequested.load(
+            std::memory_order_acquire),
+        .cancelRequested = m_cancelRequested.load(
             std::memory_order_acquire),
     };
     {
