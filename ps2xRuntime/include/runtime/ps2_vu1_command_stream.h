@@ -102,22 +102,6 @@ struct Vu1DataMemoryWriteCommand
     bool wrap = false;
 };
 
-// The EE-side VIF parser owns byte-stream framing. This value owns the
-// complete decoded UNPACK input and enough alignment metadata for the VU1
-// owner to reproduce mutation without retaining a pointer into DMA storage.
-struct Vu1DecodedUnpackCommand
-{
-    uint16_t immediate = 0u;
-    uint8_t vectorLength = 0u;
-    uint8_t componentCount = 0u;
-    uint16_t writeVectorCount = 0u;
-    uint16_t sourceVectorCount = 0u;
-    uint8_t sourceWordAlignment = 4u;
-    bool maskEnabled = false;
-    bool zeroExtend = false;
-    std::vector<uint8_t> bytes;
-};
-
 struct Vu1VifState
 {
     uint32_t cycle = 0x0101u;
@@ -130,6 +114,25 @@ struct Vu1VifState
     friend constexpr bool operator==(
         const Vu1VifState &,
         const Vu1VifState &) noexcept = default;
+};
+
+// The EE-side VIF parser owns byte-stream framing. This value owns the
+// complete decoded UNPACK input and enough alignment metadata for the VU1
+// owner to reproduce mutation without retaining a pointer into DMA storage.
+// Threaded lookahead may fold the latest parser-owned VIF state into this
+// command, preserving order without a separate owner rendezvous.
+struct Vu1DecodedUnpackCommand
+{
+    uint16_t immediate = 0u;
+    uint8_t vectorLength = 0u;
+    uint8_t componentCount = 0u;
+    uint16_t writeVectorCount = 0u;
+    uint16_t sourceVectorCount = 0u;
+    uint8_t sourceWordAlignment = 4u;
+    bool maskEnabled = false;
+    bool zeroExtend = false;
+    std::vector<uint8_t> bytes;
+    std::shared_ptr<const Vu1VifState> vifStateBefore;
 };
 
 struct Vu1VifStateUpdateCommand
@@ -166,6 +169,7 @@ struct Vu1MscalCommand
     uint32_t startPc = 0u;
     uint32_t top = 0u;
     uint32_t itop = 0u;
+    std::shared_ptr<const Vu1VifState> vifStateBefore;
 };
 
 struct Vu1MscalfCommand
@@ -173,12 +177,14 @@ struct Vu1MscalfCommand
     uint32_t startPc = 0u;
     uint32_t top = 0u;
     uint32_t itop = 0u;
+    std::shared_ptr<const Vu1VifState> vifStateBefore;
 };
 
 struct Vu1MscntCommand
 {
     uint32_t top = 0u;
     uint32_t itop = 0u;
+    std::shared_ptr<const Vu1VifState> vifStateBefore;
 };
 
 struct Vu1AdvanceSliceCommand

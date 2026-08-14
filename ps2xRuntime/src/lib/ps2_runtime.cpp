@@ -6495,7 +6495,8 @@ void PS2Runtime::beginVu1SynchronousCommandBatch()
     if (m_vu1SynchronousCommandBatchActive ||
         m_batchedVu1SynchronousCommandBarrier.resolution !=
             Vu1SpeculationResolution::None ||
-        m_batchedVu1SynchronousCommandBarrier.requeue)
+        m_batchedVu1SynchronousCommandBarrier.requeue ||
+        m_batchedVu1VifState)
     {
         throw std::logic_error(
             "nested VU1 synchronous command batch");
@@ -6516,6 +6517,30 @@ void PS2Runtime::finishVu1SynchronousCommandBatch(bool requeue)
             "VU1 synchronous command batch is not active");
     }
 
+    if (requeue && m_batchedVu1VifState)
+    {
+        try
+        {
+            flushBatchedVu1VifStateUpdate();
+        }
+        catch (...)
+        {
+            m_batchedVu1VifState.reset();
+            m_vu1SynchronousCommandBatchActive = false;
+            Vu1SynchronousCommandBarrier barrier =
+                std::move(m_batchedVu1SynchronousCommandBarrier);
+            m_batchedVu1SynchronousCommandBarrier = {};
+            if (barrier.resolution !=
+                Vu1SpeculationResolution::None)
+            {
+                m_vu1SpeculationPublicationState =
+                    Vu1SpeculationPublicationState::None;
+            }
+            throw;
+        }
+    }
+
+    m_batchedVu1VifState.reset();
     m_vu1SynchronousCommandBatchActive = false;
     Vu1SynchronousCommandBarrier barrier =
         std::move(m_batchedVu1SynchronousCommandBarrier);
@@ -6531,6 +6556,26 @@ void PS2Runtime::finishVu1SynchronousCommandBatch(bool requeue)
         return;
     }
     finishVu1SynchronousCommandBarrier(barrier);
+}
+
+void PS2Runtime::flushBatchedVu1VifStateUpdate()
+{
+    if (!m_batchedVu1VifState)
+        return;
+    if (!m_vu1SynchronousCommandBatchActive ||
+        m_vu1ExecutionMode !=
+            Vu1ExecutionMode::ThreadedAsync)
+    {
+        throw std::logic_error(
+            "buffered VU1 VIF state requires an asynchronous command batch");
+    }
+
+    Vu1VifStateUpdateCommand command{
+        *m_batchedVu1VifState};
+    m_batchedVu1VifState.reset();
+    (void)submitVu1VifStateUpdateImmediate(
+        std::move(command), currentEeTick().raw(),
+        m_vu1ExecutionTiming.generation);
 }
 
 bool PS2Runtime::isCurrentVu1PendingSlicePlan(
@@ -7084,6 +7129,32 @@ Vu1CommandResult PS2Runtime::submitVu1Command(
         refreshVu1DiagnosticsConfiguration(
             guestTick, publicationToken);
     }
+    if (m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedAsync &&
+        m_vu1SynchronousCommandBatchActive &&
+        m_batchedVu1VifState)
+    {
+        bool foldedState = false;
+        std::visit(
+            [this, &foldedState](auto &command)
+            {
+                using T = std::decay_t<decltype(command)>;
+                if constexpr (
+                    std::is_same_v<T, Vu1MscalCommand> ||
+                    std::is_same_v<T, Vu1MscalfCommand> ||
+                    std::is_same_v<T, Vu1MscntCommand>)
+                {
+                    command.vifStateBefore =
+                        std::make_shared<const Vu1VifState>(
+                            *m_batchedVu1VifState);
+                    m_batchedVu1VifState.reset();
+                    foldedState = true;
+                }
+            },
+            payload);
+        if (!foldedState)
+            flushBatchedVu1VifStateUpdate();
+    }
     const Vu1SynchronousCommandBarrier barrier =
         beginVu1SynchronousCommandBarrier();
     Vu1CommandResult result =
@@ -7121,6 +7192,13 @@ Vu1CommandResult PS2Runtime::submitVu1AdvanceSlice(
     }
     refreshVu1DiagnosticsConfiguration(
         guestTick, publicationToken);
+    if (m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedAsync &&
+        m_vu1SynchronousCommandBatchActive &&
+        m_batchedVu1VifState)
+    {
+        flushBatchedVu1VifStateUpdate();
+    }
     const Vu1SynchronousCommandBarrier barrier =
         beginVu1SynchronousCommandBarrier();
     Vu1CommandResult result =
@@ -7157,6 +7235,16 @@ Vu1CommandResult PS2Runtime::submitVu1DecodedUnpack(
     }
     refreshVu1DiagnosticsConfiguration(
         guestTick, publicationToken);
+    if (m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedAsync &&
+        m_vu1SynchronousCommandBatchActive &&
+        m_batchedVu1VifState)
+    {
+        command.vifStateBefore =
+            std::make_shared<const Vu1VifState>(
+                *m_batchedVu1VifState);
+        m_batchedVu1VifState.reset();
+    }
     const Vu1SynchronousCommandBarrier barrier =
         beginVu1SynchronousCommandBarrier();
     Vu1CommandResult result =
@@ -7194,6 +7282,44 @@ Vu1CommandResult PS2Runtime::submitVu1VifStateUpdate(
     }
     refreshVu1DiagnosticsConfiguration(
         guestTick, publicationToken);
+    if (m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedAsync &&
+        m_vu1SynchronousCommandBatchActive)
+    {
+        m_batchedVu1VifState = command.state;
+        Vu1CommandResult buffered{};
+        buffered.identity = {
+            .generation = publicationToken,
+            .guestTick = guestTick,
+            .publicationToken = publicationToken,
+        };
+        buffered.digest = {
+            .generation = publicationToken,
+            .guestTick = guestTick,
+            .type = Vu1CommandType::VifStateUpdate,
+            .payloadSize = 12u * sizeof(uint32_t),
+        };
+        buffered.ownerGeneration = publicationToken;
+        buffered.codeGeneration =
+            m_publishedVu1CodeGeneration.load(
+                std::memory_order_acquire);
+        buffered.programCounter =
+            m_publishedVu1ProgramCounter.load(
+                std::memory_order_acquire);
+        buffered.active = m_publishedVu1Active.load(
+            std::memory_order_acquire);
+        buffered.payload = Vu1VifStateResult{command.state};
+        return buffered;
+    }
+    return submitVu1VifStateUpdateImmediate(
+        std::move(command), guestTick, publicationToken);
+}
+
+Vu1CommandResult PS2Runtime::submitVu1VifStateUpdateImmediate(
+    Vu1VifStateUpdateCommand command,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
     const Vu1SynchronousCommandBarrier barrier =
         beginVu1SynchronousCommandBarrier();
     Vu1CommandResult result =
@@ -7229,6 +7355,17 @@ void PS2Runtime::refreshVu1DiagnosticsConfiguration(
             m_publishedVu1WorkloadProfileEnabled)
     {
         return;
+    }
+
+    // A diagnostics command is owner-visible and must not overtake parser
+    // state that was already acknowledged on EE. This path is cold and the
+    // immediate flush preserves the original command order.
+    if (m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedAsync &&
+        m_vu1SynchronousCommandBatchActive &&
+        m_batchedVu1VifState)
+    {
+        flushBatchedVu1VifStateUpdate();
     }
 
     const Vu1SynchronousCommandBarrier barrier =

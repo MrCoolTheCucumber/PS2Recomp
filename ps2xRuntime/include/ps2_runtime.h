@@ -2511,6 +2511,12 @@ private:
         Vu1VifStateUpdateCommand command,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u);
+    [[nodiscard]] Vu1CommandResult
+    submitVu1VifStateUpdateImmediate(
+        Vu1VifStateUpdateCommand command,
+        uint64_t guestTick,
+        uint64_t publicationToken);
+    void flushBatchedVu1VifStateUpdate();
     void refreshVu1DiagnosticsConfiguration(
         uint64_t guestTick,
         uint64_t publicationToken);
@@ -2777,6 +2783,7 @@ private:
             Vu1SpeculationPublicationState::None;
     Vu1SynchronousCommandBarrier
         m_batchedVu1SynchronousCommandBarrier{};
+    std::optional<Vu1VifState> m_batchedVu1VifState;
     bool m_vu1SynchronousCommandBatchActive = false;
     std::atomic<bool> m_vu1AsyncPendingSlice{false};
     std::atomic<bool> m_vu1AsyncDeferredSlice{false};

@@ -851,7 +851,10 @@ uint64_t vu1CommandPayloadSize(
             else if constexpr (
                 std::is_same_v<T, Vu1DecodedUnpackCommand>)
             {
-                return 11u + sizeof(uint64_t) + value.bytes.size();
+                return 11u + sizeof(uint64_t) + value.bytes.size() +
+                       (value.vifStateBefore
+                            ? 12u * sizeof(uint32_t)
+                            : 0u);
             }
             else if constexpr (
                 std::is_same_v<T, Vu1VifStateUpdateCommand>)
@@ -867,11 +870,17 @@ uint64_t vu1CommandPayloadSize(
                 std::is_same_v<T, Vu1MscalCommand> ||
                 std::is_same_v<T, Vu1MscalfCommand>)
             {
-                return 3u * sizeof(uint32_t);
+                return 3u * sizeof(uint32_t) +
+                       (value.vifStateBefore
+                            ? 12u * sizeof(uint32_t)
+                            : 0u);
             }
             else if constexpr (std::is_same_v<T, Vu1MscntCommand>)
             {
-                return 2u * sizeof(uint32_t);
+                return 2u * sizeof(uint32_t) +
+                       (value.vifStateBefore
+                            ? 12u * sizeof(uint32_t)
+                            : 0u);
             }
             else if constexpr (
                 std::is_same_v<T, Vu1AdvanceSliceCommand>)
@@ -952,6 +961,8 @@ uint64_t vu1CommandPayloadHash(
                 hashScalar(hash, value.maskEnabled);
                 hashScalar(hash, value.zeroExtend);
                 hashVector(hash, value.bytes);
+                if (value.vifStateBefore)
+                    hashVifState(hash, *value.vifStateBefore);
             }
             else if constexpr (
                 std::is_same_v<T, Vu1VifStateUpdateCommand>)
@@ -974,11 +985,15 @@ uint64_t vu1CommandPayloadHash(
                 hashScalar(hash, value.startPc);
                 hashScalar(hash, value.top);
                 hashScalar(hash, value.itop);
+                if (value.vifStateBefore)
+                    hashVifState(hash, *value.vifStateBefore);
             }
             else if constexpr (std::is_same_v<T, Vu1MscntCommand>)
             {
                 hashScalar(hash, value.top);
                 hashScalar(hash, value.itop);
+                if (value.vifStateBefore)
+                    hashVifState(hash, *value.vifStateBefore);
             }
             else if constexpr (
                 std::is_same_v<T, Vu1AdvanceSliceCommand>)
@@ -1593,6 +1608,8 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
             }
             else if constexpr (std::is_same_v<T, Vu1DecodedUnpackCommand>)
             {
+                if (value.vifStateBefore)
+                    m_vifState = *value.vifStateBefore;
                 if (!applyVu1DecodedUnpack(
                         value, m_vifState,
                         m_dataMemory, m_dataMemorySize))
@@ -1679,6 +1696,8 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
             }
             else if constexpr (std::is_same_v<T, Vu1MscalCommand>)
             {
+                if (value.vifStateBefore)
+                    m_vifState = *value.vifStateBefore;
                 m_unit.start(
                     value.startPc, value.top, value.itop,
                     m_diagnosticsObserver
@@ -1688,6 +1707,8 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
             }
             else if constexpr (std::is_same_v<T, Vu1MscalfCommand>)
             {
+                if (value.vifStateBefore)
+                    m_vifState = *value.vifStateBefore;
                 m_unit.start(
                     value.startPc, value.top, value.itop,
                     m_diagnosticsObserver
@@ -1697,6 +1718,8 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
             }
             else if constexpr (std::is_same_v<T, Vu1MscntCommand>)
             {
+                if (value.vifStateBefore)
+                    m_vifState = *value.vifStateBefore;
                 m_unit.resumeState(
                     value.top, value.itop,
                     m_diagnosticsObserver
@@ -1911,7 +1934,10 @@ Vu1CommandResult Vu1CommandProcessor::processDecodedUnpack(
             "VU1 diagnostic journal was not published");
     }
     const uint64_t payloadSize =
-        11u + sizeof(uint64_t) + command.bytes.size();
+        11u + sizeof(uint64_t) + command.bytes.size() +
+        (command.vifStateBefore
+             ? 12u * sizeof(uint32_t)
+             : 0u);
     Vu1CommandResult result{
         .identity = identity,
         .digest = {
@@ -1963,6 +1989,8 @@ Vu1CommandResult Vu1CommandProcessor::processDecodedUnpack(
         return result;
     }
 
+    if (command.vifStateBefore)
+        m_vifState = *command.vifStateBefore;
     if (!applyVu1DecodedUnpack(
             command, m_vifState,
             m_dataMemory, m_dataMemorySize))

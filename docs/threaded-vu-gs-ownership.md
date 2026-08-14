@@ -345,6 +345,15 @@ There are no unknown production hot-path accesses at this audit point.
 | Save state | EE/control -> all owners | No | Fixed global quiesce and immutable snapshots |
 | Shutdown/fault | control/worker -> runtime | No | Wake waiters, fixed teardown, deterministic error result |
 
+In threaded-asynchronous VU1 mode, one `advanceVif1Dma` parser invocation may
+coalesce consecutive scalar VIF-state snapshots. The latest complete snapshot
+is immutable owned input on the next decoded UNPACK or MSCAL-family command;
+if no such consumer follows, one state-update command is emitted before the
+parser batch closes. This removes redundant transport rendezvous without
+reordering an owner-visible command, borrowing parser memory, or carrying the
+state across a VIF service/event boundary. Inline and threaded-synchronous
+command streams retain their original command identities and digests.
+
 The public accessors are not exemptions from this matrix. Milestones 2 and 6
 must reduce their production visibility or add diagnostic owner assertions so
 a new bypass fails close to its call site.

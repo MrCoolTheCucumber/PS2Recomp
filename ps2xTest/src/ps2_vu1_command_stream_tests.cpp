@@ -2518,6 +2518,7 @@ void register_ps2_vu1_command_stream_tests()
             struct RunResult
             {
                 uint64_t architecturalHash = 0u;
+                Vu1AsyncRuntimeStatistics beforePayload{};
                 Vu1AsyncRuntimeStatistics afterPayload{};
                 Vu1AsyncRuntimeStatistics afterEmptyService{};
                 Vu1AsyncRuntimeStatistics afterPublication{};
@@ -2570,14 +2571,16 @@ void register_ps2_vu1_command_stream_tests()
                         t.Fail("the initial private slice should finish early");
                         return {};
                     }
+                    const Vu1AsyncRuntimeStatistics beforePayload =
+                        runtime.vu1AsyncStatistics();
 
                     constexpr uint32_t kVif1 = 0x10009000u;
                     constexpr uint32_t kSource = 0x00030000u;
                     const std::array<uint32_t, 4u> vifCommands = {
-                        makeVifCommand(0x01u, 0u, 0x0101u),
-                        makeVifCommand(0x02u, 0u, 3u),
                         makeVifCommand(0x05u, 0u, 1u),
-                        makeVifCommand(0x01u, 0u, 0x0202u),
+                        makeVifCommand(0x6fu, 1u, 0u),
+                        0x00001234u,
+                        makeVifCommand(0x05u, 0u, 3u),
                     };
                     std::memcpy(
                         runtime.memory().getRDRAM() + kSource,
@@ -2639,6 +2642,7 @@ void register_ps2_vu1_command_stream_tests()
                                 snapshot->dataMemory,
                                 snapshot->vif,
                                 snapshot->codeGeneration),
+                        .beforePayload = beforePayload,
                         .afterPayload = afterPayload,
                         .afterEmptyService = afterEmptyService,
                         .afterPublication = afterPublication,
@@ -2653,6 +2657,31 @@ void register_ps2_vu1_command_stream_tests()
                 asynchronous.architecturalHash,
                 reference.architecturalHash,
                 "batched VIF1 hazards should retain inline architecture");
+            const auto commandCount =
+                [](const Vu1AsyncRuntimeStatistics &statistics,
+                   Vu1CommandType type)
+                {
+                    return statistics.owner.commandTypes[
+                        vu1CommandTypeIndex(type)].submitted;
+                };
+            t.Equals(
+                commandCount(
+                    asynchronous.afterPayload,
+                    Vu1CommandType::DecodedUnpack) -
+                    commandCount(
+                        asynchronous.beforePayload,
+                        Vu1CommandType::DecodedUnpack),
+                1ull,
+                "the parser batch should submit its decoded UNPACK once");
+            t.Equals(
+                commandCount(
+                    asynchronous.afterPayload,
+                    Vu1CommandType::VifStateUpdate) -
+                    commandCount(
+                        asynchronous.beforePayload,
+                        Vu1CommandType::VifStateUpdate),
+                1ull,
+                "the pre-UNPACK VIF state should fold into the UNPACK and only the trailing state should remain");
             t.Equals(
                 asynchronous.afterPayload.hazardBarrierCount, 1ull,
                 "one parser batch should resolve speculation once");
@@ -3131,6 +3160,20 @@ void register_ps2_vu1_command_stream_tests()
                 "multiple speculation epochs in one parser batch should retain inline architecture");
             t.Equals(asynchronous.vifMode, 3u,
                      "the command after MSCAL should execute in parser order");
+            const auto vifStateCommandCount =
+                [](const Vu1AsyncRuntimeStatistics &statistics)
+                {
+                    return statistics.owner.commandTypes[
+                        vu1CommandTypeIndex(
+                            Vu1CommandType::VifStateUpdate)]
+                        .submitted;
+                };
+            t.Equals(
+                vifStateCommandCount(asynchronous.afterPayload) -
+                    vifStateCommandCount(
+                        asynchronous.afterFirstPublication),
+                1ull,
+                "the pre-MSCAL VIF state should fold into MSCAL and only the trailing state should remain");
             t.Equals(
                 asynchronous.afterFirstPublication.slicesPublished, 1ull,
                 "the fixture should begin with one published speculative epoch");
@@ -3193,7 +3236,7 @@ void register_ps2_vu1_command_stream_tests()
                         return;
                     }
                     if (stateUpdates.fetch_add(
-                            1u, std::memory_order_relaxed) == 1u)
+                            1u, std::memory_order_relaxed) == 0u)
                     {
                         throw std::runtime_error(
                             "injected VIF1 batch owner failure");
