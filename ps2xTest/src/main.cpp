@@ -46,6 +46,7 @@ void register_ps2_vu_executable_memory_tests();
 void register_ps2_vu_program_cache_tests();
 void register_ps2_vu_recompiler_tests();
 void register_ps2_vu1_tests();
+void register_ps2_vu1_command_stream_tests();
 void register_ps2_gs_tests();
 void register_ps2_gs_command_stream_tests();
 void register_ps2_gs_coherency_tests();
@@ -106,6 +107,7 @@ int main()
     register_ps2_vu_program_cache_tests();
     register_ps2_vu_recompiler_tests();
     register_ps2_vu1_tests();
+    register_ps2_vu1_command_stream_tests();
     register_ps2_gs_command_stream_tests();
     register_ps2_gs_tests();
     register_ps2_gs_coherency_tests();
