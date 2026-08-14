@@ -2,6 +2,23 @@ include(CheckIPOSupported)
 
 check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
 
+if(PS2X_ENABLE_GCC_INCREMENTAL_LTO)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR
+            "PS2X_ENABLE_GCC_INCREMENTAL_LTO requires GCC")
+    endif()
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16)
+        message(FATAL_ERROR
+            "PS2X_ENABLE_GCC_INCREMENTAL_LTO requires GCC 16 or newer")
+    endif()
+
+    get_filename_component(PS2X_GCC_INCREMENTAL_LTO_CACHE_DIR
+        "${PS2X_GCC_INCREMENTAL_LTO_CACHE_DIR}"
+        ABSOLUTE
+        BASE_DIR "${CMAKE_BINARY_DIR}")
+    file(MAKE_DIRECTORY "${PS2X_GCC_INCREMENTAL_LTO_CACHE_DIR}")
+endif()
+
 function(EnableFastReleaseMode TargetName)
     message("> Enabling optimization for: ${TargetName}")
     if(MSVC)
@@ -36,8 +53,28 @@ function(EnableFastReleaseMode TargetName)
 
     if(IPO_SUPPORTED)
         set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+
+        if(PS2X_ENABLE_GCC_INCREMENTAL_LTO)
+            get_target_property(PS2X_RELEASE_TARGET_TYPE
+                ${TargetName} TYPE)
+            if(NOT PS2X_RELEASE_TARGET_TYPE STREQUAL "STATIC_LIBRARY" AND
+               NOT PS2X_RELEASE_TARGET_TYPE STREQUAL "OBJECT_LIBRARY" AND
+               NOT PS2X_RELEASE_TARGET_TYPE STREQUAL "INTERFACE_LIBRARY")
+                string(MAKE_C_IDENTIFIER "${TargetName}"
+                    PS2X_INCREMENTAL_LTO_TARGET_NAME)
+                set(PS2X_TARGET_INCREMENTAL_LTO_CACHE_DIR
+                    "${PS2X_GCC_INCREMENTAL_LTO_CACHE_DIR}/${PS2X_INCREMENTAL_LTO_TARGET_NAME}")
+                file(MAKE_DIRECTORY
+                    "${PS2X_TARGET_INCREMENTAL_LTO_CACHE_DIR}")
+                target_link_options(${TargetName} PRIVATE
+                    "$<$<CONFIG:Release>:-flto-incremental=${PS2X_TARGET_INCREMENTAL_LTO_CACHE_DIR}>")
+                message(STATUS
+                    "GCC incremental LTO cache for ${TargetName}: "
+                    "${PS2X_TARGET_INCREMENTAL_LTO_CACHE_DIR}")
+            endif()
+        endif()
     else()
-        message(WARNING "Interprocedural optimization not supported: ${ipo_error}")
+        message(WARNING "Interprocedural optimization not supported: ${IPO_ERROR}")
     endif()
 endfunction()
 

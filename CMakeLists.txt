@@ -18,6 +18,13 @@ option(PS2X_BUILD_RUNTIME "Build ps2xRuntime" ON)
 option(PS2X_BUILD_ANALYZER "Build ps2xAnalyzer" ON)
 option(PS2X_BUILD_TEST "Build ps2xTest" ON)
 option(PS2X_BUILD_STUDIO "Build ps2xStudio" ON)
+option(PS2X_ENABLE_GCC_INCREMENTAL_LTO
+    "Reuse GCC LTO outputs across Release relinks"
+    OFF)
+set(PS2X_GCC_INCREMENTAL_LTO_CACHE_DIR
+    "${CMAKE_BINARY_DIR}/gcc-lto-cache"
+    CACHE PATH
+    "Base directory for per-target GCC incremental LTO caches")
 
 if(ANDROID)
     message(STATUS "Android target detected, building runtime only")
