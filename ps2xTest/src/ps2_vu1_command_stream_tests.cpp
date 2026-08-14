@@ -176,6 +176,37 @@ namespace
         return bytes;
     }
 
+    void writeRuntimeVu1InstructionPair(
+        PS2Runtime &runtime,
+        uint32_t pc,
+        uint32_t lower,
+        uint32_t upper)
+    {
+        runtime.memory().write32(
+            PS2_VU1_CODE_BASE + pc, lower);
+        runtime.memory().write32(
+            PS2_VU1_CODE_BASE + pc + 4u, upper);
+    }
+
+    void writeRuntimeVu1Qword(
+        PS2Runtime &runtime,
+        uint32_t offset,
+        const std::array<uint8_t, 16u> &bytes)
+    {
+        for (uint32_t word = 0u; word < 4u; ++word)
+        {
+            uint32_t value = 0u;
+            std::memcpy(
+                &value,
+                bytes.data() + word * sizeof(value),
+                sizeof(value));
+            runtime.memory().write32(
+                PS2_VU1_DATA_BASE + offset +
+                    word * sizeof(value),
+                value);
+        }
+    }
+
     uint32_t makeVifCommand(
         uint8_t opcode, uint8_t count, uint16_t immediate)
     {
@@ -1744,6 +1775,234 @@ void register_ps2_vu1_command_stream_tests()
                 "each speculative slice should copy one bounded data image");
         });
 
+        tc.Run("threaded VU1 restores a save snapshot with a slice pending", [](TestCase &t)
+        {
+            std::mutex gateMutex;
+            std::condition_variable gateCv;
+            bool entered = false;
+            bool release = false;
+            VuUnit unit(VuUnitId::Vu1);
+            unit.setProgressTrackingEnabled(true);
+            Vu1CommandProcessor processor(
+                unit,
+                Vu1CommandProcessorConfiguration{
+                    .captureCommandDigests = true,
+                    .captureArchitecturalStateHashes = true,
+                });
+            ThreadedVu1Executor executor(
+                processor,
+                ThreadedVu1ExecutorOptions{
+                    .queueCapacity = 2u,
+                    .payloadCapacityBytes = 1024u * 1024u,
+                    .beforeProcess =
+                        [&](const Vu1Command &command, uint64_t)
+                        {
+                            if (command.type !=
+                                Vu1CommandType::AdvanceSlice)
+                            {
+                                return;
+                            }
+                            std::unique_lock<std::mutex> lock(gateMutex);
+                            if (entered)
+                                return;
+                            entered = true;
+                            gateCv.notify_all();
+                            gateCv.wait(
+                                lock,
+                                [&release]()
+                                {
+                                    return release;
+                                });
+                        },
+                });
+            (void)executor.submit(Vu1BindMemoryCommand{
+                .microMemory =
+                    std::vector<uint8_t>(PS2_VU1_CODE_SIZE),
+                .dataMemory =
+                    std::vector<uint8_t>(PS2_VU1_DATA_SIZE),
+                .codeGeneration = 1u,
+                .deferredDiagnostics = true,
+            });
+            std::vector<uint8_t> program(16u, 0u);
+            const auto workPair = instructionPair(
+                makeVuIaddiu(1u, 0u, 7), kVuUpperEnd);
+            const auto delayPair = instructionPair(
+                0u, kVuUpperNop);
+            std::copy(
+                workPair.begin(), workPair.end(),
+                program.begin());
+            std::copy(
+                delayPair.begin(), delayPair.end(),
+                program.begin() + 8u);
+            (void)executor.submit(Vu1MicroMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = program,
+            });
+            (void)executor.submit(Vu1MscalCommand{}, 16u, 300u);
+            const Vu1CommandResult savedResult =
+                executor.submit(Vu1SnapshotCommand{}, 20u, 301u);
+            const auto *const saved =
+                std::get_if<Vu1SnapshotResult>(
+                    &savedResult.payload);
+            t.IsTrue(saved && saved->snapshot,
+                     "save should capture the active pre-slice state");
+            if (!saved || !saved->snapshot)
+                return;
+
+            Vu1CommandSubmission pending =
+                executor.submitSpeculativeAdvance(
+                    Vu1AdvanceSliceCommand{
+                        .maximumCycles = 16u,
+                        .captureState = true,
+                    },
+                    Vu1SpeculationResolution::None,
+                    128u, 302u);
+            t.IsTrue(
+                waitFor(
+                    gateCv, gateMutex,
+                    [&entered]()
+                    {
+                        return entered;
+                    }),
+                "the saved generation should have one pending slice");
+
+            std::atomic<bool> restoreStarted{false};
+            std::atomic<bool> restoreDone{false};
+            std::optional<Vu1CommandResult> restored;
+            std::string restoreError;
+            std::thread restorer(
+                [&]()
+                {
+                    restoreStarted.store(
+                        true, std::memory_order_release);
+                    try
+                    {
+                        restored.emplace(
+                            executor.submitResolvingSpeculation(
+                                Vu1RestoreCommand{
+                                    .snapshot = saved->snapshot,
+                                },
+                                Vu1SpeculationResolution::Rollback,
+                                24u, 303u));
+                    }
+                    catch (const std::exception &error)
+                    {
+                        restoreError = error.what();
+                    }
+                    restoreDone.store(
+                        true, std::memory_order_release);
+                });
+            t.IsTrue(
+                waitUntil(
+                    [&restoreStarted]()
+                    {
+                        return restoreStarted.load(
+                            std::memory_order_acquire);
+                    }),
+                "the load producer should start");
+            std::this_thread::sleep_for(5ms);
+            t.IsFalse(
+                restoreDone.load(std::memory_order_acquire),
+                "load should wait for the speculative rollback boundary");
+            {
+                std::lock_guard<std::mutex> lock(gateMutex);
+                release = true;
+            }
+            gateCv.notify_all();
+            restorer.join();
+            const Vu1CommandResult privateResult =
+                executor.wait(std::move(pending));
+            const Vu1SliceResult *const privateSlice =
+                sliceResult(privateResult);
+            t.IsTrue(
+                privateSlice && privateSlice->state &&
+                    privateSlice->state->vi[1] == 7,
+                "the discarded future should retain its private result");
+            t.IsTrue(restoreError.empty() && restored.has_value(),
+                     "the pending load should complete without transport failure");
+            if (!restored)
+                return;
+            t.Equals(restored->identity.sequence, 1ull,
+                     "restore should begin a fresh semantic generation");
+
+            const Vu1CommandResult canonicalResult =
+                executor.submit(Vu1SnapshotCommand{}, 25u, 304u);
+            const auto *const canonical =
+                std::get_if<Vu1SnapshotResult>(
+                    &canonicalResult.payload);
+            t.IsTrue(
+                canonical && canonical->snapshot &&
+                    canonical->architecturalStateHash ==
+                        saved->architecturalStateHash &&
+                    canonical->snapshot->state.vi[1] == 0 &&
+                    canonical->snapshot->state.active,
+                "load should restore the exact pre-slice architecture");
+
+            VuUnit inlineUnit(VuUnitId::Vu1);
+            inlineUnit.setProgressTrackingEnabled(true);
+            Vu1CommandProcessor inlineProcessor(
+                inlineUnit,
+                Vu1CommandProcessorConfiguration{
+                    .captureArchitecturalStateHashes = true,
+                });
+            InlineVu1Executor inlineExecutor(inlineProcessor);
+            (void)inlineExecutor.submit(Vu1BindMemoryCommand{
+                .microMemory =
+                    std::vector<uint8_t>(PS2_VU1_CODE_SIZE),
+                .dataMemory =
+                    std::vector<uint8_t>(PS2_VU1_DATA_SIZE),
+                .codeGeneration = 1u,
+            });
+            (void)inlineExecutor.submit(Vu1RestoreCommand{
+                .snapshot = saved->snapshot,
+            });
+            const Vu1CommandResult threadedAdvance =
+                executor.submit(Vu1AdvanceSliceCommand{
+                    .maximumCycles = 16u,
+                    .captureState = true,
+                });
+            const Vu1CommandResult inlineAdvance =
+                inlineExecutor.submit(Vu1AdvanceSliceCommand{
+                    .maximumCycles = 16u,
+                    .captureState = true,
+                });
+            const Vu1SliceResult *const threadedSlice =
+                sliceResult(threadedAdvance);
+            const Vu1SliceResult *const inlineSlice =
+                sliceResult(inlineAdvance);
+            t.IsTrue(threadedSlice != nullptr,
+                     "threaded post-load advance should return a slice");
+            t.IsTrue(inlineSlice != nullptr,
+                     "inline post-load advance should return a slice");
+            t.IsTrue(threadedSlice && threadedSlice->state,
+                     "threaded post-load advance should capture state");
+            t.IsTrue(inlineSlice && inlineSlice->state,
+                     "inline post-load advance should capture state");
+            std::string difference;
+            const bool stateMatches =
+                threadedSlice && inlineSlice &&
+                threadedSlice->state && inlineSlice->state &&
+                vuExecutionStatesEqual(
+                    *threadedSlice->state,
+                    *inlineSlice->state,
+                    &difference);
+            if (!stateMatches)
+            {
+                t.Fail(
+                    "post-load VU state should match the inline oracle: " +
+                    difference);
+            }
+            t.IsTrue(
+                threadedSlice && inlineSlice &&
+                    threadedSlice->architecturalStateHash ==
+                        inlineSlice->architecturalStateHash,
+                "post-load architecture hash should match the inline oracle");
+            t.Equals(
+                executor.statistics().speculation.rolledBackSlices,
+                1ull,
+                "pending load should roll back exactly one private slice");
+        });
+
         tc.Run("threaded VU1 defers diagnostics for EE publication", [](TestCase &t)
         {
             class Observer final : public IVuExecutionObserver
@@ -1964,6 +2223,930 @@ void register_ps2_vu1_command_stream_tests()
                 runtime.snapshotVu1Owner();
             t.Equals(ownerAfterMirrorEdit->dataMemory[4u], uint8_t{0xddu},
                      "the EE observation mirror must not be canonical owner storage");
+        });
+
+        tc.Run("runtime publishes an early VU1 slice only at its scheduler event", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedAsync;
+            configuration.vu1CommandQueueCapacity = 1u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.captureVu1ArchitecturalStateHashes = true;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "asynchronous runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "asynchronous runtime subsystems should bind");
+
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE,
+                makeVuIaddiu(1u, 0u, 7));
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE + 4u,
+                kVuUpperEnd);
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE + 8u, 0u);
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE + 12u,
+                kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const Vu1AsyncRuntimeStatistics statistics =
+                            runtime.vu1AsyncStatistics();
+                        return statistics.pendingSlice &&
+                               statistics.owner.completedTickets ==
+                                   statistics.owner.submittedTickets;
+                    }),
+                "the startup slice should become ready before its event");
+            const PS2Runtime::DebugVu1Timing beforeTiming =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(beforeTiming.active,
+                     "worker completion must not clear published VU busy");
+            t.Equals(beforeTiming.totalAdvancedCycles, 0ull,
+                     "worker completion must not advance published guest time");
+
+            const std::shared_ptr<const Vu1Snapshot> before =
+                runtime.snapshotVu1Owner();
+            t.Equals(before->state.vi[1], int32_t{0},
+                     "a pre-event observation should see the rolled-back state");
+            t.IsTrue(runtime.vu1AsyncStatistics().pendingSlice,
+                     "the observation barrier should recompute the same slice");
+
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const Vu1AsyncRuntimeStatistics statistics =
+                            runtime.vu1AsyncStatistics();
+                        return statistics.owner.completedTickets ==
+                               statistics.owner.submittedTickets;
+                    }),
+                "the recomputed slice should finish before publication");
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            const std::shared_ptr<const Vu1Snapshot> after =
+                runtime.snapshotVu1Owner();
+            t.Equals(after->state.vi[1], int32_t{7},
+                     "the scheduled event should publish the completed slice");
+            const PS2Runtime::DebugVu1Timing afterTiming =
+                runtime.debugVu1TimingSnapshot();
+            t.IsFalse(afterTiming.active,
+                      "the E-bit program should complete at publication");
+            t.IsTrue(afterTiming.totalAdvancedCycles != 0u,
+                     "publication should account the executed VU cycles");
+
+            const Vu1AsyncRuntimeStatistics statistics =
+                runtime.vu1AsyncStatistics();
+            t.Equals(statistics.slicesSubmitted, 2ull,
+                     "one observation rollback should cause one recomputation");
+            t.Equals(statistics.slicesPublished, 1ull,
+                     "exactly one guest slice should publish");
+            t.Equals(statistics.resultsReadyAtEvent, 1ull,
+                     "the forced-ready result should be classified at the event");
+            t.Equals(statistics.resultsLateAtEvent, 0ull,
+                     "the forced-ready result should not be classified late");
+            t.Equals(statistics.hazardBarrierCount, 1ull,
+                     "the pre-event snapshot should be one explicit hazard");
+            t.Equals(statistics.hazardRequeueCount, 1ull,
+                     "the hazard should requeue the unchanged event slice");
+            t.Equals(statistics.owner.speculation.rolledBackSlices, 1ull,
+                     "the owner should roll back the first private result");
+            t.Equals(statistics.owner.speculation.committedSlices, 1ull,
+                     "the post-event snapshot should commit the published result");
+        });
+
+        tc.Run("runtime waits for a late VU1 result without moving guest time", [](TestCase &t)
+        {
+            std::mutex gateMutex;
+            std::condition_variable gateCv;
+            bool entered = false;
+            bool release = false;
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedAsync;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.vu1BeforeProcess =
+                [&](const Vu1Command &command, uint64_t)
+                {
+                    if (command.type !=
+                        Vu1CommandType::AdvanceSlice)
+                    {
+                        return;
+                    }
+                    std::unique_lock<std::mutex> lock(gateMutex);
+                    if (entered)
+                        return;
+                    entered = true;
+                    gateCv.notify_all();
+                    gateCv.wait(
+                        lock,
+                        [&release]()
+                        {
+                            return release;
+                        });
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "late-result runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "late-result runtime subsystems should bind");
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE,
+                makeVuIaddiu(1u, 0u, 9));
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE + 4u,
+                kVuUpperEnd);
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE + 8u, 0u);
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE + 12u,
+                kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(
+                waitFor(
+                    gateCv, gateMutex,
+                    [&entered]()
+                    {
+                        return entered;
+                    }),
+                "the owner should enter the delayed slice");
+
+            std::thread releaser(
+                [&]()
+                {
+                    std::this_thread::sleep_for(20ms);
+                    {
+                        std::lock_guard<std::mutex> lock(gateMutex);
+                        release = true;
+                    }
+                    gateCv.notify_all();
+                });
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            releaser.join();
+
+            const PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            t.Equals(snapshot->state.vi[1], int32_t{9},
+                     "the late result should publish exact state");
+            t.Equals(timing.currentTick, 128ull,
+                     "host waiting must not add guest ticks");
+            const Vu1AsyncRuntimeStatistics statistics =
+                runtime.vu1AsyncStatistics();
+            t.Equals(statistics.resultsReadyAtEvent, 0ull,
+                     "the blocked owner should not be ready at the event");
+            t.Equals(statistics.resultsLateAtEvent, 1ull,
+                     "the blocked owner should be classified late");
+            t.IsTrue(statistics.eventWaitNanoseconds >= 10'000'000ull,
+                     "the event should report its forced host wait");
+        });
+
+        tc.Run("runtime reset cancels an in-flight speculative VU1 slice", [](TestCase &t)
+        {
+            std::mutex gateMutex;
+            std::condition_variable gateCv;
+            bool entered = false;
+            bool release = false;
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedAsync;
+            configuration.vu1CommandQueueCapacity = 1u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.vu1BeforeProcess =
+                [&](const Vu1Command &command, uint64_t)
+                {
+                    if (command.type !=
+                        Vu1CommandType::AdvanceSlice)
+                    {
+                        return;
+                    }
+                    std::unique_lock<std::mutex> lock(gateMutex);
+                    if (entered)
+                        return;
+                    entered = true;
+                    gateCv.notify_all();
+                    gateCv.wait(
+                        lock,
+                        [&release]()
+                        {
+                            return release;
+                        });
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "pending-reset runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "pending-reset runtime subsystems should bind");
+            for (uint32_t pair = 0u; pair < 64u; ++pair)
+            {
+                writeRuntimeVu1InstructionPair(
+                    runtime, pair * 8u,
+                    makeVuIaddiu(1u, 1u, 1),
+                    kVuUpperNop);
+            }
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            const PS2Runtime::DebugVu1Timing started =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(
+                waitFor(
+                    gateCv, gateMutex,
+                    [&entered]()
+                    {
+                        return entered;
+                    }),
+                "the speculative slice should be owner-active");
+
+            std::atomic<bool> resetDone{false};
+            std::atomic<bool> resetStarted{false};
+            bool resetAccepted = false;
+            std::thread resetter(
+                [&]()
+                {
+                    resetStarted.store(
+                        true, std::memory_order_release);
+                    resetAccepted = runtime.memory().writeIORegister(
+                        0x10003c10u, 1u);
+                    resetDone.store(
+                        true, std::memory_order_release);
+                });
+            t.IsTrue(
+                waitUntil(
+                    [&resetStarted]()
+                    {
+                        return resetStarted.load(
+                            std::memory_order_acquire);
+                    }),
+                "the reset producer should start");
+            std::this_thread::sleep_for(5ms);
+            t.IsFalse(
+                resetDone.load(std::memory_order_acquire),
+                "reset must wait for the owner to reach a rollback boundary");
+            {
+                std::lock_guard<std::mutex> lock(gateMutex);
+                release = true;
+            }
+            gateCv.notify_all();
+            resetter.join();
+
+            t.IsTrue(resetAccepted,
+                     "VIF1 FBRST should accept the reset");
+            const PS2Runtime::DebugVu1Timing reset =
+                runtime.debugVu1TimingSnapshot();
+            t.IsFalse(reset.active,
+                      "reset should clear the published VU1 busy state");
+            t.IsFalse(reset.eventPending,
+                      "reset should cancel the old scheduler token");
+            t.IsTrue(reset.generation > started.generation,
+                     "reset should invalidate the old execution generation");
+            const Vu1AsyncRuntimeStatistics statistics =
+                runtime.vu1AsyncStatistics();
+            t.IsFalse(statistics.pendingSlice,
+                      "reset should retain no speculative work");
+            t.Equals(statistics.slicesPublished, 0ull,
+                     "reset must not publish the discarded slice");
+            t.Equals(statistics.hazardBarrierCount, 1ull,
+                     "reset should cross one pending-slice barrier");
+            t.Equals(
+                statistics.owner.speculation.rolledBackSlices,
+                1ull,
+                "the owner should roll back the in-flight slice once");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            t.IsFalse(snapshot->state.active,
+                      "the stale event must not reactivate VU1");
+            t.Equals(snapshot->state.vi[1], int32_t{0},
+                     "discarded speculative arithmetic must remain private");
+        });
+
+        tc.Run("runtime reset resolves ready published and follow-up speculation", [](TestCase &t)
+        {
+            enum class ResetPhase : uint8_t
+            {
+                ReadyUnpublished,
+                PublishedComplete,
+                FollowupPending,
+            };
+            for (const ResetPhase phase : {
+                     ResetPhase::ReadyUnpublished,
+                     ResetPhase::PublishedComplete,
+                     ResetPhase::FollowupPending})
+            {
+                PS2RuntimeConfiguration configuration =
+                    defaultPs2RuntimeConfiguration();
+                configuration.vu1ExecutionMode =
+                    Vu1ExecutionMode::ThreadedAsync;
+                configuration.vu1CommandQueueCapacity =
+                    phase == ResetPhase::FollowupPending
+                        ? 2u
+                        : 1u;
+                configuration.vu1CommandPayloadCapacityBytes =
+                    1024u * 1024u;
+                PS2Runtime runtime(configuration);
+                t.IsTrue(runtime.memory().initialize(),
+                         "reset-phase runtime memory should initialize");
+                t.IsTrue(runtime.syncCoreSubsystems(),
+                         "reset-phase runtime subsystems should bind");
+
+                const bool completesAtStartup =
+                    phase == ResetPhase::PublishedComplete;
+                const uint32_t pairCount =
+                    completesAtStartup ? 2u : 64u;
+                for (uint32_t pair = 0u;
+                     pair < pairCount; ++pair)
+                {
+                    writeRuntimeVu1InstructionPair(
+                        runtime, pair * 8u,
+                        makeVuIaddiu(1u, 1u, 1),
+                        completesAtStartup && pair == 0u
+                            ? kVuUpperEnd
+                            : kVuUpperNop);
+                }
+                const uint32_t mscal =
+                    makeVifCommand(0x14u, 0u, 0u);
+                runtime.memory().processVIF1Data(
+                    reinterpret_cast<const uint8_t *>(&mscal),
+                    sizeof(mscal));
+
+                if (phase == ResetPhase::ReadyUnpublished)
+                {
+                    t.IsTrue(
+                        waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return statistics.pendingSlice &&
+                                       statistics.owner.completedTickets ==
+                                           statistics.owner.submittedTickets;
+                            }),
+                        "the pre-event result should become ready");
+                }
+                else
+                {
+                    R5900Context &context = runtime.cpu();
+                    context.advanceEeCycleTicks(128u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    if (phase == ResetPhase::FollowupPending)
+                    {
+                        t.IsTrue(runtime.vu1AsyncStatistics().pendingSlice,
+                                 "the first event should enqueue its follow-up");
+                    }
+                }
+
+                t.IsTrue(runtime.memory().writeIORegister(
+                             0x10003c10u, 1u),
+                         "VIF1 FBRST should accept each reset phase");
+                const auto timing =
+                    runtime.debugVu1TimingSnapshot();
+                const auto statistics =
+                    runtime.vu1AsyncStatistics();
+                t.IsFalse(timing.active,
+                          "each reset phase should clear VU1 busy");
+                t.IsFalse(timing.eventPending,
+                          "each reset phase should cancel its event");
+                t.IsFalse(statistics.pendingSlice,
+                          "each reset phase should retire pending transport");
+                const uint64_t expectedPublished =
+                    phase == ResetPhase::ReadyUnpublished ? 0u : 1u;
+                const uint64_t expectedCommitted =
+                    phase == ResetPhase::ReadyUnpublished ? 0u : 1u;
+                const uint64_t expectedRolledBack =
+                    phase == ResetPhase::PublishedComplete ? 0u : 1u;
+                t.Equals(statistics.slicesPublished, expectedPublished,
+                         "reset should preserve only prior event publication");
+                t.Equals(
+                    statistics.owner.speculation.committedSlices,
+                    expectedCommitted,
+                    "reset should commit only an already-published slice");
+                t.Equals(
+                    statistics.owner.speculation.rolledBackSlices,
+                    expectedRolledBack,
+                    "reset should discard only an unpublished slice");
+                const std::shared_ptr<const Vu1Snapshot> snapshot =
+                    runtime.snapshotVu1Owner();
+                t.IsFalse(snapshot->state.active,
+                          "reset snapshot should remain inactive");
+                t.Equals(snapshot->state.vi[1], int32_t{0},
+                         "reset should clear all published or private work");
+            }
+        });
+
+        tc.Run("runtime shutdown resolves a pending speculative VU1 slice", [](TestCase &t)
+        {
+            auto advanceAttempts =
+                std::make_shared<std::atomic<uint64_t>>(0u);
+            const auto startedAt =
+                std::chrono::steady_clock::now();
+            {
+                PS2RuntimeConfiguration configuration =
+                    defaultPs2RuntimeConfiguration();
+                configuration.vu1ExecutionMode =
+                    Vu1ExecutionMode::ThreadedAsync;
+                configuration.vu1CommandQueueCapacity = 1u;
+                configuration.vu1CommandPayloadCapacityBytes =
+                    1024u * 1024u;
+                configuration.vu1BeforeProcess =
+                    [advanceAttempts](
+                        const Vu1Command &command, uint64_t)
+                    {
+                        if (command.type !=
+                            Vu1CommandType::AdvanceSlice)
+                        {
+                            return;
+                        }
+                        advanceAttempts->fetch_add(
+                            1u, std::memory_order_relaxed);
+                        std::this_thread::sleep_for(20ms);
+                    };
+                PS2Runtime runtime(configuration);
+                t.IsTrue(runtime.memory().initialize(),
+                         "shutdown runtime memory should initialize");
+                t.IsTrue(runtime.syncCoreSubsystems(),
+                         "shutdown runtime subsystems should bind");
+                for (uint32_t pair = 0u; pair < 32u; ++pair)
+                {
+                    writeRuntimeVu1InstructionPair(
+                        runtime, pair * 8u, 0u,
+                        kVuUpperNop);
+                }
+                const uint32_t mscal =
+                    makeVifCommand(0x14u, 0u, 0u);
+                runtime.memory().processVIF1Data(
+                    reinterpret_cast<const uint8_t *>(&mscal),
+                    sizeof(mscal));
+                t.IsTrue(
+                    waitUntil(
+                        [&advanceAttempts]()
+                        {
+                            return advanceAttempts->load(
+                                       std::memory_order_acquire) != 0u;
+                        }),
+                    "destruction should begin with owner-active speculation");
+            }
+            const auto elapsed =
+                std::chrono::steady_clock::now() - startedAt;
+            t.IsTrue(
+                elapsed < 2s,
+                "pending shutdown should resolve without a lifecycle hang");
+            t.Equals(advanceAttempts->load(std::memory_order_acquire), 1ull,
+                     "shutdown should not requeue discarded future work");
+        });
+
+        tc.Run("runtime chains MSCAL MSCNT and VIF waits through async events", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedAsync;
+            configuration.vu1CommandQueueCapacity = 1u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "chained-VIF runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "chained-VIF runtime subsystems should bind");
+
+            const auto makeVuBranch = [](int16_t immediate)
+            {
+                return (0x20u << 25u) |
+                       (static_cast<uint32_t>(immediate) & 0x07ffu);
+            };
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u, makeVuBranch(2), kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u,
+                makeVuIaddiu(1u, 0u, 1),
+                kVuUpperNop);
+            writeRuntimeVu1InstructionPair(
+                runtime, 24u,
+                makeVuIaddiu(2u, 0u, 7),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 32u, 0u, kVuUpperNop);
+
+            const std::array<uint32_t, 5u> commands = {
+                makeVifCommand(0x14u, 0u, 0u),
+                makeVifCommand(0x11u, 0u, 0u),
+                makeVifCommand(0x17u, 0u, 0u),
+                makeVifCommand(0x11u, 0u, 0u),
+                makeVifCommand(0x05u, 0u, 3u),
+            };
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(commands.data()),
+                static_cast<uint32_t>(sizeof(commands)));
+            t.IsTrue(runtime.memory().vif1WaitingForVu(),
+                     "the first FLUSH should defer MSCNT and STMOD");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const PS2Runtime::DebugVu1Timing resumed =
+                runtime.debugVu1TimingSnapshot();
+            const std::shared_ptr<const Vu1Snapshot> first =
+                runtime.snapshotVu1Owner();
+            t.IsTrue(resumed.active && resumed.eventPending,
+                     "MSCNT should schedule a fresh async startup slice");
+            t.IsTrue(runtime.memory().vif1WaitingForVu(),
+                     "the second FLUSH should retain the wait");
+            t.Equals(first->state.vi[1], int32_t{1},
+                     "the first segment should publish its delay slot");
+            t.Equals(first->state.vi[2], int32_t{0},
+                     "the resumed segment must remain private until its event");
+            t.Equals(runtime.memory().vif1_regs.mode, 0u,
+                     "STMOD should remain deferred behind MSCNT");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const std::shared_ptr<const Vu1Snapshot> second =
+                runtime.snapshotVu1Owner();
+            t.IsFalse(second->state.active,
+                      "the resumed E-bit segment should finish");
+            t.Equals(second->state.vi[2], int32_t{7},
+                     "MSCNT should resume at the canonical branch target");
+            t.IsFalse(runtime.memory().vif1WaitingForVu(),
+                      "second completion should wake VIF1");
+            t.Equals(runtime.memory().vif1_regs.mode, 3u,
+                     "the deferred STMOD should execute last");
+            t.Equals(runtime.vu1AsyncStatistics().slicesPublished, 2ull,
+                     "both VU segments should publish at their own events");
+        });
+
+        tc.Run("runtime publishes multiple XGKICKs in slice and event order", [](TestCase &t)
+        {
+            const auto run =
+                [&](uint32_t secondKickPair,
+                    size_t packetsAfterStartup)
+                {
+                    PS2RuntimeConfiguration configuration =
+                        defaultPs2RuntimeConfiguration();
+                    configuration.vu1ExecutionMode =
+                        Vu1ExecutionMode::ThreadedAsync;
+                    configuration.vu1CommandQueueCapacity = 2u;
+                    configuration.vu1CommandPayloadCapacityBytes =
+                        1024u * 1024u;
+                    PS2Runtime runtime(configuration);
+                    if (!runtime.memory().initialize() ||
+                        !runtime.syncCoreSubsystems())
+                    {
+                        t.Fail("multi-XGKICK runtime should initialize");
+                        return;
+                    }
+
+                    std::vector<std::vector<uint8_t>> captured;
+                    runtime.gifArbiter().setProcessPacketFn(
+                        [&](const uint8_t *data, uint32_t sizeBytes)
+                        {
+                            captured.emplace_back(
+                                data, data + sizeBytes);
+                        });
+                    std::array<uint8_t, 16u> firstPacket{};
+                    std::array<uint8_t, 16u> secondPacket{};
+                    const uint64_t eopImageTag =
+                        (1ull << 15u) | (2ull << 58u);
+                    const uint64_t firstMarker = 0x1111u;
+                    const uint64_t secondMarker = 0x2222u;
+                    std::memcpy(
+                        firstPacket.data(), &eopImageTag,
+                        sizeof(eopImageTag));
+                    std::memcpy(
+                        firstPacket.data() + 8u, &firstMarker,
+                        sizeof(firstMarker));
+                    std::memcpy(
+                        secondPacket.data(), &eopImageTag,
+                        sizeof(eopImageTag));
+                    std::memcpy(
+                        secondPacket.data() + 8u, &secondMarker,
+                        sizeof(secondMarker));
+                    writeRuntimeVu1Qword(runtime, 0u, firstPacket);
+                    writeRuntimeVu1Qword(runtime, 4u * 16u, secondPacket);
+
+                    for (uint32_t pair = 0u;
+                         pair <= secondKickPair + 2u; ++pair)
+                    {
+                        writeRuntimeVu1InstructionPair(
+                            runtime, pair * 8u, 0u,
+                            kVuUpperNop);
+                    }
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 0u,
+                        makeVuIaddiu(1u, 0u, 0),
+                        kVuUpperNop);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 1u * 8u,
+                        makeVuLowerSpecial(0x6cu, 1u),
+                        kVuUpperNop);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, (secondKickPair - 1u) * 8u,
+                        makeVuIaddiu(1u, 0u, 4),
+                        kVuUpperNop);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, secondKickPair * 8u,
+                        makeVuLowerSpecial(0x6cu, 1u),
+                        kVuUpperEnd);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, (secondKickPair + 1u) * 8u,
+                        0u, kVuUpperNop);
+
+                    const uint32_t mscal =
+                        makeVifCommand(0x14u, 0u, 0u);
+                    runtime.memory().processVIF1Data(
+                        reinterpret_cast<const uint8_t *>(&mscal),
+                        sizeof(mscal));
+                    if (!waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return statistics.owner.completedTickets ==
+                                       statistics.owner.submittedTickets;
+                            }))
+                    {
+                        t.Fail("startup XGKICK slice should become ready");
+                        return;
+                    }
+                    t.Equals(captured.size(), size_t{0u},
+                             "ready XGKICK packets must remain private");
+
+                    R5900Context &context = runtime.cpu();
+                    context.advanceEeCycleTicks(128u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    t.Equals(
+                        captured.size(), packetsAfterStartup,
+                        "startup event should publish only its earned packets");
+                    if (captured.size() < 2u)
+                    {
+                        const auto timing =
+                            runtime.debugVu1TimingSnapshot();
+                        const uint64_t delta =
+                            timing.eventDeadlineTick -
+                            timing.currentTick;
+                        context.advanceEeCycleTicks(delta);
+                        runtime.serviceEeEventsAtBlockBoundary(
+                            runtime.memory().getRDRAM(), &context);
+                    }
+                    t.Equals(captured.size(), size_t{2u},
+                             "the complete program should publish both packets");
+                    if (captured.size() == 2u)
+                    {
+                        t.Equals(
+                            captured[0],
+                            std::vector<uint8_t>(
+                                firstPacket.begin(),
+                                firstPacket.end()),
+                            "the first kick should retain its source bytes");
+                        t.Equals(
+                            captured[1],
+                            std::vector<uint8_t>(
+                                secondPacket.begin(),
+                                secondPacket.end()),
+                            "the second kick should follow in VU order");
+                    }
+                };
+
+            run(3u, 2u);
+            run(18u, 1u);
+        });
+
+        tc.Run("runtime async checkpoints match inline under ready late and jitter schedules", [](TestCase &t)
+        {
+            struct Checkpoint
+            {
+                uint64_t architecturalHash = 0u;
+                uint64_t eventTick = 0u;
+                uint64_t advancedCycles = 0u;
+                uint32_t pc = 0u;
+                bool active = false;
+
+                bool operator==(
+                    const Checkpoint &) const = default;
+            };
+            struct RunResult
+            {
+                std::vector<Checkpoint> checkpoints;
+                Vu1AsyncRuntimeStatistics statistics{};
+            };
+            const auto run =
+                [&](Vu1ExecutionMode mode,
+                    size_t queueCapacity,
+                    std::vector<std::chrono::microseconds> delays,
+                    bool waitForReady) -> RunResult
+                {
+                    std::atomic<size_t> sliceAttempt{0u};
+                    PS2RuntimeConfiguration configuration =
+                        defaultPs2RuntimeConfiguration();
+                    configuration.vu1ExecutionMode = mode;
+                    configuration.vu1CommandQueueCapacity =
+                        queueCapacity;
+                    configuration.vu1CommandPayloadCapacityBytes =
+                        1024u * 1024u;
+                    configuration.captureVu1ArchitecturalStateHashes =
+                        true;
+                    configuration.vu1BeforeProcess =
+                        [&](const Vu1Command &command, uint64_t)
+                        {
+                            if (command.type !=
+                                    Vu1CommandType::AdvanceSlice ||
+                                delays.empty())
+                            {
+                                return;
+                            }
+                            const size_t index =
+                                sliceAttempt.fetch_add(
+                                    1u,
+                                    std::memory_order_relaxed);
+                            std::this_thread::sleep_for(
+                                delays[index % delays.size()]);
+                        };
+                    PS2Runtime runtime(configuration);
+                    if (!runtime.memory().initialize() ||
+                        !runtime.syncCoreSubsystems())
+                    {
+                        t.Fail("delay-matrix runtime should initialize");
+                        return {};
+                    }
+
+                    constexpr uint32_t kWorkPairs = 170u;
+                    for (uint32_t pair = 0u;
+                         pair < kWorkPairs; ++pair)
+                    {
+                        writeRuntimeVu1InstructionPair(
+                            runtime, pair * 8u,
+                            makeVuIaddiu(1u, 1u, 1),
+                            pair + 1u == kWorkPairs
+                                ? kVuUpperEnd
+                                : kVuUpperNop);
+                    }
+                    writeRuntimeVu1InstructionPair(
+                        runtime, kWorkPairs * 8u,
+                        0u, kVuUpperNop);
+                    const uint32_t mscal =
+                        makeVifCommand(0x14u, 0u, 0u);
+                    runtime.memory().processVIF1Data(
+                        reinterpret_cast<const uint8_t *>(&mscal),
+                        sizeof(mscal));
+
+                    RunResult result;
+                    R5900Context &context = runtime.cpu();
+                    for (uint32_t event = 0u;
+                         event < 8u; ++event)
+                    {
+                        PS2Runtime::DebugVu1Timing before =
+                            runtime.debugVu1TimingSnapshot();
+                        if (!before.eventPending)
+                            break;
+                        if (waitForReady &&
+                            mode == Vu1ExecutionMode::ThreadedAsync)
+                        {
+                            if (!waitUntil(
+                                    [&runtime]()
+                                    {
+                                        const auto statistics =
+                                            runtime.vu1AsyncStatistics();
+                                        return statistics.pendingSlice &&
+                                               statistics.owner.completedTickets ==
+                                                   statistics.owner.submittedTickets;
+                                    }))
+                            {
+                                t.Fail("forced-early slice should become ready");
+                                return result;
+                            }
+                        }
+                        const uint64_t delta =
+                            before.eventDeadlineTick -
+                            before.currentTick;
+                        context.advanceEeCycleTicks(delta);
+                        runtime.serviceEeEventsAtBlockBoundary(
+                            runtime.memory().getRDRAM(), &context);
+                        const PS2Runtime::DebugVu1Timing after =
+                            runtime.debugVu1TimingSnapshot();
+                        const std::shared_ptr<const Vu1Snapshot> snapshot =
+                            runtime.snapshotVu1Owner();
+                        result.checkpoints.push_back(
+                            Checkpoint{
+                                .architecturalHash =
+                                    vu1ArchitecturalStateHash(
+                                        snapshot->state,
+                                        snapshot->microMemory,
+                                        snapshot->dataMemory,
+                                        snapshot->vif,
+                                        snapshot->codeGeneration),
+                                .eventTick = after.currentTick,
+                                .advancedCycles =
+                                    after.totalAdvancedCycles,
+                                .pc = snapshot->state.pc,
+                                .active = snapshot->state.active,
+                            });
+                        if (!after.active)
+                            break;
+                    }
+                    result.statistics =
+                        runtime.vu1AsyncStatistics();
+                    return result;
+                };
+
+            const RunResult reference = run(
+                Vu1ExecutionMode::Inline, 1u, {}, false);
+            t.Equals(reference.checkpoints.size(), size_t{3u},
+                     "the oracle should cross three scheduler events");
+            const auto compare =
+                [&](const RunResult &candidate,
+                    const char *description)
+                {
+                    t.Equals(
+                        candidate.checkpoints.size(),
+                        reference.checkpoints.size(),
+                        std::string(description) +
+                            " should retain every event boundary");
+                    const size_t count = std::min(
+                        candidate.checkpoints.size(),
+                        reference.checkpoints.size());
+                    for (size_t index = 0u;
+                         index < count; ++index)
+                    {
+                        t.IsTrue(
+                            candidate.checkpoints[index] ==
+                                reference.checkpoints[index],
+                            std::string(description) +
+                                " should match checkpoint " +
+                                std::to_string(index));
+                    }
+                };
+
+            const RunResult early = run(
+                Vu1ExecutionMode::ThreadedAsync,
+                1u, {0us}, true);
+            compare(early, "forced-early capacity-one execution");
+            t.Equals(
+                early.statistics.resultsReadyAtEvent,
+                early.statistics.slicesPublished,
+                "every forced-early result should be ready at publication");
+            t.Equals(early.statistics.resultsLateAtEvent, 0ull,
+                     "forced-early execution should have no late result");
+            t.Equals(early.statistics.owner.queueCapacity, size_t{1u},
+                     "the early arm should exercise capacity one");
+
+            const RunResult late = run(
+                Vu1ExecutionMode::ThreadedAsync,
+                2u, {10ms}, false);
+            compare(late, "forced-late capacity-two execution");
+            t.Equals(
+                late.statistics.resultsLateAtEvent,
+                late.statistics.slicesPublished,
+                "every delayed result should be late at publication");
+            t.Equals(late.statistics.resultsReadyAtEvent, 0ull,
+                     "forced-late execution should have no ready result");
+            t.Equals(late.statistics.owner.queueCapacity, size_t{2u},
+                     "the late arm should exercise capacity two");
+
+            const RunResult jitter = run(
+                Vu1ExecutionMode::ThreadedAsync,
+                1u,
+                {0us, 250us, 20ms, 1ms, 0us, 5ms},
+                false);
+            compare(jitter, "fixed-seed jitter execution");
+            t.Equals(jitter.statistics.slicesPublished, 3ull,
+                     "jitter should publish the unchanged event count");
         });
     });
 }

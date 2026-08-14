@@ -131,6 +131,26 @@ struct GsAsyncRuntimeStatistics
     ThreadedGsExecutorStatistics owner{};
 };
 
+struct Vu1AsyncRuntimeStatistics
+{
+    bool enabled = false;
+    bool pendingSlice = false;
+    uint64_t slicesSubmitted = 0u;
+    uint64_t slicesPublished = 0u;
+    uint64_t resultsReadyAtEvent = 0u;
+    uint64_t resultsLateAtEvent = 0u;
+    uint64_t eventWaitCount = 0u;
+    uint64_t eventWaitNanoseconds = 0u;
+    uint64_t maximumEventWaitNanoseconds = 0u;
+    uint64_t hazardBarrierCount = 0u;
+    uint64_t hazardWaitNanoseconds = 0u;
+    uint64_t hazardRequeueCount = 0u;
+    uint64_t sliceSubmitCount = 0u;
+    uint64_t sliceSubmitNanoseconds = 0u;
+    uint64_t maximumSliceSubmitNanoseconds = 0u;
+    ThreadedVu1ExecutorStatistics owner{};
+};
+
 [[nodiscard]] PS2RuntimeConfiguration
 defaultPs2RuntimeConfiguration() noexcept;
 
@@ -762,17 +782,13 @@ public:
     }
     [[nodiscard]] ThreadedVu1ExecutorStatistics
     vu1OwnerStatistics() const;
+    [[nodiscard]] Vu1AsyncRuntimeStatistics
+    vu1AsyncStatistics() const;
     [[nodiscard]] std::shared_ptr<const Vu1Snapshot>
     snapshotVu1Owner();
     [[nodiscard]] VuProgressSnapshot
-    vu1ProgressSnapshot() const
-    {
-        return m_vu1.getProgressSnapshot();
-    }
-    void setVu1ProgressTrackingEnabled(bool enabled)
-    {
-        m_vu1.setProgressTrackingEnabled(enabled);
-    }
+    vu1ProgressSnapshot() const;
+    void setVu1ProgressTrackingEnabled(bool enabled);
     [[nodiscard]] ps2x::timing::EeTick currentEeTick() const noexcept;
     void resetEeTiming(R5900Context *context = nullptr);
     void setRealtimeVSyncPacingEnabled(bool enabled);
@@ -2426,6 +2442,36 @@ private:
     void scheduleVU1Event(
         ps2x::timing::EeTick deadline) noexcept;
     void cancelVU1Execution(bool resetInterpreter);
+    struct Vu1PendingSlicePlan
+    {
+        uint32_t cycleBudget = 0u;
+        ps2x::timing::EeTick deadline{};
+        uint64_t eventGeneration = 0u;
+        uint64_t executionGeneration = 0u;
+    };
+    struct Vu1SynchronousCommandBarrier
+    {
+        Vu1SpeculationResolution resolution =
+            Vu1SpeculationResolution::None;
+        std::optional<Vu1PendingSlicePlan> requeue;
+    };
+    enum class Vu1SpeculationPublicationState : uint8_t
+    {
+        None,
+        Unpublished,
+        Published,
+    };
+    [[nodiscard]] Vu1SynchronousCommandBarrier
+    beginVu1SynchronousCommandBarrier();
+    void finishVu1SynchronousCommandBarrier(
+        const Vu1SynchronousCommandBarrier &barrier);
+    void enqueueVu1SpeculativeSlice(
+        const Vu1PendingSlicePlan &plan,
+        Vu1SpeculationResolution previousResolution);
+    [[nodiscard]] Vu1CommandResult
+    consumeVu1SpeculativeSliceAtEvent(
+        const ps2x::timing::EeEventService &service);
+    void resolveVu1SpeculationForShutdown() noexcept;
     [[nodiscard]] Vu1CommandResult submitVu1Command(
         Vu1CommandPayload payload,
         uint64_t guestTick = 0u,
@@ -2686,10 +2732,38 @@ private:
     std::atomic<bool> m_publishedVu1Active{false};
     std::atomic<uint32_t> m_publishedVu1ProgramCounter{0u};
     std::atomic<uint64_t> m_publishedVu1CodeGeneration{0u};
+    std::atomic<bool> m_publishedVu1ProgressEnabled{false};
+    std::atomic<bool> m_publishedVu1ProgressActive{false};
+    std::atomic<uint64_t> m_publishedVu1ProgressInvocations{0u};
+    std::atomic<uint64_t> m_publishedVu1ProgressCycles{0u};
+    std::atomic<uint32_t> m_publishedVu1ProgressPc{0u};
     bool m_publishedVu1TraceEnabled = false;
     bool m_publishedVu1WorkloadProfileEnabled = false;
     bool m_vu1MemoryMirrorDirty = false;
     bool m_vu1MemoryMirrorSynchronizationActive = false;
+    struct Vu1PendingSlice
+    {
+        Vu1CommandSubmission submission;
+        Vu1PendingSlicePlan plan{};
+    };
+    std::optional<Vu1PendingSlice> m_pendingVu1Slice;
+    Vu1SpeculationPublicationState
+        m_vu1SpeculationPublicationState =
+            Vu1SpeculationPublicationState::None;
+    std::atomic<bool> m_vu1AsyncPendingSlice{false};
+    std::atomic<uint64_t> m_vu1AsyncSlicesSubmitted{0u};
+    std::atomic<uint64_t> m_vu1AsyncSlicesPublished{0u};
+    std::atomic<uint64_t> m_vu1AsyncResultsReadyAtEvent{0u};
+    std::atomic<uint64_t> m_vu1AsyncResultsLateAtEvent{0u};
+    std::atomic<uint64_t> m_vu1AsyncEventWaitCount{0u};
+    std::atomic<uint64_t> m_vu1AsyncEventWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_vu1AsyncMaximumEventWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_vu1AsyncHazardBarrierCount{0u};
+    std::atomic<uint64_t> m_vu1AsyncHazardWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_vu1AsyncHazardRequeueCount{0u};
+    std::atomic<uint64_t> m_vu1AsyncSliceSubmitCount{0u};
+    std::atomic<uint64_t> m_vu1AsyncSliceSubmitNanoseconds{0u};
+    std::atomic<uint64_t> m_vu1AsyncMaximumSliceSubmitNanoseconds{0u};
     ps2x::timing::Cop0Timing m_cop0Timing;
     static constexpr size_t kEeBranchHistoryEntries = 4096u;
     std::array<uint32_t, kEeBranchHistoryEntries>

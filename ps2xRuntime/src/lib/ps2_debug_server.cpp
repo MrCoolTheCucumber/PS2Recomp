@@ -1248,6 +1248,169 @@ struct PS2DebugServer::Impl
         }
         result.AddMember("gs_async", gsAsyncValue, allocator);
 
+        const Vu1AsyncRuntimeStatistics vu1Async =
+            runtime.vu1AsyncStatistics();
+        Value vu1AsyncValue(rapidjson::kObjectType);
+        vu1AsyncValue.AddMember(
+            "enabled", vu1Async.enabled, allocator);
+        vu1AsyncValue.AddMember(
+            "pending_slice", vu1Async.pendingSlice, allocator);
+        vu1AsyncValue.AddMember(
+            "slices_submitted",
+            vu1Async.slicesSubmitted, allocator);
+        vu1AsyncValue.AddMember(
+            "slices_published",
+            vu1Async.slicesPublished, allocator);
+        vu1AsyncValue.AddMember(
+            "results_ready_at_event",
+            vu1Async.resultsReadyAtEvent, allocator);
+        vu1AsyncValue.AddMember(
+            "results_late_at_event",
+            vu1Async.resultsLateAtEvent, allocator);
+        vu1AsyncValue.AddMember(
+            "event_wait_count",
+            vu1Async.eventWaitCount, allocator);
+        vu1AsyncValue.AddMember(
+            "event_wait_ns",
+            vu1Async.eventWaitNanoseconds, allocator);
+        vu1AsyncValue.AddMember(
+            "maximum_event_wait_ns",
+            vu1Async.maximumEventWaitNanoseconds, allocator);
+        vu1AsyncValue.AddMember(
+            "hazard_barrier_count",
+            vu1Async.hazardBarrierCount, allocator);
+        vu1AsyncValue.AddMember(
+            "hazard_wait_ns",
+            vu1Async.hazardWaitNanoseconds, allocator);
+        vu1AsyncValue.AddMember(
+            "hazard_requeue_count",
+            vu1Async.hazardRequeueCount, allocator);
+        vu1AsyncValue.AddMember(
+            "slice_submit_count",
+            vu1Async.sliceSubmitCount, allocator);
+        vu1AsyncValue.AddMember(
+            "slice_submit_ns",
+            vu1Async.sliceSubmitNanoseconds, allocator);
+        vu1AsyncValue.AddMember(
+            "maximum_slice_submit_ns",
+            vu1Async.maximumSliceSubmitNanoseconds, allocator);
+
+        const ThreadedVu1ExecutorStatistics &vu1OwnerStats =
+            vu1Async.owner;
+        Value vu1OwnerValue(rapidjson::kObjectType);
+        vu1OwnerValue.AddMember(
+            "queue_capacity",
+            static_cast<uint64_t>(vu1OwnerStats.queueCapacity),
+            allocator);
+        vu1OwnerValue.AddMember(
+            "payload_capacity_bytes",
+            vu1OwnerStats.payloadCapacityBytes, allocator);
+        vu1OwnerValue.AddMember(
+            "queue_depth",
+            static_cast<uint64_t>(vu1OwnerStats.queueDepth),
+            allocator);
+        vu1OwnerValue.AddMember(
+            "queue_high_water",
+            static_cast<uint64_t>(vu1OwnerStats.queueHighWater),
+            allocator);
+        vu1OwnerValue.AddMember(
+            "queued_payload_bytes",
+            vu1OwnerStats.queuedPayloadBytes, allocator);
+        vu1OwnerValue.AddMember(
+            "payload_high_water_bytes",
+            vu1OwnerStats.payloadHighWaterBytes, allocator);
+        vu1OwnerValue.AddMember(
+            "submitted_tickets",
+            vu1OwnerStats.submittedTickets, allocator);
+        vu1OwnerValue.AddMember(
+            "completed_tickets",
+            vu1OwnerStats.completedTickets, allocator);
+        vu1OwnerValue.AddMember(
+            "submitted_generation",
+            vu1OwnerStats.submittedGeneration, allocator);
+        vu1OwnerValue.AddMember(
+            "submitted_sequence",
+            vu1OwnerStats.submittedSequence, allocator);
+        vu1OwnerValue.AddMember(
+            "completed_generation",
+            vu1OwnerStats.completedGeneration, allocator);
+        vu1OwnerValue.AddMember(
+            "completed_sequence",
+            vu1OwnerStats.completedSequence, allocator);
+        vu1OwnerValue.AddMember(
+            "producer_block_count",
+            vu1OwnerStats.producerBlockCount, allocator);
+        vu1OwnerValue.AddMember(
+            "producer_blocked_ns",
+            vu1OwnerStats.producerBlockedNanoseconds, allocator);
+        vu1OwnerValue.AddMember(
+            "producer_slot_wait_count",
+            vu1OwnerStats.producerSlotWaitCount, allocator);
+        vu1OwnerValue.AddMember(
+            "producer_slot_wait_ns",
+            vu1OwnerStats.producerSlotWaitNanoseconds, allocator);
+        vu1OwnerValue.AddMember(
+            "producer_payload_wait_count",
+            vu1OwnerStats.producerPayloadWaitCount, allocator);
+        vu1OwnerValue.AddMember(
+            "producer_payload_wait_ns",
+            vu1OwnerStats.producerPayloadWaitNanoseconds, allocator);
+        vu1OwnerValue.AddMember(
+            "worker_active_ns",
+            vu1OwnerStats.workerActiveNanoseconds, allocator);
+        vu1OwnerValue.AddMember(
+            "worker_idle_ns",
+            vu1OwnerStats.workerIdleNanoseconds, allocator);
+        vu1OwnerValue.AddMember(
+            "result_wait_count",
+            vu1OwnerStats.resultWaitCount, allocator);
+        vu1OwnerValue.AddMember(
+            "result_wait_ns",
+            vu1OwnerStats.resultWaitNanoseconds, allocator);
+        vu1OwnerValue.AddMember(
+            "started", vu1OwnerStats.started, allocator);
+        vu1OwnerValue.AddMember(
+            "running", vu1OwnerStats.running, allocator);
+        vu1OwnerValue.AddMember(
+            "accepting", vu1OwnerStats.accepting, allocator);
+        vu1OwnerValue.AddMember(
+            "drain_requested",
+            vu1OwnerStats.drainRequested, allocator);
+        vu1OwnerValue.AddMember(
+            "cancel_requested",
+            vu1OwnerStats.cancelRequested, allocator);
+        vu1OwnerValue.AddMember(
+            "failed", vu1OwnerStats.failed, allocator);
+
+        const Vu1SpeculationStatistics &speculation =
+            vu1OwnerStats.speculation;
+        Value speculationValue(rapidjson::kObjectType);
+        speculationValue.AddMember(
+            "captured_slices",
+            speculation.capturedSlices, allocator);
+        speculationValue.AddMember(
+            "checkpoint_bytes_copied",
+            speculation.checkpointBytesCopied, allocator);
+        speculationValue.AddMember(
+            "checkpoint_capture_ns",
+            speculation.checkpointCaptureNanoseconds,
+            allocator);
+        speculationValue.AddMember(
+            "committed_slices",
+            speculation.committedSlices, allocator);
+        speculationValue.AddMember(
+            "rolled_back_slices",
+            speculation.rolledBackSlices, allocator);
+        speculationValue.AddMember(
+            "rollback_ns",
+            speculation.rollbackNanoseconds, allocator);
+        vu1OwnerValue.AddMember(
+            "speculation", speculationValue, allocator);
+        vu1AsyncValue.AddMember(
+            "owner", vu1OwnerValue, allocator);
+        result.AddMember(
+            "vu1_async", vu1AsyncValue, allocator);
+
         const auto vuBackendStatus =
             [&](VuBackendKind requested,
                 VuBackendKind resolved,
