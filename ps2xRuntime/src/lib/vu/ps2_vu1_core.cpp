@@ -167,6 +167,32 @@ namespace
         GS &m_gs;
         PS2Memory *m_memory;
     };
+
+    void bindLegacyVuContext(
+        VuExecutionContext &context,
+        VuUnitId unit,
+        const uint8_t *code,
+        PS2Memory *memory)
+    {
+        context.codeUnit = unit;
+        context.memoryIdentity =
+            reinterpret_cast<uintptr_t>(memory);
+        context.codeIdentity =
+            reinterpret_cast<uintptr_t>(code);
+        context.observer = memory;
+        if (!memory || !code)
+            return;
+
+        const bool tracked =
+            unit == VuUnitId::Vu0
+                ? code == memory->getVU0Code()
+                : code == memory->getVU1Code();
+        if (!tracked)
+            return;
+        context.codeGeneration =
+            memory->currentVuCodeGeneration(unit);
+        context.trackedCode = true;
+    }
 }
 
 std::string_view vuBackendKindName(VuBackendKind kind)
@@ -411,17 +437,17 @@ std::string_view VuInterpreterBackend::name() const
 void VuUnit::reset()
 {
     if (m_workloadProfileInvocationActive &&
-        m_workloadProfileMemory)
+        m_workloadProfileObserver)
     {
-        m_workloadProfileMemory->
-            endVu1WorkloadProfileInvocation(false);
+        m_workloadProfileObserver->
+            endVuWorkloadProfileInvocation(false);
     }
-    if (m_workloadProfileMemory)
+    if (m_workloadProfileObserver)
     {
-        m_workloadProfileMemory->
-            resetVu1WorkloadProfileEpoch();
+        m_workloadProfileObserver->
+            resetVuWorkloadProfileEpoch();
     }
-    m_workloadProfileMemory = nullptr;
+    m_workloadProfileObserver = nullptr;
     m_workloadProfileInvocationPending = false;
     m_workloadProfileInvocationActive = false;
     m_state = {};
@@ -633,7 +659,7 @@ VuInterpreterBackend::decodeInstructionPair(
 PS2X_VU_NOINLINE
 void VuInterpreterBackend::rebuildDecodedCodeCache(
     const uint8_t *vuCode, uint32_t codeSize,
-    const PS2Memory *memory, uint64_t generation)
+    uintptr_t memoryIdentity, uint64_t generation)
 {
     VuUnit::InterpreterCache &cache = m_unit.m_interpreterCache;
     const uint32_t pairCount = codeSize / 8u;
@@ -645,7 +671,7 @@ void VuInterpreterBackend::rebuildDecodedCodeCache(
     }
 
     cache.vuCode = vuCode;
-    cache.memory = memory;
+    cache.memoryIdentity = memoryIdentity;
     cache.codeSize = codeSize;
     cache.codeGeneration = generation;
     cache.valid = true;
@@ -655,13 +681,13 @@ void VuInterpreterBackend::rebuildDecodedCodeCache(
 
 void VuUnit::start(
     uint32_t startPC, uint32_t top, uint32_t itop,
-    PS2Memory *memory)
+    IVuExecutionObserver *observer)
 {
     if (m_workloadProfileInvocationActive &&
-        m_workloadProfileMemory)
+        m_workloadProfileObserver)
     {
-        m_workloadProfileMemory->
-            endVu1WorkloadProfileInvocation(false);
+        m_workloadProfileObserver->
+            endVuWorkloadProfileInvocation(false);
     }
     m_workloadProfileInvocationActive = false;
     m_workloadProfileInvocationPending = true;
@@ -687,18 +713,23 @@ void VuUnit::start(
     m_state.vf[0][3] = 1.0f;
     m_state.active = true;
     m_state.issuedCycles = 0u;
-    if (memory && memory->isVif1DmaTraceActive())
-        memory->traceVu1Invocation(m_state.pc, top, itop, false, m_state);
+    if (m_unitId == VuUnitId::Vu1 && observer &&
+        observer->vuTraceEnabled())
+    {
+        observer->traceVuInvocation(
+            m_state.pc, top, itop, false, m_state);
+    }
 }
 
 void VuUnit::resumeState(
-    uint32_t top, uint32_t itop, PS2Memory *memory)
+    uint32_t top, uint32_t itop,
+    IVuExecutionObserver *observer)
 {
     if (m_workloadProfileInvocationActive &&
-        m_workloadProfileMemory)
+        m_workloadProfileObserver)
     {
-        m_workloadProfileMemory->
-            endVu1WorkloadProfileInvocation(false);
+        m_workloadProfileObserver->
+            endVuWorkloadProfileInvocation(false);
     }
     m_workloadProfileInvocationActive = false;
     m_workloadProfileInvocationPending = true;
@@ -707,8 +738,12 @@ void VuUnit::resumeState(
     m_state.itop = itop;
     m_state.active = true;
     m_state.issuedCycles = 0u;
-    if (memory && memory->isVif1DmaTraceActive())
-        memory->traceVu1Invocation(m_state.pc, top, itop, true, m_state);
+    if (m_unitId == VuUnitId::Vu1 && observer &&
+        observer->vuTraceEnabled())
+    {
+        observer->traceVuInvocation(
+            m_state.pc, top, itop, true, m_state);
+    }
 }
 
 VuRunResult VuUnit::advance(
@@ -785,54 +820,6 @@ PS2X_VU_ALWAYS_INLINE VuRunResult VuUnit::run(
     GS &gs, PS2Memory *memory, uint32_t maxCycles,
     bool traceBudgetBoundary)
 {
-    VuRunResult result;
-    if (m_resolvedBackend == VuBackendKind::Recompiler)
-        [[unlikely]]
-    {
-        result = runRecompiler(
-            vuCode, codeSize, vuData, dataSize,
-            gs, memory, maxCycles,
-            traceBudgetBoundary);
-    }
-    else if (m_resolvedBackend == VuBackendKind::Verify)
-        [[unlikely]]
-    {
-        result = runVerify(
-            vuCode, codeSize, vuData, dataSize,
-            gs, memory, maxCycles);
-    }
-    else
-    {
-        RuntimeVuSideEffectSink sideEffects(gs, memory);
-        VuExecutionContext context{
-            .state = m_state,
-            .code = vuCode,
-            .codeSize = codeSize,
-            .data = vuData,
-            .dataSize = dataSize,
-            .sideEffects = sideEffects,
-            .memory = memory,
-            .traceBudgetBoundary = traceBudgetBoundary,
-            .enableInstrumentation =
-                PS2X_ENABLE_RUNTIME_DIAGNOSTICS != 0,
-        };
-
-        // Keep the interpreter call concrete so auto/debug mode retains its
-        // optimizer-visible hot loop.
-        result = m_interpreter->run(context, maxCycles);
-    }
-    m_lastExitReason = result.reason;
-    return result;
-}
-
-#undef PS2X_VU_ALWAYS_INLINE
-
-VuRunResult VuUnit::runRecompiler(
-    uint8_t *vuCode, uint32_t codeSize,
-    uint8_t *vuData, uint32_t dataSize,
-    GS &gs, PS2Memory *memory, uint32_t maxCycles,
-    bool traceBudgetBoundary)
-{
     RuntimeVuSideEffectSink sideEffects(gs, memory);
     VuExecutionContext context{
         .state = m_state,
@@ -841,7 +828,6 @@ VuRunResult VuUnit::runRecompiler(
         .data = vuData,
         .dataSize = dataSize,
         .sideEffects = sideEffects,
-        .memory = memory,
         .traceBudgetBoundary = traceBudgetBoundary,
         .enableInstrumentation =
             PS2X_ENABLE_RUNTIME_DIAGNOSTICS != 0,
@@ -850,8 +836,51 @@ VuRunResult VuUnit::runRecompiler(
         .enableProgressAccounting =
             PS2X_ENABLE_RUNTIME_DIAGNOSTICS != 0,
     };
-    return runRecompilerContext(
-        context, maxCycles, true);
+    bindLegacyVuContext(
+        context, m_unitId, vuCode, memory);
+    return advance(context, maxCycles);
+}
+
+#undef PS2X_VU_ALWAYS_INLINE
+
+VuRunResult VuUnit::advance(
+    VuExecutionContext &context,
+    uint32_t maxCycles)
+{
+    if (&context.state != &m_state ||
+        context.codeUnit != m_unitId)
+    {
+        const VuRunResult result{
+            .requestedCycles = maxCycles,
+            .reason = VuExitReason::Fault,
+            .activeBefore = context.state.active,
+            .activeAfter = context.state.active,
+            .completed = !context.state.active,
+        };
+        m_lastExitReason = result.reason;
+        return result;
+    }
+
+    VuRunResult result;
+    if (m_resolvedBackend == VuBackendKind::Recompiler)
+        [[unlikely]]
+    {
+        result = runRecompilerContext(
+            context, maxCycles, true);
+    }
+    else if (m_resolvedBackend == VuBackendKind::Verify)
+        [[unlikely]]
+    {
+        result = runVerify(context, maxCycles);
+    }
+    else
+    {
+        // Keep the interpreter call concrete so auto/debug mode retains its
+        // optimizer-visible hot loop.
+        result = m_interpreter->run(context, maxCycles);
+    }
+    m_lastExitReason = result.reason;
+    return result;
 }
 
 VuRunResult VuUnit::runRecompilerContext(
@@ -956,10 +985,13 @@ VuRunResult VuUnit::runRecompilerContext(
 }
 
 VuRunResult VuUnit::runVerify(
-    uint8_t *vuCode, uint32_t codeSize,
-    uint8_t *vuData, uint32_t dataSize,
-    GS &gs, PS2Memory *memory, uint32_t maxCycles)
+    VuExecutionContext &context,
+    uint32_t maxCycles)
 {
+    const uint8_t *const vuCode = context.code;
+    const uint32_t codeSize = context.codeSize;
+    uint8_t *const vuData = context.data;
+    const uint32_t dataSize = context.dataSize;
     ++m_verifyDiagnostics.runs;
     const bool activeBefore = m_state.active;
     const uint32_t invocationEntryPc = m_state.pc;
@@ -989,11 +1021,11 @@ VuRunResult VuUnit::runVerify(
             "VU verify input error: native backend is unavailable",
             0u);
     }
-    if (!vuCode || !memory ||
+    if (!vuCode || !context.trackedCode ||
         (dataSize != 0u && !vuData))
     {
         return fault(
-            "VU verify input error: tracked code, memory, and VU data are required",
+            "VU verify input error: tracked code identity and VU data are required",
             0u);
     }
     if (maxCycles == 0u)
@@ -1027,7 +1059,12 @@ VuRunResult VuUnit::runVerify(
         .data = referenceData.data(),
         .dataSize = dataSize,
         .sideEffects = referenceEffects,
-        .memory = memory,
+        .codeUnit = context.codeUnit,
+        .memoryIdentity = context.memoryIdentity,
+        .codeIdentity = context.codeIdentity,
+        .codeGeneration = context.codeGeneration,
+        .trackedCode = context.trackedCode,
+        .observer = context.observer,
         .enableInstrumentation = false,
         .enableProgressAccounting = false,
     };
@@ -1038,11 +1075,15 @@ VuRunResult VuUnit::runVerify(
         .data = nativeData.data(),
         .dataSize = dataSize,
         .sideEffects = nativeEffects,
-        .memory = memory,
+        .codeUnit = context.codeUnit,
+        .memoryIdentity = context.memoryIdentity,
+        .codeIdentity = context.codeIdentity,
+        .codeGeneration = context.codeGeneration,
+        .trackedCode = context.trackedCode,
+        .observer = context.observer,
         .enableInstrumentation = false,
         .enableProgressAccounting = false,
     };
-    RuntimeVuSideEffectSink runtimeEffects(gs, memory);
     uint32_t executedCycles = 0u;
     uint64_t pairIndex = 0u;
     ProgressTracker progress(
@@ -1122,7 +1163,12 @@ VuRunResult VuUnit::runVerify(
                 .nativeEffects = nativeEffects,
                 .code = vuCode,
                 .codeSize = codeSize,
-                .memory = memory,
+                .codeUnit = context.codeUnit,
+                .memoryIdentity = context.memoryIdentity,
+                .codeIdentity = context.codeIdentity,
+                .codeGeneration = context.codeGeneration,
+                .trackedCode = context.trackedCode,
+                .observer = context.observer,
                 .invocationEntryPc = invocationEntryPc,
                 .failingPc = failingPc,
                 .lowerWord = lowerWord,
@@ -1143,7 +1189,7 @@ VuRunResult VuUnit::runVerify(
                 vuData, referenceData.data(),
                 dataSize);
         }
-        referenceEffects.commitTo(runtimeEffects);
+        referenceEffects.commitTo(context.sideEffects);
         m_verifyDiagnostics.publishedPath1Packets +=
             referenceEffects.path1Packets().size();
         referenceEffects.clear();
@@ -1259,7 +1305,12 @@ std::string VuUnit::formatVerifyMismatch(
         .dataSize =
             static_cast<uint32_t>(keyData.size()),
         .sideEffects = keyEffects,
-        .memory = mismatch.memory,
+        .codeUnit = mismatch.codeUnit,
+        .memoryIdentity = mismatch.memoryIdentity,
+        .codeIdentity = mismatch.codeIdentity,
+        .codeGeneration = mismatch.codeGeneration,
+        .trackedCode = mismatch.trackedCode,
+        .observer = mismatch.observer,
         .enableInstrumentation = false,
         .enableProgressAccounting = false,
     };
@@ -1419,7 +1470,7 @@ VuRunResult VuInterpreterBackend::run(
     uint8_t *const vuData = context.data;
     const uint32_t dataSize = context.dataSize;
     IVuSideEffectSink &sideEffects = context.sideEffects;
-    PS2Memory *const memory = context.memory;
+    IVuExecutionObserver *const observer = context.observer;
     const bool traceBudgetBoundary = context.traceBudgetBoundary;
 #if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     const bool instrumentation = context.enableInstrumentation;
@@ -1432,15 +1483,20 @@ VuRunResult VuInterpreterBackend::run(
     // own floating-point environment.
     const ScopedVuFloatMode vuFloatMode;
     const bool traceVu1 =
-        instrumentation && memory && memory->isVif1DmaTraceActive();
+        instrumentation &&
+        m_unit.m_unitId == VuUnitId::Vu1 &&
+        observer && observer->vuTraceEnabled();
     const bool profileVu1 =
-        instrumentation && memory &&
-        vuCode == memory->getVU1Code() &&
-        memory->isVu1WorkloadProfileEnabled();
+        instrumentation &&
+        context.trackedCode &&
+        context.codeUnit == VuUnitId::Vu1 &&
+        observer && observer->vuWorkloadProfileEnabled();
     if (profileVu1 && m_unit.m_workloadProfileInvocationPending)
     {
-        memory->beginVu1WorkloadProfileInvocation(state.pc);
-        m_unit.m_workloadProfileMemory = memory;
+        observer->beginVuWorkloadProfileInvocation(
+            state.pc, vuCode, codeSize,
+            context.codeGeneration);
+        m_unit.m_workloadProfileObserver = observer;
         m_unit.m_workloadProfileInvocationPending = false;
         m_unit.m_workloadProfileInvocationActive = true;
     }
@@ -1512,51 +1568,42 @@ VuRunResult VuInterpreterBackend::run(
         const uint32_t issuedPc = state.pc;
         DecodedInstructionPair decoded;
         bool decodedFromCache = false;
-        if ((issuedPc & 7u) == 0u && memory)
+        if ((issuedPc & 7u) == 0u && context.trackedCode)
         {
-            uint64_t generation = 0u;
-            bool cacheable = false;
-            if (vuCode == memory->getVU0Code())
+            const uint64_t generation =
+                observer
+                    ? observer->currentVuCodeGeneration(
+                          context.codeUnit)
+                    : context.codeGeneration;
+            const bool rebuild =
+                !cache.valid ||
+                cache.vuCode != vuCode ||
+                cache.memoryIdentity !=
+                    context.memoryIdentity ||
+                cache.codeSize != codeSize ||
+                cache.codeGeneration != generation;
+            if (rebuild)
             {
-                generation = memory->getVU0CodeGeneration();
-                cacheable = true;
+                rebuildDecodedCodeCache(
+                    vuCode, codeSize,
+                    context.memoryIdentity, generation);
             }
-            else if (vuCode == memory->getVU1Code())
-            {
-                generation = memory->getVU1CodeGeneration();
-                cacheable = true;
-            }
-
-            if (cacheable)
-            {
-                const bool rebuild =
-                    !cache.valid ||
-                    cache.vuCode != vuCode ||
-                    cache.memory != memory ||
-                    cache.codeSize != codeSize ||
-                    cache.codeGeneration != generation;
-                if (rebuild)
-                {
-                    rebuildDecodedCodeCache(
-                        vuCode, codeSize, memory, generation);
-                }
-                decoded = cache.decodedCode[issuedPc / 8u];
-                decodedFromCache = true;
-            }
+            decoded = cache.decodedCode[issuedPc / 8u];
+            decodedFromCache = true;
         }
         if (!decodedFromCache)
             decoded = decodeInstructionPair(vuCode, issuedPc);
         if (traceVu1)
         {
-            memory->traceVu1Instruction(
+            observer->traceVuInstruction(
                 issuedPc, decoded.lower, decoded.upper, state);
         }
         if (instrumentation &&
             m_unit.m_workloadProfileInvocationActive &&
-            m_unit.m_workloadProfileMemory)
+            m_unit.m_workloadProfileObserver)
         {
-            m_unit.m_workloadProfileMemory->
-                recordVu1WorkloadProfileInstruction(
+            m_unit.m_workloadProfileObserver->
+                recordVuWorkloadProfileInstruction(
                     issuedPc, decoded.lower, decoded.upper);
         }
         if (instrumentation &&
@@ -1620,7 +1667,7 @@ VuRunResult VuInterpreterBackend::run(
             // so it observes the old VF value and the upper write has priority.
             execLower(
                 decoded.lower, vuData, dataSize,
-                sideEffects, memory, decoded.upper);
+                sideEffects, observer, decoded.upper);
             execUpper(decoded.upper);
         }
         else
@@ -1631,7 +1678,7 @@ VuRunResult VuInterpreterBackend::run(
             {
                 execLower(
                     decoded.lower, vuData, dataSize,
-                    sideEffects, memory, decoded.upper);
+                    sideEffects, observer, decoded.upper);
             }
         }
 
@@ -1648,7 +1695,8 @@ VuRunResult VuInterpreterBackend::run(
         if (state.pipeline.xgkick.active)
         {
             advanceXgkick(
-                vuData, dataSize, sideEffects, memory, 1u, false);
+                vuData, dataSize, sideEffects,
+                observer, 1u, false);
         }
 
         uint32_t nextPC = state.pc + 8;
@@ -1674,10 +1722,10 @@ VuRunResult VuInterpreterBackend::run(
         }
         if (instrumentation &&
             m_unit.m_workloadProfileInvocationActive &&
-            m_unit.m_workloadProfileMemory)
+            m_unit.m_workloadProfileObserver)
         {
-            m_unit.m_workloadProfileMemory->
-                recordVu1WorkloadProfileTransition(
+            m_unit.m_workloadProfileObserver->
+                recordVuWorkloadProfileTransition(
                     issuedPc, state.pc);
         }
 
@@ -1687,7 +1735,8 @@ VuRunResult VuInterpreterBackend::run(
             if (state.pipeline.xgkick.active)
             {
                 advanceXgkick(
-                    vuData, dataSize, sideEffects, memory, 0u, true);
+                    vuData, dataSize, sideEffects,
+                    observer, 0u, true);
             }
             flushQPipeline();
             flushPPipeline();
@@ -1706,17 +1755,17 @@ VuRunResult VuInterpreterBackend::run(
     if (traceVu1 &&
         (!state.active || traceBudgetBoundary))
     {
-        memory->traceVu1InvocationEnd(
+        observer->traceVuInvocationEnd(
             state.pc, ended, !ended && executedCycles == maxCycles,
             state.vi, std::size(state.vi));
     }
     if (instrumentation &&
         !state.active &&
         m_unit.m_workloadProfileInvocationActive &&
-        m_unit.m_workloadProfileMemory)
+        m_unit.m_workloadProfileObserver)
     {
-        m_unit.m_workloadProfileMemory->
-            endVu1WorkloadProfileInvocation(ended);
+        m_unit.m_workloadProfileObserver->
+            endVuWorkloadProfileInvocation(ended);
         m_unit.m_workloadProfileInvocationActive = false;
     }
     state.issuedCycles += executedCycles;
@@ -1959,21 +2008,22 @@ void VuInterpreterBackend::beginXgkick(uint32_t sourceQword,
                                                uint8_t *vuData,
                                                uint32_t dataSize,
                                                IVuSideEffectSink &sideEffects,
-                                               PS2Memory *memory)
+                                               IVuExecutionObserver *observer)
 {
     VuExecutionState &state = *m_state;
     if (!vuData || dataSize < 16u)
         return;
 
-    if (memory)
-        memory->traceVu1Xgkick(sourceQword);
+    if (observer && observer->vuTraceEnabled())
+        observer->traceVuXgkick(sourceQword);
 
     VuPipelineState::Xgkick &xgkick = state.pipeline.xgkick;
     // A second XGKICK stalls behind and drains the prior PATH1 transfer.
     if (xgkick.active)
     {
         advanceXgkick(
-            vuData, dataSize, sideEffects, memory, 0u, true);
+            vuData, dataSize, sideEffects,
+            observer, 0u, true);
     }
 
     xgkick = {};
@@ -1984,7 +2034,7 @@ void VuInterpreterBackend::beginXgkick(uint32_t sourceQword,
 void VuInterpreterBackend::advanceXgkick(uint8_t *vuData,
                                          uint32_t dataSize,
                                          IVuSideEffectSink &sideEffects,
-                                         PS2Memory *memory,
+                                         IVuExecutionObserver *,
                                          uint32_t cycles,
                                          bool flush)
 {

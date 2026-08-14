@@ -538,7 +538,13 @@ int main(int argc, char **argv)
             .data = referenceData.data(),
             .dataSize = vuSize,
             .sideEffects = referenceEffects,
-            .memory = &memory,
+            .codeUnit = VuUnitId::Vu1,
+            .memoryIdentity = reinterpret_cast<uintptr_t>(&memory),
+            .codeIdentity = reinterpret_cast<uintptr_t>(
+                memory.getVU1Code()),
+            .codeGeneration = memory.getVU1CodeGeneration(),
+            .trackedCode = true,
+            .observer = &memory,
             .enableInstrumentation = true,
         };
         VuExecutionContext candidateContext{
@@ -548,7 +554,13 @@ int main(int argc, char **argv)
             .data = candidateData.data(),
             .dataSize = vuSize,
             .sideEffects = candidateEffects,
-            .memory = &memory,
+            .codeUnit = VuUnitId::Vu1,
+            .memoryIdentity = reinterpret_cast<uintptr_t>(&memory),
+            .codeIdentity = reinterpret_cast<uintptr_t>(
+                memory.getVU1Code()),
+            .codeGeneration = memory.getVU1CodeGeneration(),
+            .trackedCode = true,
+            .observer = &memory,
             .enableInstrumentation = false,
         };
 

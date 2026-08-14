@@ -21,9 +21,69 @@ class PS2Memory;
 class VuProgramCache;
 class VuRecompilerBackend;
 enum class VuUnitId : uint8_t;
+struct VuExecutionState;
 struct VU1NativeEmitterSpikeAccess;
 struct VuVerifyTestAccess;
 struct VuXgkickTestAccess;
+
+// Diagnostics are intentionally separated from VU execution ownership. A
+// threaded owner can use a worker-local recorder, while the inline runtime can
+// adapt its existing trace/profile implementation without exposing PS2Memory
+// to the execution backend.
+class IVuExecutionObserver
+{
+public:
+    virtual ~IVuExecutionObserver() = default;
+
+    [[nodiscard]] virtual bool vuTraceEnabled() const
+    {
+        return false;
+    }
+    [[nodiscard]] virtual bool vuWorkloadProfileEnabled() const
+    {
+        return false;
+    }
+    [[nodiscard]] virtual uint64_t currentVuCodeGeneration(
+        VuUnitId) const
+    {
+        return 0u;
+    }
+    virtual void traceVuInvocation(
+        uint32_t, uint32_t, uint32_t, bool,
+        const VuExecutionState &)
+    {
+    }
+    virtual void traceVuInstruction(
+        uint32_t, uint32_t, uint32_t,
+        const VuExecutionState &)
+    {
+    }
+    virtual void traceVuXgkick(uint32_t)
+    {
+    }
+    virtual void traceVuInvocationEnd(
+        uint32_t, bool, bool, const int32_t *, size_t)
+    {
+    }
+    virtual void beginVuWorkloadProfileInvocation(
+        uint32_t, const uint8_t *, uint32_t, uint64_t)
+    {
+    }
+    virtual void recordVuWorkloadProfileInstruction(
+        uint32_t, uint32_t, uint32_t)
+    {
+    }
+    virtual void recordVuWorkloadProfileTransition(
+        uint32_t, uint32_t)
+    {
+    }
+    virtual void endVuWorkloadProfileInvocation(bool)
+    {
+    }
+    virtual void resetVuWorkloadProfileEpoch()
+    {
+    }
+};
 
 // XGKICK builds a PATH1 packet incrementally while VU memory remains live.
 // The backing storage may be prepared for a complete GIF tag, but size()
@@ -405,7 +465,15 @@ struct VuExecutionContext
     uint8_t *data = nullptr;
     uint32_t dataSize = 0;
     IVuSideEffectSink &sideEffects;
-    PS2Memory *memory = nullptr;
+    // Explicit cache identity replaces backend discovery through PS2Memory.
+    // memoryIdentity names the canonical VU-memory owner, while codeIdentity
+    // names this stable code allocation within that owner.
+    VuUnitId codeUnit = static_cast<VuUnitId>(0);
+    uintptr_t memoryIdentity = 0u;
+    uintptr_t codeIdentity = 0u;
+    uint64_t codeGeneration = 0u;
+    bool trackedCode = false;
+    IVuExecutionObserver *observer = nullptr;
     bool traceBudgetBoundary = false;
     bool enableInstrumentation = true;
     // Opt-in CI/test path. When an observer is armed, compile a distinct
@@ -441,9 +509,13 @@ public:
     // Starting/resuming and advancing are separate so a runtime scheduler can
     // make busy state visible before any VU work is performed.
     void start(uint32_t startPC = 0, uint32_t top = 0,
-               uint32_t itop = 0, PS2Memory *memory = nullptr);
+               uint32_t itop = 0,
+               IVuExecutionObserver *observer = nullptr);
     void resumeState(uint32_t top = 0, uint32_t itop = 0,
-                     PS2Memory *memory = nullptr);
+                     IVuExecutionObserver *observer = nullptr);
+    [[nodiscard]] VuRunResult advance(
+        VuExecutionContext &context,
+        uint32_t maxCycles = 65536);
     [[nodiscard]] VuRunResult advance(
         uint8_t *vuCode, uint32_t codeSize,
         uint8_t *vuData, uint32_t dataSize,
@@ -546,7 +618,7 @@ private:
     {
         std::vector<DecodedInstructionPair> decodedCode;
         const uint8_t *vuCode = nullptr;
-        const PS2Memory *memory = nullptr;
+        uintptr_t memoryIdentity = 0u;
         uint32_t codeSize = 0;
         uint64_t codeGeneration = 0;
         bool valid = false;
@@ -565,7 +637,12 @@ private:
         const VuTransactionalSideEffectSink &nativeEffects;
         const uint8_t *code = nullptr;
         uint32_t codeSize = 0u;
-        PS2Memory *memory = nullptr;
+        VuUnitId codeUnit = static_cast<VuUnitId>(0);
+        uintptr_t memoryIdentity = 0u;
+        uintptr_t codeIdentity = 0u;
+        uint64_t codeGeneration = 0u;
+        bool trackedCode = false;
+        IVuExecutionObserver *observer = nullptr;
         uint32_t invocationEntryPc = 0u;
         uint32_t failingPc = 0u;
         uint32_t lowerWord = 0u;
@@ -580,18 +657,12 @@ private:
         uint8_t *vuData, uint32_t dataSize,
         GS &gs, PS2Memory *memory, uint32_t maxCycles,
         bool traceBudgetBoundary);
-    [[nodiscard]] VuRunResult runRecompiler(
-        uint8_t *vuCode, uint32_t codeSize,
-        uint8_t *vuData, uint32_t dataSize,
-        GS &gs, PS2Memory *memory, uint32_t maxCycles,
-        bool traceBudgetBoundary);
     [[nodiscard]] VuRunResult runRecompilerContext(
         VuExecutionContext &context, uint32_t maxCycles,
         bool trackProgress);
     [[nodiscard]] VuRunResult runVerify(
-        uint8_t *vuCode, uint32_t codeSize,
-        uint8_t *vuData, uint32_t dataSize,
-        GS &gs, PS2Memory *memory, uint32_t maxCycles);
+        VuExecutionContext &context,
+        uint32_t maxCycles);
     [[nodiscard]] std::string formatVerifyMismatch(
         const VerifyMismatch &mismatch);
 
@@ -606,7 +677,7 @@ private:
     VuInstructionObserver m_instructionObserver;
     std::atomic<bool> m_instructionObserverEnabled{false};
     bool m_nativeInstrumentationEnabled = false;
-    PS2Memory *m_workloadProfileMemory = nullptr;
+    IVuExecutionObserver *m_workloadProfileObserver = nullptr;
     bool m_workloadProfileInvocationPending = false;
     bool m_workloadProfileInvocationActive = false;
     InterpreterCache m_interpreterCache;
@@ -642,17 +713,21 @@ private:
 
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
-                                 const PS2Memory *memory, uint64_t generation);
+                                 uintptr_t memoryIdentity,
+                                 uint64_t generation);
 
     void execUpper(uint32_t instr);
     void execLower(
         uint32_t instr, uint8_t *vuData, uint32_t dataSize,
-        IVuSideEffectSink &sideEffects, PS2Memory *memory,
+        IVuSideEffectSink &sideEffects,
+        IVuExecutionObserver *observer,
         uint32_t upperInstr);
     void beginXgkick(uint32_t sourceQword, uint8_t *vuData, uint32_t dataSize,
-                     IVuSideEffectSink &sideEffects, PS2Memory *memory);
+                     IVuSideEffectSink &sideEffects,
+                     IVuExecutionObserver *observer);
     void advanceXgkick(uint8_t *vuData, uint32_t dataSize,
-                       IVuSideEffectSink &sideEffects, PS2Memory *memory,
+                       IVuSideEffectSink &sideEffects,
+                       IVuExecutionObserver *observer,
                        uint32_t cycles, bool flush);
     void cancelXgkick();
     void advanceQPipeline();

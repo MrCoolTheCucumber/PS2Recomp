@@ -399,7 +399,16 @@ namespace
             .data = fixture.data,
             .dataSize = fixture.dataSize,
             .sideEffects = effects,
-            .memory = &fixture.memory,
+            .codeUnit = fixture.unit,
+            .memoryIdentity = reinterpret_cast<uintptr_t>(
+                &fixture.memory),
+            .codeIdentity = reinterpret_cast<uintptr_t>(
+                fixture.code),
+            .codeGeneration =
+                fixture.memory.currentVuCodeGeneration(
+                    fixture.unit),
+            .trackedCode = true,
+            .observer = &fixture.memory,
             .enableInstrumentation = instrumentation,
         };
     }

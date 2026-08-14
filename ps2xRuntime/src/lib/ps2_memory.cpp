@@ -2,6 +2,7 @@
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gs_command_stream.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu_program_cache.h"
 #include "ps2_log.h"
 #include <array>
 #include <atomic>
@@ -32,6 +33,80 @@
 #else
 #define PS2X_VU_OBSERVER_NOINLINE
 #endif
+
+bool PS2Memory::vuTraceEnabled() const
+{
+    return isVif1DmaTraceActive();
+}
+
+bool PS2Memory::vuWorkloadProfileEnabled() const
+{
+    return isVu1WorkloadProfileEnabled();
+}
+
+uint64_t PS2Memory::currentVuCodeGeneration(
+    VuUnitId unit) const
+{
+    return unit == VuUnitId::Vu0
+        ? getVU0CodeGeneration()
+        : getVU1CodeGeneration();
+}
+
+void PS2Memory::traceVuInvocation(
+    uint32_t startPc, uint32_t top, uint32_t itop,
+    bool resume, const VuExecutionState &state)
+{
+    traceVu1Invocation(startPc, top, itop, resume, state);
+}
+
+void PS2Memory::traceVuInstruction(
+    uint32_t pc, uint32_t lower, uint32_t upper,
+    const VuExecutionState &state)
+{
+    traceVu1Instruction(pc, lower, upper, state);
+}
+
+void PS2Memory::traceVuXgkick(uint32_t sourceQword)
+{
+    traceVu1Xgkick(sourceQword);
+}
+
+void PS2Memory::traceVuInvocationEnd(
+    uint32_t finalPc, bool ended, bool hitCycleLimit,
+    const int32_t *viRegisters, size_t viRegisterCount)
+{
+    traceVu1InvocationEnd(
+        finalPc, ended, hitCycleLimit,
+        viRegisters, viRegisterCount);
+}
+
+void PS2Memory::beginVuWorkloadProfileInvocation(
+    uint32_t startPc, const uint8_t *, uint32_t, uint64_t)
+{
+    beginVu1WorkloadProfileInvocation(startPc);
+}
+
+void PS2Memory::recordVuWorkloadProfileInstruction(
+    uint32_t pc, uint32_t lower, uint32_t upper)
+{
+    recordVu1WorkloadProfileInstruction(pc, lower, upper);
+}
+
+void PS2Memory::recordVuWorkloadProfileTransition(
+    uint32_t pc, uint32_t nextPc)
+{
+    recordVu1WorkloadProfileTransition(pc, nextPc);
+}
+
+void PS2Memory::endVuWorkloadProfileInvocation(bool completed)
+{
+    endVu1WorkloadProfileInvocation(completed);
+}
+
+void PS2Memory::resetVuWorkloadProfileEpoch()
+{
+    resetVu1WorkloadProfileEpoch();
+}
 
 // TLB-cache diagnostics are opt-in and disabled in production. Keep their
 // accounting out of the cache-hit body so the common resolver remains a

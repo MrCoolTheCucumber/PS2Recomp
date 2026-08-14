@@ -20,6 +20,7 @@
 #include "ps2_build_config.h"
 #include "ee_counters.h"
 #include "ps2_gif_arbiter.h"
+#include "ps2_vu1.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(USE_SSE2NEON)
@@ -1018,7 +1019,7 @@ struct Vu1WorkloadProfileSnapshot
     uint64_t identicalCodeUploadBytes = 0u;
 };
 
-class PS2Memory
+class PS2Memory : public IVuExecutionObserver
 {
 public:
     struct EeTranslatedAddress
@@ -1074,6 +1075,30 @@ public:
     debugVif1DmaTraceSnapshot() const;
     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool vuTraceEnabled() const override;
+    [[nodiscard]] bool vuWorkloadProfileEnabled() const override;
+    [[nodiscard]] uint64_t currentVuCodeGeneration(
+        VuUnitId unit) const override;
+    void traceVuInvocation(
+        uint32_t startPc, uint32_t top, uint32_t itop,
+        bool resume, const VuExecutionState &state) override;
+    void traceVuInstruction(
+        uint32_t pc, uint32_t lower, uint32_t upper,
+        const VuExecutionState &state) override;
+    void traceVuXgkick(uint32_t sourceQword) override;
+    void traceVuInvocationEnd(
+        uint32_t finalPc, bool ended, bool hitCycleLimit,
+        const int32_t *viRegisters,
+        size_t viRegisterCount) override;
+    void beginVuWorkloadProfileInvocation(
+        uint32_t startPc, const uint8_t *code,
+        uint32_t codeSize, uint64_t generation) override;
+    void recordVuWorkloadProfileInstruction(
+        uint32_t pc, uint32_t lower, uint32_t upper) override;
+    void recordVuWorkloadProfileTransition(
+        uint32_t pc, uint32_t nextPc) override;
+    void endVuWorkloadProfileInvocation(bool completed) override;
+    void resetVuWorkloadProfileEpoch() override;
     bool configureVu1WorkloadProfile(
         const char *outputPath,
         uint64_t warmupPairs = 0u,

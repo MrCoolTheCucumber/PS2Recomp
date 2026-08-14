@@ -960,7 +960,12 @@ namespace
                 .data = reference.data.data(),
                 .dataSize = PS2_VU1_DATA_SIZE,
                 .sideEffects = reference.effects,
-                .memory = &memory,
+                .codeUnit = VuUnitId::Vu1,
+                .memoryIdentity = reinterpret_cast<uintptr_t>(&memory),
+                .codeIdentity = reinterpret_cast<uintptr_t>(code),
+                .codeGeneration = memory.getVU1CodeGeneration(),
+                .trackedCode = true,
+                .observer = &memory,
                 .enableInstrumentation = false,
             };
             VuExecutionContext recompiledContext{
@@ -970,7 +975,12 @@ namespace
                 .data = recompiled.data.data(),
                 .dataSize = PS2_VU1_DATA_SIZE,
                 .sideEffects = recompiled.effects,
-                .memory = &memory,
+                .codeUnit = VuUnitId::Vu1,
+                .memoryIdentity = reinterpret_cast<uintptr_t>(&memory),
+                .codeIdentity = reinterpret_cast<uintptr_t>(code),
+                .codeGeneration = memory.getVU1CodeGeneration(),
+                .trackedCode = true,
+                .observer = &memory,
                 .enableInstrumentation = false,
             };
             const uint32_t maximumPairs =
@@ -1184,7 +1194,12 @@ namespace
             .data = data.data(),
             .dataSize = dataSize,
             .sideEffects = effects,
-            .memory = &memory,
+            .codeUnit = VuUnitId::Vu1,
+            .memoryIdentity = reinterpret_cast<uintptr_t>(&memory),
+            .codeIdentity = reinterpret_cast<uintptr_t>(code),
+            .codeGeneration = memory.getVU1CodeGeneration(),
+            .trackedCode = true,
+            .observer = &memory,
             .enableInstrumentation = false,
             .enableProgressAccounting = false,
         };
@@ -1826,7 +1841,12 @@ namespace
                 .data = invocation.data.data(),
                 .dataSize = PS2_VU1_DATA_SIZE,
                 .sideEffects = *sideEffects,
-                .memory = &memory,
+                .codeUnit = VuUnitId::Vu1,
+                .memoryIdentity = reinterpret_cast<uintptr_t>(&memory),
+                .codeIdentity = reinterpret_cast<uintptr_t>(code),
+                .codeGeneration = memory.getVU1CodeGeneration(),
+                .trackedCode = true,
+                .observer = &memory,
                 .enableInstrumentation = false,
             };
             const RunSummary run =
@@ -2927,7 +2947,12 @@ int main(int argc, char **argv)
         .data = reference.data.data(),
         .dataSize = PS2_VU1_DATA_SIZE,
         .sideEffects = reference.effects,
-        .memory = &memory,
+        .codeUnit = VuUnitId::Vu1,
+        .memoryIdentity = reinterpret_cast<uintptr_t>(&memory),
+        .codeIdentity = reinterpret_cast<uintptr_t>(memory.getVU1Code()),
+        .codeGeneration = memory.getVU1CodeGeneration(),
+        .trackedCode = true,
+        .observer = &memory,
         .enableInstrumentation = false,
     };
     const RunSummary referenceRun = runBackend(
@@ -2951,7 +2976,12 @@ int main(int argc, char **argv)
         .data = cold.data.data(),
         .dataSize = PS2_VU1_DATA_SIZE,
         .sideEffects = cold.effects,
-        .memory = &memory,
+        .codeUnit = VuUnitId::Vu1,
+        .memoryIdentity = reinterpret_cast<uintptr_t>(&memory),
+        .codeIdentity = reinterpret_cast<uintptr_t>(memory.getVU1Code()),
+        .codeGeneration = memory.getVU1CodeGeneration(),
+        .trackedCode = true,
+        .observer = &memory,
         .enableInstrumentation = false,
     };
     g_allocationCount.store(
@@ -3094,7 +3124,12 @@ int main(int argc, char **argv)
             .data = warmup.data.data(),
             .dataSize = PS2_VU1_DATA_SIZE,
             .sideEffects = *sideEffects,
-            .memory = &memory,
+            .codeUnit = VuUnitId::Vu1,
+            .memoryIdentity = reinterpret_cast<uintptr_t>(&memory),
+            .codeIdentity = reinterpret_cast<uintptr_t>(memory.getVU1Code()),
+            .codeGeneration = memory.getVU1CodeGeneration(),
+            .trackedCode = true,
+            .observer = &memory,
             .enableInstrumentation = false,
         };
         const RunSummary run = runBackend(

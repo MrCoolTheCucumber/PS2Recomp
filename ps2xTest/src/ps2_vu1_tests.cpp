@@ -76,7 +76,13 @@ struct VuVerifyTestAccess
             .nativeEffects = nativeEffects,
             .code = code,
             .codeSize = codeSize,
-            .memory = &memory,
+            .codeUnit = VuUnitId::Vu1,
+            .memoryIdentity = reinterpret_cast<uintptr_t>(
+                &memory),
+            .codeIdentity = reinterpret_cast<uintptr_t>(code),
+            .codeGeneration = memory.getVU1CodeGeneration(),
+            .trackedCode = true,
+            .observer = &memory,
             .invocationEntryPc = 0u,
             .failingPc = 0u,
             .lowerWord = lowerWord,
@@ -954,7 +960,13 @@ void register_ps2_vu1_tests()
                 .data = fx.data,
                 .dataSize = PS2_VU1_DATA_SIZE,
                 .sideEffects = sideEffects,
-                .memory = &fx.mem,
+                .codeUnit = VuUnitId::Vu1,
+                .memoryIdentity = reinterpret_cast<uintptr_t>(
+                    &fx.mem),
+                .codeIdentity = reinterpret_cast<uintptr_t>(fx.code),
+                .codeGeneration = fx.mem.getVU1CodeGeneration(),
+                .trackedCode = true,
+                .observer = &fx.mem,
                 .enableInstrumentation = false,
             };
             VuInterpreterBackend backend(unit);

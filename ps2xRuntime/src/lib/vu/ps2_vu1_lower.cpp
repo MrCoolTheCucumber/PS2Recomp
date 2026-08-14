@@ -1,5 +1,4 @@
 #include "runtime/ps2_vu1.h"
-#include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
@@ -12,7 +11,8 @@
 // ============================================================================
 void VuInterpreterBackend::execLower(
     uint32_t instr, uint8_t *vuData, uint32_t dataSize,
-    IVuSideEffectSink &sideEffects, PS2Memory *memory,
+    IVuSideEffectSink &sideEffects,
+    IVuExecutionObserver *observer,
     uint32_t upperInstr)
 {
     VuExecutionState &state = *m_state;
@@ -646,7 +646,7 @@ void VuInterpreterBackend::execLower(
             }
             case 0x6C: // XGKICK - send GIF packet from VU1 data memory
                 beginXgkick(static_cast<uint32_t>(static_cast<uint16_t>(state.vi[viS])),
-                            vuData, dataSize, sideEffects, memory);
+                            vuData, dataSize, sideEffects, observer);
                 return;
             case 0x70: // ESADD
                 return;

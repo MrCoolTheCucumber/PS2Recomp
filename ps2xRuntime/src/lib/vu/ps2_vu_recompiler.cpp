@@ -5476,36 +5476,25 @@ bool VuRecompilerBackend::programKey(
                 : "the x86-64 VU recompiler was not built",
             diagnostic);
     }
-    if (!context.memory || !context.code)
+    if (!context.trackedCode || !context.code ||
+        context.memoryIdentity == 0u ||
+        context.codeIdentity == 0u)
     {
         return fail(
             "native VU execution requires tracked code memory",
             diagnostic);
     }
 
-    VuUnitId codeUnit;
-    uint32_t expectedCodeSize = 0u;
-    uint64_t generation = 0u;
-    if (context.code == context.memory->getVU0Code())
-    {
-        codeUnit = VuUnitId::Vu0;
-        expectedCodeSize = PS2_VU0_CODE_SIZE;
-        generation =
-            context.memory->getVU0CodeGeneration();
-    }
-    else if (context.code == context.memory->getVU1Code())
-    {
-        codeUnit = VuUnitId::Vu1;
-        expectedCodeSize = PS2_VU1_CODE_SIZE;
-        generation =
-            context.memory->getVU1CodeGeneration();
-    }
-    else
-    {
-        return fail(
-            "native VU code is not owned by the supplied memory",
-            diagnostic);
-    }
+    const VuUnitId codeUnit = context.codeUnit;
+    const uint32_t expectedCodeSize =
+        codeUnit == VuUnitId::Vu0
+            ? PS2_VU0_CODE_SIZE
+            : PS2_VU1_CODE_SIZE;
+    const uint64_t generation =
+        context.observer
+            ? context.observer->currentVuCodeGeneration(
+                  codeUnit)
+            : context.codeGeneration;
     if (codeUnit != m_unit.unitId())
     {
         return fail(
@@ -5529,10 +5518,8 @@ bool VuRecompilerBackend::programKey(
 
     key = {
         .unit = codeUnit,
-        .memoryIdentity =
-            reinterpret_cast<uintptr_t>(context.memory),
-        .codeIdentity =
-            reinterpret_cast<uintptr_t>(context.code),
+        .memoryIdentity = context.memoryIdentity,
+        .codeIdentity = context.codeIdentity,
         .codeSize = context.codeSize,
         .addressMask = context.codeSize - 1u,
         .entryPc = context.state.pc,
@@ -5563,10 +5550,8 @@ uint64_t VuRecompilerBackend::codeContentIdentity(
     const VuExecutionContext &context,
     uint64_t generation)
 {
-    const uintptr_t memoryIdentity =
-        reinterpret_cast<uintptr_t>(context.memory);
-    const uintptr_t codeIdentity =
-        reinterpret_cast<uintptr_t>(context.code);
+    const uintptr_t memoryIdentity = context.memoryIdentity;
+    const uintptr_t codeIdentity = context.codeIdentity;
     const bool sameScope =
         m_currentCodeMemoryIdentity == memoryIdentity &&
         m_currentCodeIdentity == codeIdentity &&
@@ -6024,11 +6009,10 @@ VuRunResult VuRecompilerBackend::run(
             progress.publish();
 
             const uint64_t currentGeneration =
-                key.unit == VuUnitId::Vu0
-                    ? context.memory->
-                          getVU0CodeGeneration()
-                    : context.memory->
-                          getVU1CodeGeneration();
+                context.observer
+                    ? context.observer->
+                          currentVuCodeGeneration(key.unit)
+                    : context.codeGeneration;
             if (currentGeneration !=
                 key.codeGeneration)
             {
@@ -6288,7 +6272,7 @@ uint32_t VuRecompilerBackend::executePair(
             m_semantics.execLower(
                 pair.lowerWord, context.data,
                 context.dataSize, context.sideEffects,
-                context.memory, pair.upperWord);
+                context.observer, pair.upperWord);
             m_semantics.execUpper(pair.upperWord);
             break;
         case VuIrPairOrder::UpperThenLower:
@@ -6298,7 +6282,7 @@ uint32_t VuRecompilerBackend::executePair(
                 m_semantics.execLower(
                     pair.lowerWord, context.data,
                     context.dataSize, context.sideEffects,
-                    context.memory, pair.upperWord);
+                    context.observer, pair.upperWord);
             }
             break;
         }
@@ -6313,7 +6297,7 @@ uint32_t VuRecompilerBackend::executePair(
         {
             m_semantics.advanceXgkick(
                 context.data, context.dataSize,
-                context.sideEffects, context.memory,
+                context.sideEffects, context.observer,
                 1u, false);
         }
 
@@ -6345,7 +6329,7 @@ uint32_t VuRecompilerBackend::executePair(
             {
                 m_semantics.advanceXgkick(
                     context.data, context.dataSize,
-                    context.sideEffects, context.memory,
+                    context.sideEffects, context.observer,
                     0u, true);
             }
             m_semantics.flushQPipeline();
@@ -6471,9 +6455,10 @@ uint32_t VuRecompilerBackend::advanceXgkick(
     }
 
     const uint64_t generationBefore =
-        m_unit.unitId() == VuUnitId::Vu0
-            ? context.memory->getVU0CodeGeneration()
-            : context.memory->getVU1CodeGeneration();
+        context.observer
+            ? context.observer->currentVuCodeGeneration(
+                  context.codeUnit)
+            : context.codeGeneration;
     VuExecutionState *const previousState =
         m_semantics.m_state;
     m_semantics.m_state = &state;
@@ -6494,7 +6479,7 @@ uint32_t VuRecompilerBackend::advanceXgkick(
     {
         m_semantics.advanceXgkick(
             context.data, context.dataSize,
-            context.sideEffects, context.memory,
+            context.sideEffects, context.observer,
             1u, false);
     }
     catch (...)
@@ -6504,9 +6489,10 @@ uint32_t VuRecompilerBackend::advanceXgkick(
     }
 
     const uint64_t generationAfter =
-        m_unit.unitId() == VuUnitId::Vu0
-            ? context.memory->getVU0CodeGeneration()
-            : context.memory->getVU1CodeGeneration();
+        context.observer
+            ? context.observer->currentVuCodeGeneration(
+                  context.codeUnit)
+            : context.codeGeneration;
     return static_cast<uint32_t>(
         generationAfter == generationBefore
             ? VuNativeBlockExit::BlockComplete
@@ -6517,7 +6503,7 @@ uint32_t VuRecompilerBackend::advanceXgkickThunk(
     VuRecompilerBackend *backend,
     VuExecutionContext *context) noexcept
 {
-    if (!backend || !context || !context->memory)
+    if (!backend || !context || !context->trackedCode)
     {
         return static_cast<uint32_t>(
             VuNativeBlockExit::Fault);
@@ -6934,10 +6920,10 @@ bool VuRecompilerBackend::needsInterpreterInstrumentation(
     {
         return true;
     }
-    if (!context.memory)
+    if (!context.observer)
         return false;
-    return context.memory->isVif1DmaTraceActive() ||
-           context.memory->isVu1WorkloadProfileEnabled() ||
+    return context.observer->vuTraceEnabled() ||
+           context.observer->vuWorkloadProfileEnabled() ||
            m_unit.m_workloadProfileInvocationActive;
 #else
     (void)context;

@@ -114,7 +114,7 @@ VuRunResult VuIrInterpreterBackend::run(
         case VuIrPairOrder::LowerThenUpper:
             m_semantics.execLower(
                 pair.lowerWord, context.data, context.dataSize,
-                context.sideEffects, context.memory,
+                context.sideEffects, context.observer,
                 pair.upperWord);
             m_semantics.execUpper(pair.upperWord);
             break;
@@ -125,7 +125,7 @@ VuRunResult VuIrInterpreterBackend::run(
                 m_semantics.execLower(
                     pair.lowerWord, context.data,
                     context.dataSize, context.sideEffects,
-                    context.memory, pair.upperWord);
+                    context.observer, pair.upperWord);
             }
             break;
         }
@@ -140,7 +140,7 @@ VuRunResult VuIrInterpreterBackend::run(
         {
             m_semantics.advanceXgkick(
                 context.data, context.dataSize,
-                context.sideEffects, context.memory, 1u, false);
+                context.sideEffects, context.observer, 1u, false);
         }
 
         uint32_t nextPc = state.pc + 8u;
@@ -169,7 +169,7 @@ VuRunResult VuIrInterpreterBackend::run(
             {
                 m_semantics.advanceXgkick(
                     context.data, context.dataSize,
-                    context.sideEffects, context.memory,
+                    context.sideEffects, context.observer,
                     0u, true);
             }
             m_semantics.flushQPipeline();
