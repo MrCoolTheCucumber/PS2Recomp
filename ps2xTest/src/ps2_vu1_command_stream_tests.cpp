@@ -2450,7 +2450,7 @@ void register_ps2_vu1_command_stream_tests()
                      "the post-event snapshot should commit the published result");
         });
 
-        tc.Run("runtime coalesces one VIF1 parser batch into one speculation hazard", [](TestCase &t)
+        tc.Run("runtime defers VU1 requeue across scheduled VIF1 services", [](TestCase &t)
         {
             struct RunResult
             {
@@ -2537,6 +2537,15 @@ void register_ps2_vu1_command_stream_tests()
                     const Vu1AsyncRuntimeStatistics afterPayload =
                         runtime.vu1AsyncStatistics();
 
+                    // The payload schedules a finalization-only VIF1 service
+                    // two EE cycles later. Keep the invalidated slice as a
+                    // plan until that known earlier callback has completed.
+                    context.advanceEeCycleTicks(16u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    const Vu1AsyncRuntimeStatistics afterEmptyService =
+                        runtime.vu1AsyncStatistics();
+
                     if (mode == Vu1ExecutionMode::ThreadedAsync &&
                         !waitUntil(
                             [&runtime]()
@@ -2551,14 +2560,6 @@ void register_ps2_vu1_command_stream_tests()
                         t.Fail("the once-requeued slice should finish early");
                         return {};
                     }
-
-                    // The payload schedules a finalization-only VIF1 service
-                    // two EE cycles later. It must not disturb speculation.
-                    context.advanceEeCycleTicks(16u);
-                    runtime.serviceEeEventsAtBlockBoundary(
-                        runtime.memory().getRDRAM(), &context);
-                    const Vu1AsyncRuntimeStatistics afterEmptyService =
-                        runtime.vu1AsyncStatistics();
 
                     context.advanceEeCycleTicks(80u);
                     runtime.serviceEeEventsAtBlockBoundary(
@@ -2593,11 +2594,23 @@ void register_ps2_vu1_command_stream_tests()
                 asynchronous.afterPayload.hazardBarrierCount, 1ull,
                 "one parser batch should resolve speculation once");
             t.Equals(
-                asynchronous.afterPayload.hazardRequeueCount, 1ull,
-                "one parser batch should requeue speculation once");
+                asynchronous.afterPayload.hazardRequeueCount, 0ull,
+                "a known earlier VIF1 callback should defer the requeue");
             t.Equals(
-                asynchronous.afterPayload.slicesSubmitted, 2ull,
-                "four owner commands should produce only one recomputed slice");
+                asynchronous.afterPayload.slicesSubmitted, 1ull,
+                "the first callback should not submit work that the next callback can invalidate");
+            t.IsFalse(
+                asynchronous.afterPayload.pendingSlice,
+                "the deferred plan is not owner-side speculative work");
+            t.IsTrue(
+                asynchronous.afterPayload.deferredSlice,
+                "the invalidated slice should remain as an EE-side plan");
+            t.Equals(
+                asynchronous.afterPayload.deferredSliceCount, 1ull,
+                "the VIF1 chain should defer one invalidated slice");
+            t.Equals(
+                asynchronous.afterPayload.deferredSliceArmCount, 0ull,
+                "the plan must remain unarmed before VIF1 finalization");
             t.Equals(
                 asynchronous.afterPayload.owner.speculation.rolledBackSlices,
                 1ull,
@@ -2607,15 +2620,282 @@ void register_ps2_vu1_command_stream_tests()
                 asynchronous.afterPayload.hazardBarrierCount,
                 "a VIF1 service without owner commands must not add a hazard");
             t.Equals(
-                asynchronous.afterEmptyService.slicesSubmitted,
-                asynchronous.afterPayload.slicesSubmitted,
-                "a finalization-only VIF1 service must keep the pending slice");
+                asynchronous.afterEmptyService.hazardRequeueCount, 1ull,
+                "the plan should arm once after the last earlier VIF1 callback");
+            t.Equals(
+                asynchronous.afterEmptyService.slicesSubmitted, 2ull,
+                "the plan should submit once after the VIF1 chain completes");
+            t.IsTrue(
+                asynchronous.afterEmptyService.pendingSlice,
+                "the post-VIF1 slice should be pending before publication");
+            t.IsFalse(
+                asynchronous.afterEmptyService.deferredSlice,
+                "arming should consume the EE-side plan");
+            t.Equals(
+                asynchronous.afterEmptyService.deferredSliceArmCount, 1ull,
+                "the VIF1 chain should arm its retained plan once");
+            t.Equals(
+                asynchronous.afterEmptyService.forcedDeferredSliceArmCount,
+                0ull,
+                "a plan armed before its deadline is not a forced publication arm");
             t.Equals(
                 asynchronous.afterPublication.slicesPublished, 1ull,
                 "the recomputed startup slice should publish exactly once");
             t.Equals(
                 asynchronous.afterPublication.budgetFallbackCount, 0ull,
                 "the on-time batch should not require budget fallback");
+        });
+
+        tc.Run("runtime force-arms deferred VU1 work after equal-deadline VIF1", [](TestCase &t)
+        {
+            struct RunResult
+            {
+                uint64_t architecturalHash = 0u;
+                Vu1AsyncRuntimeStatistics afterHazard{};
+                Vu1AsyncRuntimeStatistics afterPublication{};
+            };
+
+            const auto run =
+                [&](Vu1ExecutionMode mode) -> RunResult
+                {
+                    PS2RuntimeConfiguration configuration =
+                        defaultPs2RuntimeConfiguration();
+                    configuration.vu1ExecutionMode = mode;
+                    configuration.vu1CommandQueueCapacity = 1u;
+                    configuration.vu1CommandPayloadCapacityBytes =
+                        1024u * 1024u;
+                    configuration.captureVu1ArchitecturalStateHashes =
+                        true;
+                    PS2Runtime runtime(configuration);
+                    if (!runtime.memory().initialize() ||
+                        !runtime.syncCoreSubsystems())
+                    {
+                        t.Fail("equal-deadline runtime should initialize");
+                        return {};
+                    }
+
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 0u,
+                        makeVuIaddiu(1u, 0u, 7),
+                        kVuUpperEnd);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 8u, 0u, kVuUpperNop);
+                    const uint32_t mscal =
+                        makeVifCommand(0x14u, 0u, 0u);
+                    runtime.memory().processVIF1Data(
+                        reinterpret_cast<const uint8_t *>(&mscal),
+                        sizeof(mscal));
+
+                    if (mode == Vu1ExecutionMode::ThreadedAsync &&
+                        !waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return statistics.pendingSlice &&
+                                       statistics.owner.completedTickets ==
+                                           statistics.owner.submittedTickets;
+                            }))
+                    {
+                        t.Fail("the equal-deadline startup slice should finish early");
+                        return {};
+                    }
+
+                    R5900Context &context = runtime.cpu();
+                    context.advanceEeCycleTicks(96u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+
+                    constexpr uint32_t kVif1 = 0x10009000u;
+                    constexpr uint32_t kSource = 0x00032000u;
+                    const std::array<uint32_t, 4u> vifCommands = {
+                        makeVifCommand(0x00u, 0u, 0u),
+                        makeVifCommand(0x00u, 0u, 0u),
+                        makeVifCommand(0x00u, 0u, 0u),
+                        makeVifCommand(0x00u, 0u, 0u),
+                    };
+                    std::memcpy(
+                        runtime.memory().getRDRAM() + kSource,
+                        vifCommands.data(), sizeof(vifCommands));
+                    if (!runtime.memory().writeIORegister(
+                            kVif1 + 0x10u, kSource) ||
+                        !runtime.memory().writeIORegister(
+                            kVif1 + 0x20u, 1u) ||
+                        !runtime.memory().writeIORegister(
+                            kVif1, 0x100u))
+                    {
+                        t.Fail("the equal-deadline VIF1 DMA should start");
+                        return {};
+                    }
+
+                    const std::shared_ptr<const Vu1Snapshot> before =
+                        runtime.snapshotVu1Owner();
+                    if (!before)
+                    {
+                        t.Fail("the equal-deadline hazard should return a snapshot");
+                        return {};
+                    }
+                    const Vu1AsyncRuntimeStatistics afterHazard =
+                        runtime.vu1AsyncStatistics();
+
+                    context.advanceEeCycleTicks(32u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    const std::shared_ptr<const Vu1Snapshot> after =
+                        runtime.snapshotVu1Owner();
+                    return RunResult{
+                        .architecturalHash =
+                            vu1ArchitecturalStateHash(
+                                after->state,
+                                after->microMemory,
+                                after->dataMemory,
+                                after->vif,
+                                after->codeGeneration),
+                        .afterHazard = afterHazard,
+                        .afterPublication =
+                            runtime.vu1AsyncStatistics(),
+                    };
+                };
+
+            const RunResult reference =
+                run(Vu1ExecutionMode::Inline);
+            const RunResult asynchronous =
+                run(Vu1ExecutionMode::ThreadedAsync);
+            t.Equals(
+                asynchronous.architecturalHash,
+                reference.architecturalHash,
+                "equal-deadline VIF1 priority should retain inline architecture");
+            t.IsTrue(
+                asynchronous.afterHazard.deferredSlice,
+                "an equal-deadline higher-priority VIF1 event should defer the slice");
+            t.IsFalse(
+                asynchronous.afterHazard.pendingSlice,
+                "deferral should leave no private owner checkpoint");
+            t.Equals(
+                asynchronous.afterPublication.slicesSubmitted, 2ull,
+                "the publication boundary should arm the retained plan once");
+            t.Equals(
+                asynchronous.afterPublication.slicesPublished, 1ull,
+                "the force-armed slice should publish once");
+            t.Equals(
+                asynchronous.afterPublication.hazardBarrierCount, 1ull,
+                "the observation should invalidate one private slice");
+            t.Equals(
+                asynchronous.afterPublication.hazardRequeueCount, 1ull,
+                "the retained plan should create one replacement slice");
+            t.Equals(
+                asynchronous.afterPublication.deferredSliceArmCount, 1ull,
+                "the retained plan should be consumed once");
+            t.Equals(
+                asynchronous.afterPublication.forcedDeferredSliceArmCount,
+                1ull,
+                "equal-deadline VIF1 should force arming immediately before VU1");
+            t.IsFalse(
+                asynchronous.afterPublication.deferredSlice,
+                "publication should leave no retained plan");
+        });
+
+        tc.Run("runtime reset discards a deferred VU1 slice plan", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedAsync;
+            configuration.vu1CommandQueueCapacity = 1u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "deferred-reset runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "deferred-reset runtime subsystems should bind");
+
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(1u, 0u, 7),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1AsyncStatistics();
+                        return statistics.pendingSlice &&
+                               statistics.owner.completedTickets ==
+                                   statistics.owner.submittedTickets;
+                    }),
+                "the deferred-reset startup slice should finish early");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(96u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kSource = 0x00033000u;
+            const std::array<uint32_t, 4u> vifCommands = {};
+            std::memcpy(
+                runtime.memory().getRDRAM() + kSource,
+                vifCommands.data(), sizeof(vifCommands));
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kVif1 + 0x10u, kSource) &&
+                    runtime.memory().writeIORegister(
+                        kVif1 + 0x20u, 1u) &&
+                    runtime.memory().writeIORegister(
+                        kVif1, 0x100u),
+                "the deferred-reset VIF1 DMA should start");
+
+            const std::shared_ptr<const Vu1Snapshot> before =
+                runtime.snapshotVu1Owner();
+            t.IsTrue(before != nullptr,
+                     "the deferred-reset hazard should return a snapshot");
+            const Vu1AsyncRuntimeStatistics deferred =
+                runtime.vu1AsyncStatistics();
+            t.IsTrue(deferred.deferredSlice,
+                     "the fixture should retain a deferred plan");
+            t.IsFalse(deferred.pendingSlice,
+                      "the fixture should have no private owner work");
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    0x10003c10u, 1u),
+                "VIF1 FBRST should accept the deferred reset");
+            const Vu1AsyncRuntimeStatistics reset =
+                runtime.vu1AsyncStatistics();
+            const PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            t.IsFalse(reset.pendingSlice,
+                      "reset should retain no speculative owner work");
+            t.IsFalse(reset.deferredSlice,
+                      "reset should discard the retained EE-side plan");
+            t.Equals(reset.deferredSliceCount, 1ull,
+                     "the fixture should defer exactly one plan");
+            t.Equals(reset.deferredSliceArmCount, 0ull,
+                     "reset must not arm discarded work");
+            t.Equals(reset.slicesPublished, 0ull,
+                     "reset must not publish discarded arithmetic");
+            t.IsFalse(timing.active,
+                      "reset should clear published VU1 busy");
+            t.IsFalse(timing.eventPending,
+                      "reset should cancel the old VU1 event");
+
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const std::shared_ptr<const Vu1Snapshot> after =
+                runtime.snapshotVu1Owner();
+            t.IsFalse(after->state.active,
+                      "the discarded plan must not reactivate VU1");
+            t.Equals(after->state.vi[1], int32_t{0},
+                     "the discarded plan must not publish private arithmetic");
         });
 
         tc.Run("runtime resolves a new speculation epoch inside one VIF1 parser batch", [](TestCase &t)
@@ -2627,6 +2907,7 @@ void register_ps2_vu1_command_stream_tests()
                 uint32_t vifMode = 0u;
                 Vu1AsyncRuntimeStatistics afterFirstPublication{};
                 Vu1AsyncRuntimeStatistics afterPayload{};
+                Vu1AsyncRuntimeStatistics afterVifFollowup{};
                 Vu1AsyncRuntimeStatistics afterSecondPublication{};
             };
 
@@ -2727,6 +3008,12 @@ void register_ps2_vu1_command_stream_tests()
                     const Vu1AsyncRuntimeStatistics afterPayload =
                         runtime.vu1AsyncStatistics();
 
+                    context.advanceEeCycleTicks(16u);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    const Vu1AsyncRuntimeStatistics afterVifFollowup =
+                        runtime.vu1AsyncStatistics();
+
                     if (mode == Vu1ExecutionMode::ThreadedAsync &&
                         !waitUntil(
                             [&runtime]()
@@ -2742,7 +3029,7 @@ void register_ps2_vu1_command_stream_tests()
                         return {};
                     }
 
-                    context.advanceEeCycleTicks(128u);
+                    context.advanceEeCycleTicks(112u);
                     runtime.serviceEeEventsAtBlockBoundary(
                         runtime.memory().getRDRAM(), &context);
                     const Vu1AsyncRuntimeStatistics afterSecondPublication =
@@ -2761,6 +3048,7 @@ void register_ps2_vu1_command_stream_tests()
                         .afterFirstPublication =
                             afterFirstPublication,
                         .afterPayload = afterPayload,
+                        .afterVifFollowup = afterVifFollowup,
                         .afterSecondPublication =
                             afterSecondPublication,
                     };
@@ -2784,14 +3072,26 @@ void register_ps2_vu1_command_stream_tests()
                 asynchronous.afterFirstPublication.slicesPublished, 1ull,
                 "the fixture should begin with one published speculative epoch");
             t.Equals(
-                asynchronous.afterPayload.slicesSubmitted, 3ull,
-                "the replacement epoch should be recomputed once after its hazard");
+                asynchronous.afterPayload.slicesSubmitted, 2ull,
+                "the replacement epoch should remain deferred while VIF1 has an earlier callback");
+            t.IsTrue(
+                asynchronous.afterPayload.deferredSlice,
+                "the replacement epoch should retain an EE-side plan");
             t.Equals(
                 asynchronous.afterPayload.hazardBarrierCount, 1ull,
                 "only the unpublished replacement epoch should require a wait barrier");
             t.Equals(
-                asynchronous.afterPayload.hazardRequeueCount, 1ull,
+                asynchronous.afterPayload.hazardRequeueCount, 0ull,
+                "the payload should not immediately requeue disposable work");
+            t.Equals(
+                asynchronous.afterVifFollowup.slicesSubmitted, 3ull,
+                "the replacement epoch should arm after VIF1 finalization");
+            t.Equals(
+                asynchronous.afterVifFollowup.hazardRequeueCount, 1ull,
                 "the replacement epoch should requeue exactly once");
+            t.IsFalse(
+                asynchronous.afterVifFollowup.deferredSlice,
+                "arming should consume the retained EE-side plan");
             t.Equals(
                 asynchronous.afterPayload.owner.speculation.committedSlices,
                 1ull,

@@ -1256,6 +1256,8 @@ struct PS2DebugServer::Impl
         vu1AsyncValue.AddMember(
             "pending_slice", vu1Async.pendingSlice, allocator);
         vu1AsyncValue.AddMember(
+            "deferred_slice", vu1Async.deferredSlice, allocator);
+        vu1AsyncValue.AddMember(
             "slices_submitted",
             vu1Async.slicesSubmitted, allocator);
         vu1AsyncValue.AddMember(
@@ -1306,6 +1308,15 @@ struct PS2DebugServer::Impl
         vu1AsyncValue.AddMember(
             "hazard_requeue_count",
             vu1Async.hazardRequeueCount, allocator);
+        vu1AsyncValue.AddMember(
+            "deferred_slice_count",
+            vu1Async.deferredSliceCount, allocator);
+        vu1AsyncValue.AddMember(
+            "deferred_slice_arm_count",
+            vu1Async.deferredSliceArmCount, allocator);
+        vu1AsyncValue.AddMember(
+            "forced_deferred_slice_arm_count",
+            vu1Async.forcedDeferredSliceArmCount, allocator);
         vu1AsyncValue.AddMember(
             "slice_submit_count",
             vu1Async.sliceSubmitCount, allocator);

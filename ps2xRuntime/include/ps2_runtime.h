@@ -135,6 +135,7 @@ struct Vu1AsyncRuntimeStatistics
 {
     bool enabled = false;
     bool pendingSlice = false;
+    bool deferredSlice = false;
     uint64_t slicesSubmitted = 0u;
     uint64_t slicesPublished = 0u;
     uint64_t resultsReadyAtEvent = 0u;
@@ -152,6 +153,9 @@ struct Vu1AsyncRuntimeStatistics
     uint64_t hazardBarrierCount = 0u;
     uint64_t hazardWaitNanoseconds = 0u;
     uint64_t hazardRequeueCount = 0u;
+    uint64_t deferredSliceCount = 0u;
+    uint64_t deferredSliceArmCount = 0u;
+    uint64_t forcedDeferredSliceArmCount = 0u;
     uint64_t sliceSubmitCount = 0u;
     uint64_t sliceSubmitNanoseconds = 0u;
     uint64_t maximumSliceSubmitNanoseconds = 0u;
@@ -2474,6 +2478,15 @@ private:
         const Vu1SynchronousCommandBarrier &barrier);
     void beginVu1SynchronousCommandBatch();
     void finishVu1SynchronousCommandBatch(bool requeue);
+    [[nodiscard]] bool isCurrentVu1PendingSlicePlan(
+        const Vu1PendingSlicePlan &plan) const noexcept;
+    [[nodiscard]] bool hasPrecedingVif1Event(
+        const Vu1PendingSlicePlan &plan) const noexcept;
+    void clearDeferredVu1SpeculativeSlice() noexcept;
+    void requeueOrDeferVu1SpeculativeSlice(
+        const Vu1PendingSlicePlan &plan);
+    void armDeferredVu1SpeculativeSlice(
+        uint64_t requiredEventGeneration = 0u);
     void enqueueVu1SpeculativeSlice(
         const Vu1PendingSlicePlan &plan,
         Vu1SpeculationResolution previousResolution);
@@ -2757,6 +2770,8 @@ private:
         Vu1PendingSlicePlan plan{};
     };
     std::optional<Vu1PendingSlice> m_pendingVu1Slice;
+    std::optional<Vu1PendingSlicePlan>
+        m_deferredVu1SlicePlan;
     Vu1SpeculationPublicationState
         m_vu1SpeculationPublicationState =
             Vu1SpeculationPublicationState::None;
@@ -2764,6 +2779,7 @@ private:
         m_batchedVu1SynchronousCommandBarrier{};
     bool m_vu1SynchronousCommandBatchActive = false;
     std::atomic<bool> m_vu1AsyncPendingSlice{false};
+    std::atomic<bool> m_vu1AsyncDeferredSlice{false};
     std::atomic<uint64_t> m_vu1AsyncSlicesSubmitted{0u};
     std::atomic<uint64_t> m_vu1AsyncSlicesPublished{0u};
     std::atomic<uint64_t> m_vu1AsyncResultsReadyAtEvent{0u};
@@ -2781,6 +2797,10 @@ private:
     std::atomic<uint64_t> m_vu1AsyncHazardBarrierCount{0u};
     std::atomic<uint64_t> m_vu1AsyncHazardWaitNanoseconds{0u};
     std::atomic<uint64_t> m_vu1AsyncHazardRequeueCount{0u};
+    std::atomic<uint64_t> m_vu1AsyncDeferredSliceCount{0u};
+    std::atomic<uint64_t> m_vu1AsyncDeferredSliceArmCount{0u};
+    std::atomic<uint64_t>
+        m_vu1AsyncForcedDeferredSliceArmCount{0u};
     std::atomic<uint64_t> m_vu1AsyncSliceSubmitCount{0u};
     std::atomic<uint64_t> m_vu1AsyncSliceSubmitNanoseconds{0u};
     std::atomic<uint64_t> m_vu1AsyncMaximumSliceSubmitNanoseconds{0u};

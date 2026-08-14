@@ -3558,6 +3558,8 @@ PS2Runtime::vu1AsyncStatistics() const
                 Vu1ExecutionMode::ThreadedAsync,
         .pendingSlice = m_vu1AsyncPendingSlice.load(
             std::memory_order_acquire),
+        .deferredSlice = m_vu1AsyncDeferredSlice.load(
+            std::memory_order_acquire),
         .slicesSubmitted = m_vu1AsyncSlicesSubmitted.load(
             std::memory_order_acquire),
         .slicesPublished = m_vu1AsyncSlicesPublished.load(
@@ -3605,6 +3607,15 @@ PS2Runtime::vu1AsyncStatistics() const
                 std::memory_order_acquire),
         .hazardRequeueCount =
             m_vu1AsyncHazardRequeueCount.load(
+                std::memory_order_acquire),
+        .deferredSliceCount =
+            m_vu1AsyncDeferredSliceCount.load(
+                std::memory_order_acquire),
+        .deferredSliceArmCount =
+            m_vu1AsyncDeferredSliceArmCount.load(
+                std::memory_order_acquire),
+        .forcedDeferredSliceArmCount =
+            m_vu1AsyncForcedDeferredSliceArmCount.load(
                 std::memory_order_acquire),
         .sliceSubmitCount =
             m_vu1AsyncSliceSubmitCount.load(
@@ -5719,23 +5730,31 @@ void PS2Runtime::serviceVif1DmaAtEvent(
         finishVu1SynchronousCommandBatch(false);
         throw;
     }
-    finishVu1SynchronousCommandBatch(true);
-    if (!advance.active || advance.completed)
-        return;
-
-    if (advance.stall !=
-            Vif1DmaStallReason::None &&
-        advance.stall !=
-            Vif1DmaStallReason::GifPath)
+    const bool scheduleFollowup =
+        advance.active && !advance.completed &&
+        (advance.stall == Vif1DmaStallReason::None ||
+         advance.stall == Vif1DmaStallReason::GifPath);
+    if (scheduleFollowup)
     {
-        return;
+        // Publish the known callback before resolving the VU1 hazard. A VIF1
+        // callback at or before the VU1 deadline would otherwise invalidate
+        // the immediately requeued speculative slice.
+        scheduleVif1DmaEvent(
+            ps2x::timing::saturatingAdd(
+                service.serviceTick,
+                ps2x::timing::eeCyclesToTicks(
+                    advance.delayEeCycles)));
     }
-
-    scheduleVif1DmaEvent(
-        ps2x::timing::saturatingAdd(
-            service.serviceTick,
-            ps2x::timing::eeCyclesToTicks(
-                advance.delayEeCycles)));
+    try
+    {
+        finishVu1SynchronousCommandBatch(true);
+    }
+    catch (...)
+    {
+        if (scheduleFollowup)
+            cancelVif1DmaEvent();
+        throw;
+    }
 }
 
 bool PS2Runtime::scheduleGifDmaFromMemory(
@@ -6462,20 +6481,8 @@ void PS2Runtime::finishVu1SynchronousCommandBarrier(
         return;
     }
 
-    const Vu1PendingSlicePlan &plan = *barrier.requeue;
-    if (m_vu1ExecutionTiming.generation !=
-            plan.executionGeneration ||
-        m_vu1ExecutionTiming.eventToken.generation !=
-            plan.eventGeneration ||
-        !m_publishedVu1Active.load(
-            std::memory_order_acquire))
-    {
-        return;
-    }
-    enqueueVu1SpeculativeSlice(
-        plan, Vu1SpeculationResolution::None);
-    m_vu1AsyncHazardRequeueCount.fetch_add(
-        1u, std::memory_order_relaxed);
+    requeueOrDeferVu1SpeculativeSlice(
+        *barrier.requeue);
 }
 
 void PS2Runtime::beginVu1SynchronousCommandBatch()
@@ -6526,6 +6533,111 @@ void PS2Runtime::finishVu1SynchronousCommandBatch(bool requeue)
     finishVu1SynchronousCommandBarrier(barrier);
 }
 
+bool PS2Runtime::isCurrentVu1PendingSlicePlan(
+    const Vu1PendingSlicePlan &plan) const noexcept
+{
+    return plan.cycleBudget != 0u &&
+           plan.eventGeneration != 0u &&
+           plan.executionGeneration ==
+               m_vu1ExecutionTiming.generation &&
+           plan.eventGeneration ==
+               m_vu1ExecutionTiming.eventToken.generation &&
+           m_publishedVu1Active.load(
+               std::memory_order_acquire);
+}
+
+bool PS2Runtime::hasPrecedingVif1Event(
+    const Vu1PendingSlicePlan &plan) const noexcept
+{
+    const auto vif1Event = m_eeEventScheduler.event(
+        ps2x::timing::EeEventSource::DmacVif1);
+    return vif1Event.has_value() &&
+           vif1Event->deadline <= plan.deadline;
+}
+
+void PS2Runtime::clearDeferredVu1SpeculativeSlice() noexcept
+{
+    m_deferredVu1SlicePlan.reset();
+    m_vu1AsyncDeferredSlice.store(
+        false, std::memory_order_release);
+}
+
+void PS2Runtime::requeueOrDeferVu1SpeculativeSlice(
+    const Vu1PendingSlicePlan &plan)
+{
+    if (!isCurrentVu1PendingSlicePlan(plan))
+    {
+        return;
+    }
+    if (m_pendingVu1Slice || m_deferredVu1SlicePlan)
+    {
+        throw std::logic_error(
+            "VU1 hazard requeue conflicts with retained speculative work");
+    }
+
+    if (hasPrecedingVif1Event(plan))
+    {
+        m_deferredVu1SlicePlan = plan;
+        m_vu1AsyncDeferredSlice.store(
+            true, std::memory_order_release);
+        m_vu1AsyncDeferredSliceCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        return;
+    }
+
+    enqueueVu1SpeculativeSlice(
+        plan, Vu1SpeculationResolution::None);
+    m_vu1AsyncHazardRequeueCount.fetch_add(
+        1u, std::memory_order_relaxed);
+}
+
+void PS2Runtime::armDeferredVu1SpeculativeSlice(
+    uint64_t requiredEventGeneration)
+{
+    if (!m_deferredVu1SlicePlan)
+    {
+        return;
+    }
+
+    const Vu1PendingSlicePlan plan =
+        *m_deferredVu1SlicePlan;
+    if (!isCurrentVu1PendingSlicePlan(plan))
+    {
+        clearDeferredVu1SpeculativeSlice();
+        return;
+    }
+    if (requiredEventGeneration != 0u &&
+        plan.eventGeneration != requiredEventGeneration)
+    {
+        return;
+    }
+    if (requiredEventGeneration == 0u &&
+        hasPrecedingVif1Event(plan))
+    {
+        return;
+    }
+    if (m_pendingVu1Slice ||
+        m_vu1SpeculationPublicationState !=
+            Vu1SpeculationPublicationState::None)
+    {
+        throw std::logic_error(
+            "deferred VU1 slice conflicts with active speculation");
+    }
+
+    clearDeferredVu1SpeculativeSlice();
+    enqueueVu1SpeculativeSlice(
+        plan, Vu1SpeculationResolution::None);
+    m_vu1AsyncHazardRequeueCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_vu1AsyncDeferredSliceArmCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (requiredEventGeneration != 0u)
+    {
+        m_vu1AsyncForcedDeferredSliceArmCount.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+}
+
 void PS2Runtime::enqueueVu1SpeculativeSlice(
     const Vu1PendingSlicePlan &plan,
     Vu1SpeculationResolution previousResolution)
@@ -6536,6 +6648,16 @@ void PS2Runtime::enqueueVu1SpeculativeSlice(
     {
         throw std::logic_error(
             "VU1 speculative enqueue requires asynchronous ownership");
+    }
+    if (m_deferredVu1SlicePlan)
+    {
+        if (isCurrentVu1PendingSlicePlan(
+                *m_deferredVu1SlicePlan))
+        {
+            throw std::logic_error(
+                "new VU1 speculation conflicts with a current deferred slice");
+        }
+        clearDeferredVu1SpeculativeSlice();
     }
     if (m_pendingVu1Slice ||
         plan.cycleBudget == 0u ||
@@ -6890,6 +7012,7 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
 
 void PS2Runtime::resolveVu1SpeculationForShutdown() noexcept
 {
+    clearDeferredVu1SpeculativeSlice();
     if (m_vu1ExecutionMode !=
             Vu1ExecutionMode::ThreadedAsync ||
         !m_threadedVu1Executor ||
@@ -6925,6 +7048,7 @@ void PS2Runtime::resolveVu1SpeculationForShutdown() noexcept
 
 void PS2Runtime::cancelVU1Execution(bool resetInterpreter)
 {
+    clearDeferredVu1SpeculativeSlice();
     if (m_vu1ExecutionTiming.eventToken.generation != 0u)
     {
         (void)m_eeEventScheduler.cancel(
@@ -7251,6 +7375,7 @@ void PS2Runtime::startVU1FromVif(
     uint32_t startPC, uint32_t top, uint32_t itop,
     bool flushBeforeStart)
 {
+    clearDeferredVu1SpeculativeSlice();
     const ps2x::timing::EeTick startTick =
         commitEeContextProgress(m_boundEeContext);
     if (m_vu1ExecutionTiming.eventToken.generation != 0u)
@@ -7303,6 +7428,7 @@ void PS2Runtime::startVU1FromVif(
 void PS2Runtime::resumeVU1FromVif(
     uint32_t top, uint32_t itop)
 {
+    clearDeferredVu1SpeculativeSlice();
     const ps2x::timing::EeTick startTick =
         commitEeContextProgress(m_boundEeContext);
     if (m_vu1ExecutionTiming.eventToken.generation != 0u)
@@ -10095,6 +10221,7 @@ void PS2Runtime::serviceEeEventsAtTick(
 {
     if (!m_eeEventScheduler.deadlineDue(eeCycleTick))
     {
+        armDeferredVu1SpeculativeSlice();
         return;
     }
 
@@ -10126,6 +10253,16 @@ void PS2Runtime::serviceEeEventsAtTick(
                 }
 #endif
 
+                if (service.source ==
+                    ps2x::timing::EeEventSource::
+                        VifVu1Finish)
+                {
+                    // The scheduler has already serviced every equal-tick
+                    // higher-priority VIF1 callback. Arm exactly once from
+                    // the resulting canonical owner state before publishing.
+                    armDeferredVu1SpeculativeSlice(
+                        service.generation);
+                }
                 dispatchEeEvent(rdram, ctx, service);
 
 #if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
@@ -10174,6 +10311,11 @@ void PS2Runtime::serviceEeEventsAtTick(
         requestStop();
         return;
     }
+
+    // Retain the plan while another known VIF1 callback can run first. Once
+    // that chain ends, restore lookahead without waiting for an unrelated
+    // future scheduler event.
+    armDeferredVu1SpeculativeSlice();
 
     // PCSX2 services the complete fixed-priority device batch before its
     // ordinary VU0 catch-up. A same-tick callback scheduled by another
