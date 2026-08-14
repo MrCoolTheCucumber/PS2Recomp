@@ -2435,7 +2435,8 @@ void register_ps2_vu1_command_stream_tests()
                 Vu1AsyncRuntimeStatistics statistics{};
             };
             const auto run =
-                [&](Vu1ExecutionMode mode) -> RunResult
+                [&](Vu1ExecutionMode mode,
+                    uint64_t serviceTicks) -> RunResult
                 {
                     PS2RuntimeConfiguration configuration =
                         defaultPs2RuntimeConfiguration();
@@ -2489,7 +2490,28 @@ void register_ps2_vu1_command_stream_tests()
                     }
 
                     R5900Context &context = runtime.cpu();
-                    context.advanceEeCycleTicks(136u);
+                    context.advanceEeCycleTicks(serviceTicks);
+                    const std::shared_ptr<const Vu1Snapshot>
+                        delayedSnapshot = runtime.snapshotVu1Owner();
+                    if (!delayedSnapshot)
+                    {
+                        t.Fail("the overdue hazard should return a snapshot");
+                        return {};
+                    }
+                    if (mode == Vu1ExecutionMode::ThreadedAsync &&
+                        !waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return statistics.pendingSlice &&
+                                       statistics.owner.completedTickets ==
+                                           statistics.owner.submittedTickets;
+                            }))
+                    {
+                        t.Fail("the overdue requeued slice should finish early");
+                        return {};
+                    }
                     runtime.serviceEeEventsAtBlockBoundary(
                         runtime.memory().getRDRAM(), &context);
                     const std::shared_ptr<const Vu1Snapshot> snapshot =
@@ -2507,10 +2529,33 @@ void register_ps2_vu1_command_stream_tests()
                     };
                 };
 
+            const RunResult sameBudgetReference =
+                run(Vu1ExecutionMode::Inline, 132u);
+            const RunResult sameBudgetAsynchronous =
+                run(Vu1ExecutionMode::ThreadedAsync, 132u);
+            t.Equals(
+                sameBudgetAsynchronous.architecturalHash,
+                sameBudgetReference.architecturalHash,
+                "a sub-cycle-late requeue should retain inline architecture");
+            t.Equals(
+                sameBudgetAsynchronous.timing.currentTick,
+                sameBudgetReference.timing.currentTick,
+                "a sub-cycle-late requeue should retain the canonical guest tick");
+            t.Equals(
+                sameBudgetAsynchronous.timing.totalAdvancedCycles,
+                sameBudgetReference.timing.totalAdvancedCycles,
+                "a sub-cycle-late requeue should retain the canonical VU cycles");
+            t.Equals(
+                sameBudgetAsynchronous.statistics.slicesPublished, 1ull,
+                "the monotonic-identity slice should publish once");
+            t.Equals(
+                sameBudgetAsynchronous.statistics.budgetFallbackCount, 0ull,
+                "sub-cycle lateness should not require recomputation");
+
             const RunResult reference =
-                run(Vu1ExecutionMode::Inline);
+                run(Vu1ExecutionMode::Inline, 136u);
             const RunResult asynchronous =
-                run(Vu1ExecutionMode::ThreadedAsync);
+                run(Vu1ExecutionMode::ThreadedAsync, 136u);
             t.Equals(
                 asynchronous.architecturalHash,
                 reference.architecturalHash,
@@ -2535,6 +2580,12 @@ void register_ps2_vu1_command_stream_tests()
             t.Equals(
                 asynchronous.statistics.resultsReadyAtEvent, 1ull,
                 "the discarded scheduled-budget result should be ready early");
+            t.Equals(
+                asynchronous.statistics.hazardBarrierCount, 2ull,
+                "the overdue and result snapshots should resolve private slices");
+            t.Equals(
+                asynchronous.statistics.hazardRequeueCount, 2ull,
+                "both snapshots should requeue their pending events");
             t.IsTrue(
                 asynchronous.statistics.owner.speculation.rolledBackSlices >=
                     1u,

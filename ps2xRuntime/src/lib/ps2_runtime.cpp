@@ -6517,6 +6517,8 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
         m_pendingVu1Slice->plan.cycleBudget;
     Vu1CommandSubmission submission =
         std::move(m_pendingVu1Slice->submission);
+    const Vu1WorkIdentity speculativeIdentity =
+        submission.identity();
     m_pendingVu1Slice.reset();
     m_vu1AsyncPendingSlice.store(
         false, std::memory_order_release);
@@ -6525,10 +6527,10 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
     Vu1CommandResult speculativeResult =
         m_threadedVu1Executor->wait(
             std::move(submission));
-    if (speculativeResult.identity.publicationToken !=
-            service.generation ||
-        speculativeResult.identity.guestTick !=
-            service.scheduledTick.raw() ||
+    // A synchronous hazard can requeue an overdue plan after a command at a
+    // later guest tick. Command identities remain monotonic in that case;
+    // the plan, not the identity timestamp, owns the publication deadline.
+    if (speculativeResult.identity != speculativeIdentity ||
         speculativeResult.digest.type !=
             Vu1CommandType::AdvanceSlice ||
         !std::holds_alternative<Vu1SliceResult>(
@@ -6570,7 +6572,7 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
 
     const uint64_t expectedResultGuestTick =
         speculativeCycleBudget == cycleBudget
-            ? service.scheduledTick.raw()
+            ? speculativeIdentity.guestTick
             : service.serviceTick.raw();
     if (result.identity.publicationToken !=
             service.generation ||
