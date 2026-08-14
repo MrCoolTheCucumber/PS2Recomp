@@ -2979,7 +2979,7 @@ void register_ps2_memory_tests()
                 uint32_t itop;
             };
             std::vector<MscalCall> mscalCalls;
-            mem.setVu1MscalCallback([&](uint32_t startPC, uint32_t top, uint32_t itop)
+            mem.setVu1MscalCallback([&](uint32_t startPC, uint32_t top, uint32_t itop, bool)
             {
                 mscalCalls.push_back({startPC, top, itop});
             });

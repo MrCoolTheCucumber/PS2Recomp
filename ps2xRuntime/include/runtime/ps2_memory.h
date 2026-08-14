@@ -21,6 +21,7 @@
 #include "ee_counters.h"
 #include "ps2_gif_arbiter.h"
 #include "ps2_vu1.h"
+#include "ps2_vu1_command_stream.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(USE_SSE2NEON)
@@ -1545,12 +1546,34 @@ public:
         m_vif0DmaCancelCallback = std::move(cb);
     }
 
-    using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
+    using Vu1MscalCallback = std::function<void(
+        uint32_t startPC, uint32_t top, uint32_t itop,
+        bool flushBeforeStart)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
     using Vu1BusyCallback = std::function<bool()>;
     void setVu1BusyCallback(Vu1BusyCallback cb) { m_vu1BusyCallback = std::move(cb); }
+    using Vu1CommandCallback =
+        std::function<Vu1CommandResult(Vu1CommandPayload)>;
+    void setVu1CommandCallback(Vu1CommandCallback cb)
+    {
+        m_vu1CommandCallback = std::move(cb);
+    }
+    using Vu1DecodedUnpackCallback =
+        std::function<Vu1CommandResult(Vu1DecodedUnpackCommand)>;
+    void setVu1DecodedUnpackCallback(
+        Vu1DecodedUnpackCallback cb)
+    {
+        m_vu1DecodedUnpackCallback = std::move(cb);
+    }
+    using Vu1VifStateUpdateCallback =
+        std::function<Vu1CommandResult(Vu1VifStateUpdateCommand)>;
+    void setVu1VifStateUpdateCallback(
+        Vu1VifStateUpdateCallback cb)
+    {
+        m_vu1VifStateUpdateCallback = std::move(cb);
+    }
     using Vif1ResetCallback = std::function<void()>;
     void setVif1ResetCallback(Vif1ResetCallback cb) { m_vif1ResetCallback = std::move(cb); }
     using Vif1DmaScheduleCallback =
@@ -1901,6 +1924,9 @@ public:
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
     Vu1BusyCallback m_vu1BusyCallback;
+    Vu1CommandCallback m_vu1CommandCallback;
+    Vu1DecodedUnpackCallback m_vu1DecodedUnpackCallback;
+    Vu1VifStateUpdateCallback m_vu1VifStateUpdateCallback;
     Vif1ResetCallback m_vif1ResetCallback;
     Vif1DmaScheduleCallback m_vif1DmaScheduleCallback;
     Vif1DmaCancelCallback m_vif1DmaCancelCallback;
@@ -2196,7 +2222,7 @@ public:
     bool isAddressInRegion(uint32_t address, const CodeRegion &region);
     void markModified(uint32_t address, uint32_t size, uint32_t writerPc);
     void markVU0CodeModified() { m_vu0CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
-    void markVU1CodeModified() { m_vu1CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
+    void markVU1CodeModified();
     void markVUCodeModified(const uint8_t *vuMem)
     {
         if (vuMem == m_vu0Code)
@@ -2204,6 +2230,20 @@ public:
         else if (vuMem == m_vu1Code)
             markVU1CodeModified();
     }
+    [[nodiscard]] bool submitVu1OwnerCommand(
+        Vu1CommandPayload payload);
+    [[nodiscard]] bool submitVu1OwnerCommand(
+        Vu1DecodedUnpackCommand command);
+    [[nodiscard]] bool submitVu1OwnerCommand(
+        Vu1VifStateUpdateCommand command);
+    [[nodiscard]] bool writeVu1OwnerMemory(
+        uint8_t *vuMemory, uint32_t offset,
+        const void *bytes, size_t size,
+        bool wrap = false);
+    [[nodiscard]] Vu1VifState captureVu1VifState() const;
+    void publishVu1VifState(
+        const Vu1VifState &state) noexcept;
+    void submitVu1VifStateUpdate();
     bool isScratchpad(uint32_t address) const;
     uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit);
     const uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const;

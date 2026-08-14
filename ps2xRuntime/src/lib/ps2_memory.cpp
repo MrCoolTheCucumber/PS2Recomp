@@ -34,6 +34,165 @@
 #define PS2X_VU_OBSERVER_NOINLINE
 #endif
 
+bool PS2Memory::submitVu1OwnerCommand(
+    Vu1CommandPayload payload)
+{
+    if (!m_vu1CommandCallback)
+        return false;
+
+    const Vu1CommandType type = vu1CommandType(payload);
+    const Vu1CommandResult result =
+        m_vu1CommandCallback(std::move(payload));
+    if (result.disposition != Vu1CommandDisposition::Completed)
+    {
+        throw std::runtime_error(
+            std::string("VU1 owner rejected ") +
+            vu1CommandTypeName(type));
+    }
+
+    m_vu1CodeGeneration.store(
+        result.codeGeneration, std::memory_order_relaxed);
+    if (const auto *const vif =
+            std::get_if<Vu1VifStateResult>(&result.payload))
+    {
+        publishVu1VifState(vif->state);
+    }
+    return true;
+}
+
+bool PS2Memory::submitVu1OwnerCommand(
+    Vu1DecodedUnpackCommand command)
+{
+    if (!m_vu1DecodedUnpackCallback)
+    {
+        return submitVu1OwnerCommand(
+            Vu1CommandPayload{std::move(command)});
+    }
+
+    const Vu1CommandResult result =
+        m_vu1DecodedUnpackCallback(std::move(command));
+    if (result.disposition != Vu1CommandDisposition::Completed)
+    {
+        throw std::runtime_error(
+            "VU1 owner rejected decoded-unpack");
+    }
+    m_vu1CodeGeneration.store(
+        result.codeGeneration, std::memory_order_relaxed);
+    if (const auto *const vif =
+            std::get_if<Vu1VifStateResult>(&result.payload))
+    {
+        publishVu1VifState(vif->state);
+    }
+    return true;
+}
+
+bool PS2Memory::submitVu1OwnerCommand(
+    Vu1VifStateUpdateCommand command)
+{
+    if (!m_vu1VifStateUpdateCallback)
+    {
+        return submitVu1OwnerCommand(
+            Vu1CommandPayload{std::move(command)});
+    }
+
+    const Vu1CommandResult result =
+        m_vu1VifStateUpdateCallback(std::move(command));
+    if (result.disposition != Vu1CommandDisposition::Completed)
+    {
+        throw std::runtime_error(
+            "VU1 owner rejected vif-state-update");
+    }
+    m_vu1CodeGeneration.store(
+        result.codeGeneration, std::memory_order_relaxed);
+    if (const auto *const vif =
+            std::get_if<Vu1VifStateResult>(&result.payload))
+    {
+        publishVu1VifState(vif->state);
+    }
+    return true;
+}
+
+bool PS2Memory::writeVu1OwnerMemory(
+    uint8_t *vuMemory, uint32_t offset,
+    const void *bytes, size_t size, bool wrap)
+{
+    if (!m_vu1CommandCallback || !bytes || size == 0u)
+        return false;
+
+    const auto *const first =
+        static_cast<const uint8_t *>(bytes);
+    std::vector<uint8_t> owned(first, first + size);
+    if (vuMemory == m_vu1Code)
+    {
+        return submitVu1OwnerCommand(
+            Vu1MicroMemoryWriteCommand{
+                .offset = offset,
+                .bytes = std::move(owned),
+                .wrap = wrap,
+            });
+    }
+    if (vuMemory == m_vu1Data)
+    {
+        return submitVu1OwnerCommand(
+            Vu1DataMemoryWriteCommand{
+                .offset = offset,
+                .bytes = std::move(owned),
+                .wrap = wrap,
+            });
+    }
+    return false;
+}
+
+void PS2Memory::markVU1CodeModified()
+{
+    if (m_vu1CommandCallback && m_vu1Code)
+    {
+        // Transitional raw fixture/debug writers cannot describe their
+        // touched range. Republish the complete micro image so the command
+        // owner receives both the bytes and the generation transition.
+        if (writeVu1OwnerMemory(
+                m_vu1Code, 0u, m_vu1Code,
+                PS2_VU1_CODE_SIZE))
+        {
+            return;
+        }
+    }
+    m_vu1CodeGeneration.fetch_add(
+        1u, std::memory_order_relaxed);
+}
+
+Vu1VifState PS2Memory::captureVu1VifState() const
+{
+    Vu1VifState state{
+        .cycle = vif1_regs.cycle,
+        .mode = vif1_regs.mode,
+        .mask = vif1_regs.mask,
+        .tops = vif1_regs.tops,
+    };
+    std::copy_n(vif1_regs.row, state.row.size(), state.row.begin());
+    std::copy_n(
+        vif1_regs.col, state.column.size(), state.column.begin());
+    return state;
+}
+
+void PS2Memory::publishVu1VifState(
+    const Vu1VifState &state) noexcept
+{
+    vif1_regs.cycle = state.cycle;
+    vif1_regs.mode = state.mode;
+    vif1_regs.mask = state.mask;
+    vif1_regs.tops = state.tops;
+    std::copy(state.row.begin(), state.row.end(), vif1_regs.row);
+    std::copy(
+        state.column.begin(), state.column.end(), vif1_regs.col);
+}
+
+void PS2Memory::submitVu1VifStateUpdate()
+{
+    (void)submitVu1OwnerCommand(
+        Vu1VifStateUpdateCommand{captureVu1VifState()});
+}
+
 bool PS2Memory::vuTraceEnabled() const
 {
     return isVif1DmaTraceActive();
@@ -2897,7 +3056,11 @@ bool PS2Memory::initialize(size_t ramSize)
         m_vu1Data = new uint8_t[PS2_VU1_DATA_SIZE];
         std::memset(m_vu1Code, 0, PS2_VU1_CODE_SIZE);
         std::memset(m_vu1Data, 0, PS2_VU1_DATA_SIZE);
-        markVU1CodeModified();
+        // Allocation/reallocation occurs before the VU owner is rebound.
+        // Publish only the EE-side generation here; syncCoreSubsystems will
+        // bind the new image before any owner command is accepted.
+        m_vu1CodeGeneration.fetch_add(
+            1u, std::memory_order_relaxed);
 
         // Initialize VIF registers
         memset(&vif0_regs, 0, sizeof(vif0_regs));
@@ -4207,6 +4370,11 @@ void PS2Memory::write8(
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint8_t), vuOffset, vuLimit))
         {
             (void)vuLimit;
+            if (writeVu1OwnerMemory(
+                    vuMem, vuOffset, &value, sizeof(value)))
+            {
+                return;
+            }
             vuMem[vuOffset] = value;
             markVUCodeModified(vuMem);
             return;
@@ -4267,6 +4435,11 @@ void PS2Memory::write16(
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
         {
+            if (writeVu1OwnerMemory(
+                    vuMem, vuOffset, &value, sizeof(value)))
+            {
+                return;
+            }
             storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
             markVUCodeModified(vuMem);
             return;
@@ -4339,6 +4512,11 @@ void PS2Memory::write32(
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
         {
+            if (writeVu1OwnerMemory(
+                    vuMem, vuOffset, &value, sizeof(value)))
+            {
+                return;
+            }
             storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
             markVUCodeModified(vuMem);
             return;
@@ -4401,6 +4579,11 @@ void PS2Memory::write64(
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
         {
+            if (writeVu1OwnerMemory(
+                    vuMem, vuOffset, &value, sizeof(value)))
+            {
+                return;
+            }
             storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
             markVUCodeModified(vuMem);
             return;
@@ -4511,6 +4694,18 @@ void PS2Memory::writeMasked32(
         inRange(
             vuOffset, sizeof(value), vuLimit,
             "writeMasked32 vu", address);
+        std::array<uint8_t, sizeof(value)> ownerBytes{};
+        for (uint32_t index = 0u; index < span.size; ++index)
+        {
+            ownerBytes[index] = static_cast<uint8_t>(
+                value >> ((span.offset + index) * 8u));
+        }
+        if (writeVu1OwnerMemory(
+                vuMem, vuOffset + span.offset,
+                ownerBytes.data(), span.size))
+        {
+            return;
+        }
         writeBytes(vuMem + vuOffset);
         markVUCodeModified(vuMem);
         return;
@@ -4610,6 +4805,18 @@ void PS2Memory::writeMasked64(
         inRange(
             vuOffset, sizeof(value), vuLimit,
             "writeMasked64 vu", address);
+        std::array<uint8_t, sizeof(value)> ownerBytes{};
+        for (uint32_t index = 0u; index < span.size; ++index)
+        {
+            ownerBytes[index] = static_cast<uint8_t>(
+                value >> ((span.offset + index) * 8u));
+        }
+        if (writeVu1OwnerMemory(
+                vuMem, vuOffset + span.offset,
+                ownerBytes.data(), span.size))
+        {
+            return;
+        }
         writeBytes(vuMem + vuOffset);
         markVUCodeModified(vuMem);
         return;
@@ -4682,6 +4889,17 @@ void PS2Memory::write128(
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(__m128i), vuOffset, vuLimit))
         {
             inRange(vuOffset, sizeof(__m128i), vuLimit, "write128 vu", address);
+            alignas(16) std::array<uint8_t, sizeof(__m128i)>
+                ownerBytes{};
+            _mm_storeu_si128(
+                reinterpret_cast<__m128i *>(ownerBytes.data()),
+                value);
+            if (writeVu1OwnerMemory(
+                    vuMem, vuOffset, ownerBytes.data(),
+                    ownerBytes.size()))
+            {
+                return;
+            }
             _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
             markVUCodeModified(vuMem);
             return;
@@ -5047,6 +5265,7 @@ bool PS2Memory::writeIORegisterMasked(
                 (void)cancelDmacTransfer(DmacChannel::Vif1);
                 if (m_vif1ResetCallback)
                     m_vif1ResetCallback();
+                submitVu1VifStateUpdate();
                 break;
             }
             if (writeValue & 0x2u) // FBK
@@ -5090,15 +5309,18 @@ bool PS2Memory::writeIORegisterMasked(
             break;
         case 0x10003C40u:
             vif1_regs.cycle = mergedValue & 0xFFFFu;
+            submitVu1VifStateUpdate();
             break;
         case 0x10003C50u:
             vif1_regs.mode = mergedValue & 0x3u;
+            submitVu1VifStateUpdate();
             break;
         case 0x10003C60u:
             vif1_regs.num = mergedValue & 0xFFu;
             break;
         case 0x10003C70u:
             vif1_regs.mask = mergedValue;
+            submitVu1VifStateUpdate();
             break;
         case 0x10003C80u:
             vif1_regs.code = mergedValue;
@@ -5114,6 +5336,7 @@ bool PS2Memory::writeIORegisterMasked(
             break;
         case 0x10003CC0u:
             vif1_regs.tops = mergedValue & 0x3FFu;
+            submitVu1VifStateUpdate();
             break;
         case 0x10003CD0u:
             vif1_regs.itop = mergedValue & 0x3FFu;

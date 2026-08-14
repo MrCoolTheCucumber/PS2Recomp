@@ -43,6 +43,14 @@ namespace
         return bytes;
     }
 
+    uint32_t makeVifCommand(
+        uint8_t opcode, uint8_t count, uint16_t immediate)
+    {
+        return (static_cast<uint32_t>(opcode) << 24u) |
+               (static_cast<uint32_t>(count) << 16u) |
+               immediate;
+    }
+
     struct Fixture
     {
         VuUnit unit{VuUnitId::Vu1};
@@ -71,6 +79,28 @@ namespace
             uint64_t tick = 0u)
         {
             return executor.submit(std::move(payload), tick);
+        }
+
+        Vu1CommandResult advance(
+            Vu1AdvanceSliceCommand command,
+            uint64_t tick = 0u)
+        {
+            return executor.submitAdvanceSlice(command, tick);
+        }
+
+        Vu1CommandResult unpack(
+            Vu1DecodedUnpackCommand command,
+            uint64_t tick = 0u)
+        {
+            return executor.submitDecodedUnpack(
+                std::move(command), tick);
+        }
+
+        Vu1CommandResult updateVif(
+            Vu1VifStateUpdateCommand command,
+            uint64_t tick = 0u)
+        {
+            return executor.submitVifStateUpdate(command, tick);
         }
     };
 
@@ -136,10 +166,24 @@ void register_ps2_vu1_command_stream_tests()
                 const VuRunResult direct =
                     directUnit.advance(directContext, budget);
                 const Vu1CommandResult inlineResult =
-                    inlineFixture.submit(Vu1AdvanceSliceCommand{
+                    inlineFixture.advance(Vu1AdvanceSliceCommand{
                         .maximumCycles = budget,
                         .captureState = true,
                     });
+                Vu1Command expectedCommand{
+                    .identity = inlineResult.identity,
+                    .type = Vu1CommandType::AdvanceSlice,
+                    .payload = Vu1AdvanceSliceCommand{
+                        .maximumCycles = budget,
+                        .captureState = true,
+                    },
+                };
+                expectedCommand.payloadSize =
+                    vu1CommandPayloadSize(expectedCommand.payload);
+                t.IsTrue(
+                    inlineResult.digest ==
+                        vu1CommandDigest(expectedCommand),
+                    "the typed slice route should retain the canonical digest");
                 const Vu1SliceResult *const slice =
                     sliceResult(inlineResult);
                 t.IsTrue(slice != nullptr,
@@ -152,7 +196,7 @@ void register_ps2_vu1_command_stream_tests()
                          "each seam slice should retain the direct exit reason");
                 std::string difference;
                 t.IsTrue(
-                    slice->state.has_value() &&
+                    static_cast<bool>(slice->state) &&
                         vuExecutionStatesEqual(
                             *slice->state, directUnit.state(), &difference),
                     "each seam slice should retain exact architectural state");
@@ -184,7 +228,7 @@ void register_ps2_vu1_command_stream_tests()
             });
             fixture.submit(Vu1MscalCommand{});
             const Vu1CommandResult result =
-                fixture.submit(Vu1AdvanceSliceCommand{
+                fixture.advance(Vu1AdvanceSliceCommand{
                     .maximumCycles = 2u,
                     .captureState = true,
                 });
@@ -215,7 +259,19 @@ void register_ps2_vu1_command_stream_tests()
                 .mode = 1u,
                 .row = {10u, 20u, 30u, 40u},
             };
-            fixture.submit(Vu1VifStateUpdateCommand{vif});
+            const Vu1CommandResult vifResult =
+                fixture.updateVif(Vu1VifStateUpdateCommand{vif});
+            Vu1Command expectedVifCommand{
+                .identity = vifResult.identity,
+                .type = Vu1CommandType::VifStateUpdate,
+                .payload = Vu1VifStateUpdateCommand{vif},
+            };
+            expectedVifCommand.payloadSize =
+                vu1CommandPayloadSize(expectedVifCommand.payload);
+            t.IsTrue(
+                vifResult.digest ==
+                    vu1CommandDigest(expectedVifCommand),
+                "the typed VIF state route should retain the canonical digest");
             std::vector<uint8_t> source(32u);
             const std::array<uint32_t, 8u> words{
                 1u, 2u, 3u, 4u,
@@ -223,16 +279,29 @@ void register_ps2_vu1_command_stream_tests()
             };
             std::memcpy(source.data(), words.data(), source.size());
             const std::vector<uint8_t> owned = source;
-            const Vu1CommandResult result = fixture.submit(
-                Vu1DecodedUnpackCommand{
-                    .immediate = 3u,
-                    .vectorLength = 0u,
-                    .componentCount = 4u,
-                    .writeVectorCount = 2u,
-                    .sourceVectorCount = 2u,
-                    .sourceWordAlignment = 4u,
-                    .bytes = std::move(source),
-                });
+            Vu1DecodedUnpackCommand unpack{
+                .immediate = 3u,
+                .vectorLength = 0u,
+                .componentCount = 4u,
+                .writeVectorCount = 2u,
+                .sourceVectorCount = 2u,
+                .sourceWordAlignment = 4u,
+                .bytes = std::move(source),
+            };
+            const Vu1DecodedUnpackCommand expectedUnpack = unpack;
+            const Vu1CommandResult result =
+                fixture.unpack(std::move(unpack));
+            Vu1Command expectedUnpackCommand{
+                .identity = result.identity,
+                .type = Vu1CommandType::DecodedUnpack,
+                .payload = expectedUnpack,
+            };
+            expectedUnpackCommand.payloadSize =
+                vu1CommandPayloadSize(expectedUnpackCommand.payload);
+            t.IsTrue(
+                result.digest ==
+                    vu1CommandDigest(expectedUnpackCommand),
+                "the typed UNPACK route should retain the canonical digest");
             t.IsTrue(
                 result.disposition == Vu1CommandDisposition::Completed,
                 "a complete decoded UNPACK should be accepted");
@@ -252,6 +321,10 @@ void register_ps2_vu1_command_stream_tests()
 
         tc.Run("digests identities and generation rejection are deterministic", [](TestCase &t)
         {
+            t.IsTrue(
+                sizeof(Vu1Command) <= 128u &&
+                    sizeof(Vu1CommandResult) <= 256u,
+                "hot command and result envelopes should remain bounded");
             VuUnit unit(VuUnitId::Vu1);
             std::vector<uint8_t> code(PS2_VU1_CODE_SIZE);
             std::vector<uint8_t> data(PS2_VU1_DATA_SIZE);
@@ -309,6 +382,349 @@ void register_ps2_vu1_command_stream_tests()
                 "a sequence gap should be rejected");
         });
 
+        tc.Run("reset remains ordered before owner memory is bound", [](TestCase &t)
+        {
+            VuUnit unit(VuUnitId::Vu1);
+            Vu1CommandProcessor processor(unit);
+            InlineVu1Executor executor(processor);
+            const Vu1CommandResult reset =
+                executor.submit(Vu1ResetCommand{});
+            t.IsTrue(
+                reset.disposition ==
+                    Vu1CommandDisposition::Completed,
+                "runtime timing reset should not require initialized VU memory");
+            t.Equals(processor.generation(), uint64_t{2u},
+                     "an unbound reset should still advance owner generation");
+            t.Equals(processor.nextSequence(), uint64_t{2u},
+                     "an unbound reset should consume exactly one sequence");
+        });
+
+        tc.Run("mapped writes MPG and UNPACK enter one ordered owner stream", [](TestCase &t)
+        {
+            PS2Memory memory;
+            t.IsTrue(memory.initialize(),
+                     "owner-routing memory should initialize");
+            VuUnit unit(VuUnitId::Vu1);
+            Vu1CommandProcessor processor(
+                unit, {.captureCommandDigests = true});
+            processor.bindMemory(
+                memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                memory.getVU1CodeGeneration());
+            InlineVu1Executor executor(processor);
+            memory.setVu1CommandCallback(
+                [&](Vu1CommandPayload payload)
+                {
+                    return executor.submit(std::move(payload), 17u);
+                });
+            memory.setVu1DecodedUnpackCallback(
+                [&](Vu1DecodedUnpackCommand command)
+                {
+                    return executor.submitDecodedUnpack(
+                        std::move(command), 17u);
+                });
+            memory.setVu1VifStateUpdateCallback(
+                [&](Vu1VifStateUpdateCommand command)
+                {
+                    return executor.submitVifStateUpdate(
+                        command, 17u);
+                });
+
+            const uint64_t initialCodeGeneration =
+                processor.codeGeneration();
+            memory.write32(
+                PS2_VU1_CODE_BASE + 4u, 0x44332211u);
+            memory.writeMasked32(
+                PS2_VU1_DATA_BASE + 8u,
+                0xaabbccddu, 0x6u);
+            t.Equals(processor.nextSequence(), uint64_t{3u},
+                     "mapped code and data writes should consume two commands");
+            t.Equals(processor.codeGeneration(),
+                     initialCodeGeneration + 1u,
+                     "only the mapped micro write should advance code generation");
+            t.Equals(memory.getVU1CodeGeneration(),
+                     processor.codeGeneration(),
+                     "the EE generation mirror should publish the owner result");
+            t.Equals(memory.getVU1Code()[4u], uint8_t{0x11u},
+                     "mapped micro bytes should be applied by the owner");
+            t.Equals(memory.getVU1Data()[9u], uint8_t{0xccu},
+                     "masked data writes should retain their byte offset");
+            t.Equals(memory.getVU1Data()[10u], uint8_t{0xbbu},
+                     "masked data writes should retain contiguous enabled bytes");
+
+            std::vector<uint8_t> stream;
+            const auto append =
+                [&](const void *source, size_t size)
+                {
+                    const auto *const bytes =
+                        static_cast<const uint8_t *>(source);
+                    stream.insert(stream.end(), bytes, bytes + size);
+                };
+            const uint32_t stcycl =
+                makeVifCommand(0x01u, 0u, 0x0101u);
+            const uint32_t mpg =
+                makeVifCommand(0x4au, 1u, 2u);
+            const auto uploadedPair =
+                instructionPair(0x10203040u, kVuUpperNop);
+            const uint32_t unpack =
+                makeVifCommand(0x6cu, 1u, 3u);
+            const std::array<uint32_t, 4u> unpackWords{
+                1u, 2u, 3u, 4u};
+            append(&stcycl, sizeof(stcycl));
+            append(&mpg, sizeof(mpg));
+            append(uploadedPair.data(), uploadedPair.size());
+            append(&unpack, sizeof(unpack));
+            append(unpackWords.data(), sizeof(unpackWords));
+            memory.processVIF1Data(
+                stream.data(), static_cast<uint32_t>(stream.size()));
+
+            t.Equals(processor.nextSequence(), uint64_t{6u},
+                     "STCYCL MPG and decoded UNPACK should add three commands");
+            t.Equals(processor.codeGeneration(),
+                     initialCodeGeneration + 2u,
+                     "MPG should publish one additional code generation");
+            t.Equals(processor.vifState().cycle, uint32_t{0x0101u},
+                     "VIF state should be ordered before decoded UNPACK");
+            t.IsTrue(
+                std::memcmp(
+                    memory.getVU1Code() + 16u,
+                    uploadedPair.data(), uploadedPair.size()) == 0,
+                "MPG bytes should be owned and applied at their wrapped address");
+            std::array<uint32_t, 4u> actual{};
+            std::memcpy(
+                actual.data(), memory.getVU1Data() + 48u,
+                sizeof(actual));
+            t.Equals(actual, unpackWords,
+                     "decoded UNPACK should mutate owner data memory");
+        });
+
+        tc.Run("decoded owner UNPACK matches the legacy parser matrix", [](TestCase &t)
+        {
+            PS2Memory legacy;
+            PS2Memory owned;
+            t.IsTrue(legacy.initialize() && owned.initialize(),
+                     "UNPACK differential memories should initialize");
+            VuUnit unit(VuUnitId::Vu1);
+            Vu1CommandProcessor processor(unit);
+            processor.bindMemory(
+                owned.getVU1Code(), PS2_VU1_CODE_SIZE,
+                owned.getVU1Data(), PS2_VU1_DATA_SIZE,
+                owned.getVU1CodeGeneration());
+            InlineVu1Executor executor(processor);
+            owned.setVu1CommandCallback(
+                [&](Vu1CommandPayload payload)
+                {
+                    return executor.submit(std::move(payload));
+                });
+            owned.setVu1DecodedUnpackCallback(
+                [&](Vu1DecodedUnpackCommand command)
+                {
+                    return executor.submitDecodedUnpack(
+                        std::move(command));
+                });
+            owned.setVu1VifStateUpdateCallback(
+                [&](Vu1VifStateUpdateCommand command)
+                {
+                    return executor.submitVifStateUpdate(command);
+                });
+
+            constexpr std::array<std::pair<uint8_t, uint8_t>, 6u>
+                cycles{{
+                    {1u, 1u}, {2u, 2u}, {1u, 3u},
+                    {3u, 1u}, {4u, 4u}, {2u, 4u},
+                }};
+            constexpr std::array<uint32_t, 4u> row{
+                0x10u, 0x20u, 0x30u, 0x40u};
+            constexpr std::array<uint32_t, 4u> column{
+                0x100u, 0x200u, 0x300u, 0x400u};
+            constexpr uint32_t mask = 0xe4e4e4e4u;
+            const auto append = [](
+                std::vector<uint8_t> &output,
+                const void *source, size_t size)
+            {
+                const auto *const bytes =
+                    static_cast<const uint8_t *>(source);
+                output.insert(output.end(), bytes, bytes + size);
+            };
+
+            for (uint8_t vn = 0u; vn < 4u; ++vn)
+            {
+                for (uint8_t vl = 0u; vl < 4u; ++vl)
+                {
+                    const uint32_t components = vn + 1u;
+                    const uint32_t bitsPerComponent =
+                        vl == 0u ? 32u :
+                        vl == 1u ? 16u :
+                        vl == 2u ? 8u :
+                        vn == 3u ? 4u : 16u;
+                    const uint32_t bytesPerVector =
+                        ((vl == 3u && vn == 3u)
+                             ? 16u
+                             : components * bitsPerComponent) /
+                        8u;
+                    for (bool maskEnabled : {false, true})
+                    {
+                        for (uint8_t mode = 0u; mode < 4u; ++mode)
+                        {
+                            for (const auto [cl, wl] : cycles)
+                            {
+                                constexpr uint32_t writeCount = 5u;
+                                uint32_t sourceCount = writeCount;
+                                if (cl < wl)
+                                {
+                                    sourceCount =
+                                        (writeCount / wl) * cl +
+                                        std::min<uint32_t>(
+                                            writeCount % wl, cl);
+                                }
+                                const uint32_t payloadBytes =
+                                    (sourceCount * bytesPerVector + 3u) &
+                                    ~3u;
+                                for (uint8_t alignment = 0u;
+                                     alignment < 4u; ++alignment)
+                                {
+                                    for (uint16_t flags :
+                                         {uint16_t{0u},
+                                          uint16_t{0x4000u},
+                                          uint16_t{0x8000u},
+                                          uint16_t{0xc000u}})
+                                    {
+                                        for (uint32_t index = 0u;
+                                             index < PS2_VU1_DATA_SIZE;
+                                             ++index)
+                                        {
+                                            const uint8_t value =
+                                                static_cast<uint8_t>(
+                                                    index * 29u + 7u);
+                                            legacy.getVU1Data()[index] = value;
+                                            owned.getVU1Data()[index] = value;
+                                        }
+
+                                        std::vector<uint8_t> stream;
+                                        const std::array<uint32_t, 7u>
+                                            commands{
+                                                makeVifCommand(
+                                                    0x03u, 0u, 7u),
+                                                makeVifCommand(
+                                                    0x02u, 0u, 5u),
+                                                makeVifCommand(
+                                                    0x01u, 0u,
+                                                    static_cast<uint16_t>(
+                                                        (wl << 8u) | cl)),
+                                                makeVifCommand(
+                                                    0x05u, 0u, mode),
+                                                makeVifCommand(
+                                                    0x20u, 0u, 0u),
+                                                makeVifCommand(
+                                                    0x30u, 0u, 0u),
+                                                makeVifCommand(
+                                                    0x31u, 0u, 0u),
+                                            };
+                                        append(stream, &commands[0], 4u);
+                                        append(stream, &commands[1], 4u);
+                                        append(stream, &commands[2], 4u);
+                                        append(stream, &commands[3], 4u);
+                                        append(stream, &commands[4], 4u);
+                                        append(stream, &mask, sizeof(mask));
+                                        append(stream, &commands[5], 4u);
+                                        append(stream, row.data(), sizeof(row));
+                                        append(stream, &commands[6], 4u);
+                                        append(
+                                            stream, column.data(),
+                                            sizeof(column));
+                                        const uint32_t nop = 0u;
+                                        for (uint8_t index = 0u;
+                                             index < alignment; ++index)
+                                        {
+                                            append(stream, &nop, sizeof(nop));
+                                        }
+                                        const uint8_t opcode =
+                                            static_cast<uint8_t>(
+                                                0x60u |
+                                                (maskEnabled ? 0x10u : 0u) |
+                                                (vn << 2u) | vl);
+                                        const uint32_t unpack =
+                                            makeVifCommand(
+                                                opcode,
+                                                static_cast<uint8_t>(
+                                                    writeCount),
+                                                static_cast<uint16_t>(
+                                                    flags | 11u));
+                                        append(stream, &unpack, sizeof(unpack));
+                                        for (uint32_t index = 0u;
+                                             index < payloadBytes; ++index)
+                                        {
+                                            stream.push_back(
+                                                static_cast<uint8_t>(
+                                                    index * 17u +
+                                                    vn * 11u + vl * 3u));
+                                        }
+
+                                        legacy.processVIF1Data(
+                                            stream.data(),
+                                            static_cast<uint32_t>(
+                                                stream.size()));
+                                        owned.processVIF1Data(
+                                            stream.data(),
+                                            static_cast<uint32_t>(
+                                                stream.size()));
+                                        const bool memoryMatches =
+                                            std::memcmp(
+                                                legacy.getVU1Data(),
+                                                owned.getVU1Data(),
+                                                PS2_VU1_DATA_SIZE) == 0;
+                                        const bool stateMatches =
+                                            std::memcmp(
+                                                legacy.vif1_regs.row,
+                                                owned.vif1_regs.row,
+                                                sizeof(row)) == 0 &&
+                                            processor.vifState().cycle ==
+                                                owned.vif1_regs.cycle &&
+                                            processor.vifState().mode ==
+                                                owned.vif1_regs.mode &&
+                                            processor.vifState().mask ==
+                                                owned.vif1_regs.mask &&
+                                            processor.vifState().tops ==
+                                                owned.vif1_regs.tops &&
+                                            processor.vifState().column ==
+                                                std::array<uint32_t, 4u>{
+                                                    owned.vif1_regs.col[0],
+                                                    owned.vif1_regs.col[1],
+                                                    owned.vif1_regs.col[2],
+                                                    owned.vif1_regs.col[3]} &&
+                                            processor.vifState().row ==
+                                                std::array<uint32_t, 4u>{
+                                                    owned.vif1_regs.row[0],
+                                                    owned.vif1_regs.row[1],
+                                                    owned.vif1_regs.row[2],
+                                                    owned.vif1_regs.row[3]};
+                                        if (!memoryMatches || !stateMatches)
+                                        {
+                                            t.Fail(
+                                                "first UNPACK divergence: vn=" +
+                                                std::to_string(vn) +
+                                                " vl=" + std::to_string(vl) +
+                                                " mask=" +
+                                                std::to_string(maskEnabled) +
+                                                " mode=" +
+                                                std::to_string(mode) +
+                                                " cl=" + std::to_string(cl) +
+                                                " wl=" + std::to_string(wl) +
+                                                " alignment=" +
+                                                std::to_string(alignment) +
+                                                " flags=" +
+                                                std::to_string(flags));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         tc.Run("snapshot restore barrier and hashes cover complete owner state", [](TestCase &t)
         {
             Fixture fixture;
@@ -325,9 +741,9 @@ void register_ps2_vu1_command_stream_tests()
                 fixture.submit(Vu1SnapshotCommand{});
             const auto *const snapshot =
                 std::get_if<Vu1SnapshotResult>(&snapshotResult.payload);
-            t.IsTrue(snapshot != nullptr,
+            t.IsTrue(snapshot != nullptr && snapshot->snapshot,
                      "snapshot should return an owned typed result");
-            if (!snapshot)
+            if (!snapshot || !snapshot->snapshot)
                 return;
             const uint64_t originalHash =
                 snapshot->architecturalStateHash;

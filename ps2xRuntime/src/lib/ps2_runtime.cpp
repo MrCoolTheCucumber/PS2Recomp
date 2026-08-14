@@ -1365,6 +1365,15 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     : m_gsCommandProcessor(m_gs),
       m_vu0(VuUnitId::Vu0),
       m_vu1(VuUnitId::Vu1),
+      m_vu1CommandProcessor(
+          m_vu1,
+          {
+              .captureCommandDigests =
+                  configuration.captureVu1CommandDigests,
+              .captureArchitecturalStateHashes =
+                  configuration.
+                      captureVu1ArchitecturalStateHashes,
+          }),
       m_cpuContext(
           R5900Context::InitializationProfile::PostBiosElf)
 {
@@ -1425,6 +1434,10 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         throw std::invalid_argument(
             "unsupported GS execution mode");
     }
+
+    m_vu1Executor =
+        std::make_unique<InlineVu1Executor>(
+            m_vu1CommandProcessor);
 
     m_memory.installPostBiosTlbState();
     m_hostPresentationUploadState =
@@ -4994,7 +5007,9 @@ bool PS2Runtime::syncCoreSubsystems()
         return false;
     }
 
-    if (m_boundRdram == rdram && m_boundGSVram == gsVram)
+    if (m_boundRdram == rdram && m_boundGSVram == gsVram &&
+        m_vu1CommandProcessor.codeGeneration() ==
+            m_memory.getVU1CodeGeneration())
     {
         return true;
     }
@@ -5003,6 +5018,10 @@ bool PS2Runtime::syncCoreSubsystems()
         gsVram,
         static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
         m_gsAsyncEnabled ? nullptr : &m_memory.gs());
+    m_vu1CommandProcessor.bindMemory(
+        m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+        m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+        m_memory.getVU1CodeGeneration(), &m_memory);
     m_gifArbiter.reset();
     m_gifArbiter.setProcessBatchFn(
         [this](GifArbiterDrainBatch batch)
@@ -5055,10 +5074,33 @@ bool PS2Runtime::syncCoreSubsystems()
         {
             cancelVif0VuFinishEvent();
         });
-    m_memory.setVu1MscalCallback(
-        [this](uint32_t startPC, uint32_t top, uint32_t itop)
+    m_memory.setVu1CommandCallback(
+        [this](Vu1CommandPayload payload)
         {
-            startVU1FromVif(startPC, top, itop);
+            return submitVu1Command(
+                std::move(payload), currentEeTick().raw(),
+                m_vu1ExecutionTiming.generation);
+        });
+    m_memory.setVu1DecodedUnpackCallback(
+        [this](Vu1DecodedUnpackCommand command)
+        {
+            return m_vu1Executor->submitDecodedUnpack(
+                std::move(command), currentEeTick().raw(),
+                m_vu1ExecutionTiming.generation);
+        });
+    m_memory.setVu1VifStateUpdateCallback(
+        [this](Vu1VifStateUpdateCommand command)
+        {
+            return m_vu1Executor->submitVifStateUpdate(
+                command, currentEeTick().raw(),
+                m_vu1ExecutionTiming.generation);
+        });
+    m_memory.setVu1MscalCallback(
+        [this](uint32_t startPC, uint32_t top,
+               uint32_t itop, bool flushBeforeStart)
+        {
+            startVU1FromVif(
+                startPC, top, itop, flushBeforeStart);
         });
     m_memory.setVu1MscntCallback(
         [this](uint32_t top, uint32_t itop)
@@ -5077,7 +5119,7 @@ bool PS2Runtime::syncCoreSubsystems()
         });
     resetIop();
     m_vu0.reset();
-    m_vu1.reset();
+    (void)submitVu1Command(Vu1ResetCommand{});
     resetEeTimingUnlocked(&m_cpuContext);
     m_vu0InvocationSequence.store(0u, std::memory_order_relaxed);
     m_vu0CurrentInvocation.store(0u, std::memory_order_relaxed);
@@ -6090,14 +6132,74 @@ void PS2Runtime::cancelVU1Execution(bool resetInterpreter)
     m_vu1ExecutionTiming.lastAdvancedTick = currentEeTick();
     m_vu1ExecutionTiming.totalAdvancedCycles = 0u;
     if (resetInterpreter)
-        m_vu1.reset();
+        (void)submitVu1Command(Vu1ResetCommand{});
     m_memory.cancelVIF1VuWait();
     m_memory.finishVif1DmaTrace();
     setVU1BusyFlag(nullptr, false);
 }
 
+Vu1CommandResult PS2Runtime::submitVu1Command(
+    Vu1CommandPayload payload,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    if (!m_vu1Executor)
+    {
+        throw std::runtime_error(
+            "VU1 command executor is unavailable");
+    }
+    Vu1CommandResult result = m_vu1Executor->submit(
+        std::move(payload), guestTick, publicationToken);
+    if (result.disposition !=
+        Vu1CommandDisposition::Completed)
+    {
+        throw std::runtime_error(
+            std::string("VU1 command rejected: ") +
+            vu1CommandTypeName(result.digest.type));
+    }
+    return result;
+}
+
+Vu1CommandResult PS2Runtime::submitVu1AdvanceSlice(
+    Vu1AdvanceSliceCommand command,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    if (!m_vu1Executor)
+    {
+        throw std::runtime_error(
+            "VU1 command executor is unavailable");
+    }
+    Vu1CommandResult result =
+        m_vu1Executor->submitAdvanceSlice(
+            command, guestTick, publicationToken);
+    if (result.disposition !=
+        Vu1CommandDisposition::Completed)
+    {
+        throw std::runtime_error(
+            std::string("VU1 command rejected: ") +
+            vu1CommandTypeName(result.digest.type));
+    }
+    return result;
+}
+
+void PS2Runtime::publishVu1SliceEffects(
+    const Vu1SliceResult &slice)
+{
+    for (const Vu1Path1Packet &packet : slice.path1Packets)
+    {
+        if (packet.bytes.empty())
+            continue;
+        m_memory.submitGifPacket(
+            GifPathId::Path1,
+            packet.bytes.data(),
+            static_cast<uint32_t>(packet.bytes.size()));
+    }
+}
+
 void PS2Runtime::startVU1FromVif(
-    uint32_t startPC, uint32_t top, uint32_t itop)
+    uint32_t startPC, uint32_t top, uint32_t itop,
+    bool flushBeforeStart)
 {
     const ps2x::timing::EeTick startTick =
         commitEeContextProgress(m_boundEeContext);
@@ -6111,7 +6213,20 @@ void PS2Runtime::startVU1FromVif(
         ++m_vu1ExecutionTiming.generation;
     m_vu1ExecutionTiming.lastAdvancedTick = startTick;
     m_vu1ExecutionTiming.totalAdvancedCycles = 0u;
-    m_vu1.start(startPC, top, itop, &m_memory);
+    if (flushBeforeStart)
+    {
+        (void)submitVu1Command(
+            Vu1MscalfCommand{startPC, top, itop},
+            startTick.raw(),
+            m_vu1ExecutionTiming.generation);
+    }
+    else
+    {
+        (void)submitVu1Command(
+            Vu1MscalCommand{startPC, top, itop},
+            startTick.raw(),
+            m_vu1ExecutionTiming.generation);
+    }
     setVU1BusyFlag(nullptr, true);
     scheduleVU1Event(
         ps2x::timing::saturatingAdd(
@@ -6135,7 +6250,10 @@ void PS2Runtime::resumeVU1FromVif(
         ++m_vu1ExecutionTiming.generation;
     m_vu1ExecutionTiming.lastAdvancedTick = startTick;
     m_vu1ExecutionTiming.totalAdvancedCycles = 0u;
-    m_vu1.resumeState(top, itop, &m_memory);
+    (void)submitVu1Command(
+        Vu1MscntCommand{top, itop},
+        startTick.raw(),
+        m_vu1ExecutionTiming.generation);
     setVU1BusyFlag(nullptr, true);
     scheduleVU1Event(
         ps2x::timing::saturatingAdd(
@@ -6187,11 +6305,23 @@ void PS2Runtime::serviceVU1AtEvent(
         return;
     }
 
-    const VuRunResult advance =
-        m_vu1.advance(
-            m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-            m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-            m_gs, &m_memory, cycleBudget);
+    const Vu1CommandResult commandResult =
+        submitVu1AdvanceSlice(
+            Vu1AdvanceSliceCommand{
+                .maximumCycles = cycleBudget,
+            },
+            service.serviceTick.raw(),
+            service.generation);
+    const auto *const slice =
+        std::get_if<Vu1SliceResult>(
+            &commandResult.payload);
+    if (!slice)
+    {
+        throw std::runtime_error(
+            "VU1 advance command returned no slice result");
+    }
+    publishVu1SliceEffects(*slice);
+    const VuRunResult &advance = slice->run;
     m_vu1ExecutionTiming.totalAdvancedCycles +=
         advance.executedCycles;
 

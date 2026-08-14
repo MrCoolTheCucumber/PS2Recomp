@@ -168,7 +168,9 @@ struct Vu1Snapshot
 
 struct Vu1RestoreCommand
 {
-    Vu1Snapshot snapshot{};
+    // Snapshot payloads are cold and large. Box them so every hot command
+    // record remains a compact, bounded queue envelope.
+    std::shared_ptr<const Vu1Snapshot> snapshot;
 };
 
 struct Vu1BarrierCommand
@@ -231,15 +233,19 @@ struct Vu1SliceResult
 {
     VuRunResult run{};
     std::vector<Vu1Path1Packet> path1Packets;
-    std::optional<VuExecutionState> state;
+    // State capture is diagnostic-only. Keeping it out of the inline result
+    // envelope avoids moving a full architectural state on every slice.
+    std::unique_ptr<VuExecutionState> state;
     uint64_t architecturalStateHash = 0u;
     bool vifCanResume = false;
-    std::string fault;
+    // Fault details are cold. Keep their string storage and object footprint
+    // out of every scheduled slice result.
+    std::unique_ptr<std::string> fault;
 };
 
 struct Vu1SnapshotResult
 {
-    Vu1Snapshot snapshot{};
+    std::shared_ptr<const Vu1Snapshot> snapshot;
     uint64_t architecturalStateHash = 0u;
 };
 
@@ -248,11 +254,17 @@ struct Vu1BarrierResult
     uint64_t architecturalStateHash = 0u;
 };
 
+struct Vu1VifStateResult
+{
+    Vu1VifState state{};
+};
+
 using Vu1CommandResultPayload = std::variant<
     Vu1NoResult,
     Vu1SliceResult,
     Vu1SnapshotResult,
-    Vu1BarrierResult>;
+    Vu1BarrierResult,
+    Vu1VifStateResult>;
 
 enum class Vu1CommandDisposition : uint8_t
 {
@@ -270,6 +282,7 @@ struct Vu1CommandResult
     Vu1CommandDisposition disposition =
         Vu1CommandDisposition::Completed;
     Vu1CommandDigest digest{};
+    uint64_t codeGeneration = 0u;
     Vu1CommandResultPayload payload = Vu1NoResult{};
 };
 
@@ -289,6 +302,11 @@ struct Vu1CommandResult
     std::span<const uint8_t> dataMemory,
     const Vu1VifState &vif,
     uint64_t codeGeneration) noexcept;
+[[nodiscard]] bool applyVu1DecodedUnpack(
+    const Vu1DecodedUnpackCommand &command,
+    Vu1VifState &vif,
+    uint8_t *dataMemory,
+    uint32_t dataMemorySize);
 
 struct Vu1CommandProcessorConfiguration
 {
@@ -314,6 +332,15 @@ public:
 
     [[nodiscard]] Vu1CommandResult process(
         Vu1Command command);
+    [[nodiscard]] Vu1CommandResult processDecodedUnpack(
+        Vu1WorkIdentity identity,
+        const Vu1DecodedUnpackCommand &command);
+    [[nodiscard]] Vu1CommandResult processVifStateUpdate(
+        Vu1WorkIdentity identity,
+        const Vu1VifStateUpdateCommand &command);
+    [[nodiscard]] Vu1CommandResult processAdvanceSlice(
+        Vu1WorkIdentity identity,
+        const Vu1AdvanceSliceCommand &command);
     [[nodiscard]] uint64_t generation() const noexcept
     {
         return m_generation;
@@ -370,6 +397,8 @@ private:
     [[nodiscard]] Vu1CommandResultPayload apply(
         const Vu1CommandPayload &payload,
         Vu1CommandDisposition &disposition);
+    [[nodiscard]] Vu1SliceResult advanceSlice(
+        const Vu1AdvanceSliceCommand &command);
 
     VuUnit &m_unit;
     Vu1CommandProcessorConfiguration m_configuration{};
@@ -393,6 +422,22 @@ public:
         Vu1CommandPayload payload,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u) = 0;
+    // Inline execution can avoid constructing the generic variant envelope
+    // for the event scheduler's dominant command. A queued executor inherits
+    // the ordered generic fallback unless it provides an equivalent fast
+    // path; both routes retain the same command and result types.
+    [[nodiscard]] virtual Vu1CommandResult submitAdvanceSlice(
+        Vu1AdvanceSliceCommand command,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+    [[nodiscard]] virtual Vu1CommandResult submitDecodedUnpack(
+        Vu1DecodedUnpackCommand command,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+    [[nodiscard]] virtual Vu1CommandResult submitVifStateUpdate(
+        Vu1VifStateUpdateCommand command,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
     [[nodiscard]] virtual uint64_t generation() const noexcept = 0;
 };
 
@@ -403,6 +448,18 @@ public:
 
     [[nodiscard]] Vu1CommandResult submit(
         Vu1CommandPayload payload,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u) override;
+    [[nodiscard]] Vu1CommandResult submitAdvanceSlice(
+        Vu1AdvanceSliceCommand command,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u) override;
+    [[nodiscard]] Vu1CommandResult submitDecodedUnpack(
+        Vu1DecodedUnpackCommand command,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u) override;
+    [[nodiscard]] Vu1CommandResult submitVifStateUpdate(
+        Vu1VifStateUpdateCommand command,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u) override;
     [[nodiscard]] uint64_t generation() const noexcept override

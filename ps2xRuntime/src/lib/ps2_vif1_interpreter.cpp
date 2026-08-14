@@ -809,6 +809,7 @@ PS2Memory::processVif1Stream()
         else if (opcode == VIF_STCYCL)
         {
             vif1_regs.cycle = imm;
+            submitVu1VifStateUpdate();
             continue;
         }
         else if (opcode == VIF_OFFSET)
@@ -818,6 +819,7 @@ PS2Memory::processVif1Stream()
             vif1_regs.ofst = imm & 0x3FFu;
             vif1_regs.tops = vif1_regs.base & 0x3FFu;
             vif1_regs.stat &= ~(1u << 7); // clear DBF
+            submitVu1VifStateUpdate();
             continue;
         }
         else if (opcode == VIF_BASE)
@@ -835,6 +837,7 @@ PS2Memory::processVif1Stream()
         else if (opcode == VIF_STMOD)
         {
             vif1_regs.mode = imm & 3u;
+            submitVu1VifStateUpdate();
             continue;
         }
         else if (opcode == VIF_MSKPATH3)
@@ -878,9 +881,14 @@ PS2Memory::processVif1Stream()
             else
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
+            submitVu1VifStateUpdate();
 
             if (m_vu1MscalCallback)
-                m_vu1MscalCallback(startPC, runTop, runItop);
+            {
+                m_vu1MscalCallback(
+                    startPC, runTop, runItop,
+                    opcode == VIF_MSCALF);
+            }
             continue;
         }
         else if (opcode == VIF_MSCNT)
@@ -896,6 +904,7 @@ PS2Memory::processVif1Stream()
             else
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
+            submitVu1VifStateUpdate();
 
             if (m_vu1MscntCallback)
                 m_vu1MscntCallback(runTop, runItop);
@@ -913,6 +922,7 @@ PS2Memory::processVif1Stream()
             std::memcpy(&maskValue, data + pos, sizeof(maskValue));
             vif1_regs.mask = maskValue;
             pos += 4;
+            submitVu1VifStateUpdate();
             continue;
         }
         else if (opcode == VIF_STROW)
@@ -925,6 +935,7 @@ PS2Memory::processVif1Stream()
             }
             std::memcpy(vif1_regs.row, data + pos, 16);
             pos += 16;
+            submitVu1VifStateUpdate();
             continue;
         }
         else if (opcode == VIF_STCOL)
@@ -937,6 +948,7 @@ PS2Memory::processVif1Stream()
             }
             std::memcpy(vif1_regs.col, data + pos, 16);
             pos += 16;
+            submitVu1VifStateUpdate();
             continue;
         }
         else if (opcode == VIF_MPG)
@@ -965,10 +977,15 @@ PS2Memory::processVif1Stream()
                         destAddr, data + pos, mpgBytes);
                 const uint64_t generationBefore =
                     profileUpload ? getVU1CodeGeneration() : 0u;
-                copyWrappedMicroMemory(
-                    m_vu1Code, PS2_VU1_CODE_SIZE,
-                    destAddr, data + pos, mpgBytes);
-                markVU1CodeModified();
+                if (!writeVu1OwnerMemory(
+                        m_vu1Code, destAddr,
+                        data + pos, mpgBytes, true))
+                {
+                    copyWrappedMicroMemory(
+                        m_vu1Code, PS2_VU1_CODE_SIZE,
+                        destAddr, data + pos, mpgBytes);
+                    markVU1CodeModified();
+                }
                 if (profileUpload)
                 {
                     recordVu1WorkloadProfileCodeUpload(
@@ -1088,6 +1105,31 @@ PS2Memory::processVif1Stream()
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
+
+            if (m_vu1Data && totalBytes > 0u)
+            {
+                Vu1DecodedUnpackCommand unpack{
+                    .immediate = imm,
+                    .vectorLength = vl,
+                    .componentCount =
+                        static_cast<uint8_t>(components),
+                    .writeVectorCount = static_cast<uint16_t>(
+                        writeVectorCount),
+                    .sourceVectorCount = static_cast<uint16_t>(
+                        sourceVectorCount),
+                    .sourceWordAlignment = static_cast<uint8_t>(
+                        sourceWordAlignment),
+                    .maskEnabled = maskEnable,
+                    .zeroExtend = zeroExtend,
+                    .bytes = std::vector<uint8_t>(
+                        data + pos, data + pos + totalBytes),
+                };
+                if (submitVu1OwnerCommand(std::move(unpack)))
+                {
+                    pos += totalBytes;
+                    continue;
+                }
+            }
 
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {

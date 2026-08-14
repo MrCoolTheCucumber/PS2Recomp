@@ -44,6 +44,7 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_vu_clip.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_command_stream.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
 #include "ps2x/iop/iop_types.h"
@@ -97,6 +98,8 @@ struct PS2RuntimeConfiguration
     VuBackendKind vu1Backend = VuBackendKind::Auto;
     bool vu0NativeInstrumentation = false;
     bool vu1NativeInstrumentation = false;
+    bool captureVu1CommandDigests = false;
+    bool captureVu1ArchitecturalStateHashes = false;
     bool useVuBackendEnvironment = true;
     bool eeThreadDiagnostics = false;
     bool useEeThreadDiagnosticsEnvironment = true;
@@ -2136,6 +2139,14 @@ public:
     inline const VuUnit &vu0() const { return m_vu0; }
     inline VuUnit &vu1() { return m_vu1; }
     inline const VuUnit &vu1() const { return m_vu1; }
+    inline Vu1CommandProcessor &vu1CommandProcessor()
+    {
+        return m_vu1CommandProcessor;
+    }
+    inline const Vu1CommandProcessor &vu1CommandProcessor() const
+    {
+        return m_vu1CommandProcessor;
+    }
 
     inline PS2AudioBackend &audioBackend() { return m_audioBackend; }
     inline const PS2AudioBackend &audioBackend() const { return m_audioBackend; }
@@ -2350,7 +2361,8 @@ private:
         ps2x::timing::EeTick deadline) noexcept;
     void cancelVif0VuFinishEvent() noexcept;
     void startVU1FromVif(
-        uint32_t startPC, uint32_t top, uint32_t itop);
+        uint32_t startPC, uint32_t top, uint32_t itop,
+        bool flushBeforeStart);
     void resumeVU1FromVif(uint32_t top, uint32_t itop);
     void serviceVU1AtEvent(
         R5900Context *ctx,
@@ -2358,6 +2370,16 @@ private:
     void scheduleVU1Event(
         ps2x::timing::EeTick deadline) noexcept;
     void cancelVU1Execution(bool resetInterpreter);
+    [[nodiscard]] Vu1CommandResult submitVu1Command(
+        Vu1CommandPayload payload,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+    [[nodiscard]] Vu1CommandResult submitVu1AdvanceSlice(
+        Vu1AdvanceSliceCommand command,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+    void publishVu1SliceEffects(
+        const Vu1SliceResult &slice);
     bool scheduleVif1DmaFromMemory(
         uint32_t delayEeCycles);
     void cancelVif1DmaEvent() noexcept;
@@ -2583,6 +2605,8 @@ private:
     IoPaths m_ioPaths;
     VuUnit m_vu0;
     VuUnit m_vu1;
+    Vu1CommandProcessor m_vu1CommandProcessor;
+    std::unique_ptr<Vu1CommandExecutor> m_vu1Executor;
     ps2x::timing::Cop0Timing m_cop0Timing;
     static constexpr size_t kEeBranchHistoryEntries = 4096u;
     std::array<uint32_t, kEeBranchHistoryEntries>

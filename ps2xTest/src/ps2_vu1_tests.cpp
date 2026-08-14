@@ -4838,7 +4838,7 @@ void register_ps2_vu1_tests()
             t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
 
             VuUnit vu1;
-            fx.mem.setVu1MscalCallback([&](uint32_t startPC, uint32_t top, uint32_t itop)
+            fx.mem.setVu1MscalCallback([&](uint32_t startPC, uint32_t top, uint32_t itop, bool)
             {
                 vu1.execute(fx.code,
                             PS2_VU1_CODE_SIZE,
@@ -5547,7 +5547,7 @@ void register_ps2_vu1_tests()
             }
 
             VuUnit vu1;
-            mem.setVu1MscalCallback([&](uint32_t startPC, uint32_t top, uint32_t itop)
+            mem.setVu1MscalCallback([&](uint32_t startPC, uint32_t top, uint32_t itop, bool)
             {
                 vu1.execute(vuCode,
                             PS2_VU1_CODE_SIZE,

@@ -5518,7 +5518,7 @@ void register_ps2_runtime_expansion_tests()
             uint32_t callbackTop = 0xFFFFFFFFu;
             uint32_t callbackItop = 0xFFFFFFFFu;
             uint32_t callbackCount = 0u;
-            mem.setVu1MscalCallback([&](uint32_t startPC, uint32_t top, uint32_t itop)
+            mem.setVu1MscalCallback([&](uint32_t startPC, uint32_t top, uint32_t itop, bool)
             {
                 callbackPc = startPC;
                 callbackTop = top;
@@ -5747,7 +5747,7 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VU1 publication fixture subsystems should bind");
 
-            bool callbackSawVuActive = false;
+            bool callbackSawVuBusy = false;
             bool callbackSawVifWait = false;
             bool callbackSawDeferredCommand = false;
             size_t packetCount = 0u;
@@ -5755,7 +5755,9 @@ void register_ps2_runtime_expansion_tests()
                 [&](const uint8_t *, uint32_t)
                 {
                     ++packetCount;
-                    callbackSawVuActive = runtime.vu1().isActive();
+                    callbackSawVuBusy =
+                        (runtime.cpu().vu0_vpu_stat &
+                         (1u << 8u)) != 0u;
                     callbackSawVifWait =
                         runtime.memory().vif1WaitingForVu() &&
                         (runtime.memory().vif1_regs.stat &
@@ -5801,8 +5803,8 @@ void register_ps2_runtime_expansion_tests()
 
             t.Equals(packetCount, size_t{1u},
                      "the scheduled VU1 slice should publish one PATH1 packet");
-            t.IsTrue(callbackSawVuActive,
-                     "XGKICK should publish from inside VU1 execution");
+            t.IsTrue(callbackSawVuBusy,
+                     "XGKICK should publish before the EE-visible VU1 busy transition");
             t.IsTrue(callbackSawVifWait,
                      "XGKICK should publish before VIF1 wait state is cleared");
             t.IsTrue(callbackSawDeferredCommand,

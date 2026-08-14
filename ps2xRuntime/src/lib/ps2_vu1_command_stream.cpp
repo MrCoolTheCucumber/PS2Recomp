@@ -1,9 +1,12 @@
 #include "runtime/ps2_vu1_command_stream.h"
+#include "runtime/ps2_build_config.h"
 
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <immintrin.h>
 #include <limits>
+#include <smmintrin.h>
 #include <stdexcept>
 #include <type_traits>
 
@@ -11,6 +14,32 @@ namespace
 {
     constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ull;
     constexpr uint64_t kFnvPrime = 1099511628211ull;
+
+    class Vu1SliceSideEffectSink final : public IVuSideEffectSink
+    {
+    public:
+        explicit Vu1SliceSideEffectSink(
+            std::vector<Vu1Path1Packet> &packets)
+            : m_packets(packets)
+        {
+        }
+
+        void submitPath1Packet(
+            const uint8_t *data,
+            uint32_t sizeBytes) override
+        {
+            Vu1Path1Packet &packet =
+                m_packets.emplace_back();
+            if (sizeBytes != 0u)
+            {
+                packet.bytes.assign(
+                    data, data + sizeBytes);
+            }
+        }
+
+    private:
+        std::vector<Vu1Path1Packet> &m_packets;
+    };
 
     void hashBytes(
         uint64_t &hash, const void *data, size_t size) noexcept
@@ -183,7 +212,102 @@ namespace
         return (bits + 7u) / 8u;
     }
 
-    bool applyDecodedUnpack(
+    void copyWrappedBytes(
+        uint8_t *destination, uint32_t destinationSize,
+        uint32_t destinationOffset, const uint8_t *source,
+        uint32_t sizeBytes)
+    {
+        while (sizeBytes != 0u)
+        {
+            const uint32_t chunk = std::min(
+                sizeBytes, destinationSize - destinationOffset);
+            std::memcpy(
+                destination + destinationOffset, source, chunk);
+            source += chunk;
+            sizeBytes -= chunk;
+            destinationOffset = 0u;
+        }
+    }
+
+    bool tryUnpackContiguousV4(
+        uint8_t *destination, uint32_t destinationSize,
+        uint32_t destinationVector, const uint8_t *source,
+        uint32_t vectorCount, uint8_t componentWidth,
+        bool zeroExtend, uint32_t mode, const uint32_t *row)
+    {
+        if (!destination || !source || !row ||
+            destinationSize < 16u ||
+            (destinationSize & 15u) != 0u ||
+            componentWidth > 2u || mode > 1u)
+        {
+            return false;
+        }
+
+        const uint32_t destinationVectors = destinationSize / 16u;
+        destinationVector %= destinationVectors;
+        if (componentWidth == 0u && mode != 1u)
+        {
+            copyWrappedBytes(
+                destination, destinationSize,
+                destinationVector * 16u, source,
+                vectorCount * 16u);
+            return true;
+        }
+
+        const uint32_t sourceStride =
+            componentWidth == 0u ? 16u :
+            componentWidth == 1u ? 8u : 4u;
+        const __m128i rowValues = _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(row));
+        uint32_t remaining = vectorCount;
+        while (remaining != 0u)
+        {
+            const uint32_t chunk = std::min(
+                remaining,
+                destinationVectors - destinationVector);
+            uint8_t *output =
+                destination + destinationVector * 16u;
+            for (uint32_t index = 0u; index < chunk; ++index)
+            {
+                __m128i value{};
+                if (componentWidth == 0u)
+                {
+                    value = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i *>(source));
+                }
+                else if (componentWidth == 1u)
+                {
+                    const __m128i packed = _mm_loadl_epi64(
+                        reinterpret_cast<const __m128i *>(source));
+                    value = zeroExtend
+                        ? _mm_cvtepu16_epi32(packed)
+                        : _mm_cvtepi16_epi32(packed);
+                }
+                else
+                {
+                    uint32_t packed = 0u;
+                    std::memcpy(&packed, source, sizeof(packed));
+                    const __m128i bytes = _mm_cvtsi32_si128(
+                        static_cast<int32_t>(packed));
+                    value = zeroExtend
+                        ? _mm_cvtepu8_epi32(bytes)
+                        : _mm_cvtepi8_epi32(bytes);
+                }
+
+                if (mode == 1u)
+                    value = _mm_add_epi32(value, rowValues);
+                _mm_storeu_si128(
+                    reinterpret_cast<__m128i *>(output), value);
+                source += sourceStride;
+                output += 16u;
+            }
+            remaining -= chunk;
+            destinationVector = 0u;
+        }
+        return true;
+    }
+
+    bool applyVu1DecodedUnpackImpl(
         const Vu1DecodedUnpackCommand &command,
         Vu1VifState &vif,
         uint8_t *dataMemory,
@@ -240,6 +364,19 @@ namespace
 
         const uint8_t *const sourceBase = command.bytes.data();
         const uint32_t mode = vif.mode & 3u;
+        if (!command.maskEnabled &&
+            command.componentCount == 4u &&
+            command.vectorLength <= 2u &&
+            cl == wl && mode <= 1u &&
+            tryUnpackContiguousV4(
+                dataMemory, dataMemorySize, vuAddress,
+                sourceBase, command.writeVectorCount,
+                command.vectorLength, command.zeroExtend,
+                mode, vif.row.data()))
+        {
+            return true;
+        }
+
         uint32_t sourceIndex = 0u;
         for (uint32_t writeIndex = 0u;
              writeIndex < command.writeVectorCount;
@@ -541,6 +678,11 @@ namespace
                 {
                     return value.maximumCycles != 0u;
                 }
+                else if constexpr (
+                    std::is_same_v<T, Vu1RestoreCommand>)
+                {
+                    return static_cast<bool>(value.snapshot);
+                }
                 else
                 {
                     return true;
@@ -548,6 +690,16 @@ namespace
             },
             payload);
     }
+}
+
+bool applyVu1DecodedUnpack(
+    const Vu1DecodedUnpackCommand &command,
+    Vu1VifState &vif,
+    uint8_t *dataMemory,
+    uint32_t dataMemorySize)
+{
+    return applyVu1DecodedUnpackImpl(
+        command, vif, dataMemory, dataMemorySize);
 }
 
 const char *vu1CommandTypeName(Vu1CommandType type) noexcept
@@ -676,8 +828,10 @@ uint64_t vu1CommandPayloadSize(
             else if constexpr (std::is_same_v<T, Vu1RestoreCommand>)
             {
                 return sizeof(uint64_t) +
-                       value.snapshot.microMemory.size() +
-                       value.snapshot.dataMemory.size();
+                       (value.snapshot
+                            ? value.snapshot->microMemory.size() +
+                                  value.snapshot->dataMemory.size()
+                            : 0u);
             }
             else
             {
@@ -757,7 +911,8 @@ uint64_t vu1CommandPayloadHash(
             }
             else if constexpr (std::is_same_v<T, Vu1RestoreCommand>)
             {
-                hashScalar(hash, snapshotHash(value.snapshot));
+                if (value.snapshot)
+                    hashScalar(hash, snapshotHash(*value.snapshot));
             }
         },
         payload);
@@ -910,6 +1065,55 @@ uint64_t Vu1CommandProcessor::stateHash() const noexcept
         m_vifState, codeGeneration());
 }
 
+Vu1SliceResult Vu1CommandProcessor::advanceSlice(
+    const Vu1AdvanceSliceCommand &command)
+{
+    Vu1SliceResult slice{};
+    Vu1SliceSideEffectSink effects(slice.path1Packets);
+    VuExecutionContext context{
+        .state = m_unit.state(),
+        .code = m_microMemory,
+        .codeSize = m_microMemorySize,
+        .data = m_dataMemory,
+        .dataSize = m_dataMemorySize,
+        .sideEffects = effects,
+        .codeUnit = VuUnitId::Vu1,
+        .memoryIdentity = reinterpret_cast<uintptr_t>(this),
+        .codeIdentity = reinterpret_cast<uintptr_t>(m_microMemory),
+        .codeGeneration = codeGeneration(),
+        .trackedCode = true,
+        // Inline mode can use the already-narrow diagnostics observer
+        // directly. Avoid an adapter hop on every native block generation
+        // check; a standalone or future owner-local processor still supplies
+        // its own tracked code generation when no recorder is bound.
+        .observer = m_diagnosticsObserver
+                        ? m_diagnosticsObserver
+                        : this,
+        .enableInstrumentation =
+            PS2X_ENABLE_RUNTIME_DIAGNOSTICS != 0,
+        .enableNativeInstrumentation =
+            m_unit.nativeInstrumentationEnabled(),
+        .enableProgressAccounting =
+            PS2X_ENABLE_RUNTIME_DIAGNOSTICS != 0,
+    };
+    slice.run = m_unit.advance(
+        context, command.maximumCycles);
+    if (command.captureState)
+    {
+        slice.state =
+            std::make_unique<VuExecutionState>(
+                m_unit.state());
+    }
+    slice.architecturalStateHash = stateHash();
+    slice.vifCanResume = !m_unit.isActive();
+    if (slice.run.reason == VuExitReason::Fault)
+    {
+        slice.fault = std::make_unique<std::string>(
+            "VU1 backend reported a fault");
+    }
+    return slice;
+}
+
 Vu1CommandResultPayload Vu1CommandProcessor::apply(
     const Vu1CommandPayload &payload,
     Vu1CommandDisposition &disposition)
@@ -950,18 +1154,18 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
             }
             else if constexpr (std::is_same_v<T, Vu1DecodedUnpackCommand>)
             {
-                if (!applyDecodedUnpack(
+                if (!applyVu1DecodedUnpack(
                         value, m_vifState,
                         m_dataMemory, m_dataMemorySize))
                 {
                     disposition = Vu1CommandDisposition::Malformed;
                 }
-                return Vu1NoResult{};
+                return Vu1VifStateResult{m_vifState};
             }
             else if constexpr (std::is_same_v<T, Vu1VifStateUpdateCommand>)
             {
                 m_vifState = value.state;
-                return Vu1NoResult{};
+                return Vu1VifStateResult{m_vifState};
             }
             else if constexpr (std::is_same_v<T, Vu1RegisterWriteCommand>)
             {
@@ -1037,59 +1241,33 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
             else if constexpr (std::is_same_v<T, Vu1MscalCommand>)
             {
                 m_unit.start(
-                    value.startPc, value.top, value.itop, this);
+                    value.startPc, value.top, value.itop,
+                    m_diagnosticsObserver
+                        ? m_diagnosticsObserver
+                        : this);
                 return Vu1NoResult{};
             }
             else if constexpr (std::is_same_v<T, Vu1MscalfCommand>)
             {
                 m_unit.start(
-                    value.startPc, value.top, value.itop, this);
+                    value.startPc, value.top, value.itop,
+                    m_diagnosticsObserver
+                        ? m_diagnosticsObserver
+                        : this);
                 return Vu1NoResult{};
             }
             else if constexpr (std::is_same_v<T, Vu1MscntCommand>)
             {
-                m_unit.resumeState(value.top, value.itop, this);
+                m_unit.resumeState(
+                    value.top, value.itop,
+                    m_diagnosticsObserver
+                        ? m_diagnosticsObserver
+                        : this);
                 return Vu1NoResult{};
             }
             else if constexpr (std::is_same_v<T, Vu1AdvanceSliceCommand>)
             {
-                VuTransactionalSideEffectSink effects;
-                VuExecutionContext context{
-                    .state = m_unit.state(),
-                    .code = m_microMemory,
-                    .codeSize = m_microMemorySize,
-                    .data = m_dataMemory,
-                    .dataSize = m_dataMemorySize,
-                    .sideEffects = effects,
-                    .codeUnit = VuUnitId::Vu1,
-                    .memoryIdentity = reinterpret_cast<uintptr_t>(this),
-                    .codeIdentity = reinterpret_cast<uintptr_t>(m_microMemory),
-                    .codeGeneration = codeGeneration(),
-                    .trackedCode = true,
-                    .observer = this,
-                    .enableInstrumentation = true,
-                    .enableNativeInstrumentation =
-                        m_unit.nativeInstrumentationEnabled(),
-                    .enableProgressAccounting = true,
-                };
-                Vu1SliceResult slice{
-                    .run = m_unit.advance(
-                        context, value.maximumCycles),
-                };
-                for (const std::vector<uint8_t> &packet :
-                     effects.path1Packets())
-                {
-                    slice.path1Packets.push_back({
-                        .bytes = packet,
-                    });
-                }
-                if (value.captureState)
-                    slice.state = m_unit.state();
-                slice.architecturalStateHash = stateHash();
-                slice.vifCanResume = !m_unit.isActive();
-                if (slice.run.reason == VuExitReason::Fault)
-                    slice.fault = "VU1 backend reported a fault";
-                return slice;
+                return advanceSlice(value);
             }
             else if constexpr (std::is_same_v<T, Vu1ResetCommand>)
             {
@@ -1115,36 +1293,40 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
             else if constexpr (std::is_same_v<T, Vu1SnapshotCommand>)
             {
                 Vu1SnapshotResult result{
-                    .snapshot = captureSnapshot(),
+                    .snapshot =
+                        std::make_shared<const Vu1Snapshot>(
+                            captureSnapshot()),
                 };
                 result.architecturalStateHash =
                     m_configuration.captureArchitecturalStateHashes
-                        ? snapshotHash(result.snapshot)
+                        ? snapshotHash(*result.snapshot)
                         : 0u;
                 return result;
             }
             else if constexpr (std::is_same_v<T, Vu1RestoreCommand>)
             {
-                if (value.snapshot.microMemory.size() !=
+                if (!value.snapshot ||
+                    value.snapshot->microMemory.size() !=
                         m_microMemorySize ||
-                    value.snapshot.dataMemory.size() !=
+                    value.snapshot->dataMemory.size() !=
                         m_dataMemorySize)
                 {
                     disposition = Vu1CommandDisposition::Malformed;
                     return Vu1NoResult{};
                 }
-                m_unit.state() = value.snapshot.state;
+                const Vu1Snapshot &snapshot = *value.snapshot;
+                m_unit.state() = snapshot.state;
                 std::memcpy(
                     m_microMemory,
-                    value.snapshot.microMemory.data(),
+                    snapshot.microMemory.data(),
                     m_microMemorySize);
                 std::memcpy(
                     m_dataMemory,
-                    value.snapshot.dataMemory.data(),
+                    snapshot.dataMemory.data(),
                     m_dataMemorySize);
-                m_vifState = value.snapshot.vif;
+                m_vifState = snapshot.vif;
                 m_codeGeneration.store(
-                    value.snapshot.codeGeneration,
+                    snapshot.codeGeneration,
                     std::memory_order_relaxed);
                 if (m_generation ==
                     std::numeric_limits<uint64_t>::max())
@@ -1174,6 +1356,7 @@ Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
 {
     Vu1CommandResult result{
         .identity = command.identity,
+        .codeGeneration = codeGeneration(),
     };
     if (m_configuration.captureCommandDigests)
         result.digest = vu1CommandDigest(command);
@@ -1206,16 +1389,22 @@ Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
         result.disposition = Vu1CommandDisposition::OutOfOrder;
         return result;
     }
+    const bool requiresBoundMemory =
+        command.type != Vu1CommandType::Reset &&
+        command.type != Vu1CommandType::Barrier &&
+        command.type != Vu1CommandType::Shutdown;
     if (command.type != vu1CommandType(command.payload) ||
         command.payloadSize != vu1CommandPayloadSize(command.payload) ||
         !validPayload(command.payload) ||
-        !m_microMemory || !m_dataMemory)
+        (requiresBoundMemory &&
+         (!m_microMemory || !m_dataMemory)))
     {
         result.disposition = Vu1CommandDisposition::Malformed;
         return result;
     }
 
     result.payload = apply(command.payload, result.disposition);
+    result.codeGeneration = codeGeneration();
     if (result.disposition == Vu1CommandDisposition::Completed)
     {
         if (m_nextSequence ==
@@ -1226,6 +1415,207 @@ Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
         }
         ++m_nextSequence;
     }
+    return result;
+}
+
+Vu1CommandResult Vu1CommandProcessor::processDecodedUnpack(
+    Vu1WorkIdentity identity,
+    const Vu1DecodedUnpackCommand &command)
+{
+    const uint64_t payloadSize =
+        11u + sizeof(uint64_t) + command.bytes.size();
+    Vu1CommandResult result{
+        .identity = identity,
+        .digest = {
+            .sequence = identity.sequence,
+            .generation = identity.generation,
+            .guestTick = identity.guestTick,
+            .type = Vu1CommandType::DecodedUnpack,
+            .payloadSize = payloadSize,
+        },
+        .codeGeneration = codeGeneration(),
+    };
+    if (m_configuration.captureCommandDigests)
+    {
+        const Vu1CommandPayload payload{command};
+        result.digest.payloadHash =
+            vu1CommandPayloadHash(payload);
+    }
+
+    if (m_shutdown)
+    {
+        result.disposition = Vu1CommandDisposition::Shutdown;
+        return result;
+    }
+    if (identity.generation < m_generation)
+    {
+        result.disposition = Vu1CommandDisposition::StaleGeneration;
+        return result;
+    }
+    if (identity.generation > m_generation)
+    {
+        result.disposition = Vu1CommandDisposition::FutureGeneration;
+        return result;
+    }
+    if (identity.sequence != m_nextSequence)
+    {
+        result.disposition = Vu1CommandDisposition::OutOfOrder;
+        return result;
+    }
+    if (command.bytes.empty() ||
+        command.writeVectorCount == 0u ||
+        command.sourceVectorCount == 0u ||
+        !m_microMemory || !m_dataMemory)
+    {
+        result.disposition = Vu1CommandDisposition::Malformed;
+        return result;
+    }
+
+    if (!applyVu1DecodedUnpack(
+            command, m_vifState,
+            m_dataMemory, m_dataMemorySize))
+    {
+        result.disposition = Vu1CommandDisposition::Malformed;
+    }
+    result.payload = Vu1VifStateResult{m_vifState};
+    result.codeGeneration = codeGeneration();
+    if (result.disposition == Vu1CommandDisposition::Completed)
+    {
+        if (m_nextSequence ==
+            std::numeric_limits<uint64_t>::max())
+        {
+            throw std::overflow_error(
+                "VU1 command sequence exhausted");
+        }
+        ++m_nextSequence;
+    }
+    return result;
+}
+
+Vu1CommandResult Vu1CommandProcessor::processVifStateUpdate(
+    Vu1WorkIdentity identity,
+    const Vu1VifStateUpdateCommand &command)
+{
+    constexpr uint64_t payloadSize =
+        12u * sizeof(uint32_t);
+    Vu1CommandResult result{
+        .identity = identity,
+        .digest = {
+            .sequence = identity.sequence,
+            .generation = identity.generation,
+            .guestTick = identity.guestTick,
+            .type = Vu1CommandType::VifStateUpdate,
+            .payloadSize = payloadSize,
+        },
+        .codeGeneration = codeGeneration(),
+    };
+    if (m_configuration.captureCommandDigests)
+    {
+        const Vu1CommandPayload payload{command};
+        result.digest.payloadHash =
+            vu1CommandPayloadHash(payload);
+    }
+
+    if (m_shutdown)
+    {
+        result.disposition = Vu1CommandDisposition::Shutdown;
+        return result;
+    }
+    if (identity.generation < m_generation)
+    {
+        result.disposition = Vu1CommandDisposition::StaleGeneration;
+        return result;
+    }
+    if (identity.generation > m_generation)
+    {
+        result.disposition = Vu1CommandDisposition::FutureGeneration;
+        return result;
+    }
+    if (identity.sequence != m_nextSequence)
+    {
+        result.disposition = Vu1CommandDisposition::OutOfOrder;
+        return result;
+    }
+    if (!m_microMemory || !m_dataMemory)
+    {
+        result.disposition = Vu1CommandDisposition::Malformed;
+        return result;
+    }
+
+    m_vifState = command.state;
+    result.payload = Vu1VifStateResult{m_vifState};
+    result.codeGeneration = codeGeneration();
+    if (m_nextSequence ==
+        std::numeric_limits<uint64_t>::max())
+    {
+        throw std::overflow_error(
+            "VU1 command sequence exhausted");
+    }
+    ++m_nextSequence;
+    return result;
+}
+
+Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
+    Vu1WorkIdentity identity,
+    const Vu1AdvanceSliceCommand &command)
+{
+    constexpr uint64_t payloadSize =
+        sizeof(command.maximumCycles) +
+        sizeof(command.captureState);
+    Vu1CommandResult result{
+        .identity = identity,
+        .digest = {
+            .sequence = identity.sequence,
+            .generation = identity.generation,
+            .guestTick = identity.guestTick,
+            .type = Vu1CommandType::AdvanceSlice,
+            .payloadSize = payloadSize,
+        },
+        .codeGeneration = codeGeneration(),
+    };
+    if (m_configuration.captureCommandDigests)
+    {
+        const Vu1CommandPayload payload{command};
+        result.digest.payloadHash =
+            vu1CommandPayloadHash(payload);
+    }
+
+    if (m_shutdown)
+    {
+        result.disposition = Vu1CommandDisposition::Shutdown;
+        return result;
+    }
+    if (identity.generation < m_generation)
+    {
+        result.disposition = Vu1CommandDisposition::StaleGeneration;
+        return result;
+    }
+    if (identity.generation > m_generation)
+    {
+        result.disposition = Vu1CommandDisposition::FutureGeneration;
+        return result;
+    }
+    if (identity.sequence != m_nextSequence)
+    {
+        result.disposition = Vu1CommandDisposition::OutOfOrder;
+        return result;
+    }
+    if (command.maximumCycles == 0u ||
+        !m_microMemory || !m_dataMemory)
+    {
+        result.disposition = Vu1CommandDisposition::Malformed;
+        return result;
+    }
+
+    result.payload = advanceSlice(command);
+    result.codeGeneration = codeGeneration();
+    if (m_nextSequence ==
+        std::numeric_limits<uint64_t>::max())
+    {
+        throw std::overflow_error(
+            "VU1 command sequence exhausted");
+    }
+    ++m_nextSequence;
     return result;
 }
 
@@ -1335,6 +1725,36 @@ void Vu1CommandProcessor::resetVuWorkloadProfileEpoch()
         m_diagnosticsObserver->resetVuWorkloadProfileEpoch();
 }
 
+Vu1CommandResult Vu1CommandExecutor::submitAdvanceSlice(
+    Vu1AdvanceSliceCommand command,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    return submit(
+        Vu1CommandPayload{command},
+        guestTick, publicationToken);
+}
+
+Vu1CommandResult Vu1CommandExecutor::submitDecodedUnpack(
+    Vu1DecodedUnpackCommand command,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    return submit(
+        Vu1CommandPayload{std::move(command)},
+        guestTick, publicationToken);
+}
+
+Vu1CommandResult Vu1CommandExecutor::submitVifStateUpdate(
+    Vu1VifStateUpdateCommand command,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    return submit(
+        Vu1CommandPayload{command},
+        guestTick, publicationToken);
+}
+
 InlineVu1Executor::InlineVu1Executor(
     Vu1CommandProcessor &processor)
     : m_processor(processor),
@@ -1365,6 +1785,105 @@ Vu1CommandResult InlineVu1Executor::submit(
     };
     Vu1CommandResult result =
         m_processor.process(std::move(command));
+    if (result.disposition == Vu1CommandDisposition::Completed)
+    {
+        if (m_nextSequence ==
+            std::numeric_limits<uint64_t>::max())
+        {
+            m_nextSequence = 0u;
+        }
+        else
+        {
+            ++m_nextSequence;
+        }
+    }
+    return result;
+}
+
+Vu1CommandResult InlineVu1Executor::submitAdvanceSlice(
+    Vu1AdvanceSliceCommand command,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    if (m_nextSequence == 0u)
+    {
+        throw std::overflow_error(
+            "VU1 command sequence exhausted");
+    }
+    const Vu1WorkIdentity identity{
+        .sequence = m_nextSequence,
+        .generation = m_processor.generation(),
+        .guestTick = guestTick,
+        .publicationToken = publicationToken,
+    };
+    Vu1CommandResult result =
+        m_processor.processAdvanceSlice(identity, command);
+    if (result.disposition == Vu1CommandDisposition::Completed)
+    {
+        if (m_nextSequence ==
+            std::numeric_limits<uint64_t>::max())
+        {
+            m_nextSequence = 0u;
+        }
+        else
+        {
+            ++m_nextSequence;
+        }
+    }
+    return result;
+}
+
+Vu1CommandResult InlineVu1Executor::submitDecodedUnpack(
+    Vu1DecodedUnpackCommand command,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    if (m_nextSequence == 0u)
+    {
+        throw std::overflow_error(
+            "VU1 command sequence exhausted");
+    }
+    const Vu1WorkIdentity identity{
+        .sequence = m_nextSequence,
+        .generation = m_processor.generation(),
+        .guestTick = guestTick,
+        .publicationToken = publicationToken,
+    };
+    Vu1CommandResult result =
+        m_processor.processDecodedUnpack(identity, command);
+    if (result.disposition == Vu1CommandDisposition::Completed)
+    {
+        if (m_nextSequence ==
+            std::numeric_limits<uint64_t>::max())
+        {
+            m_nextSequence = 0u;
+        }
+        else
+        {
+            ++m_nextSequence;
+        }
+    }
+    return result;
+}
+
+Vu1CommandResult InlineVu1Executor::submitVifStateUpdate(
+    Vu1VifStateUpdateCommand command,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    if (m_nextSequence == 0u)
+    {
+        throw std::overflow_error(
+            "VU1 command sequence exhausted");
+    }
+    const Vu1WorkIdentity identity{
+        .sequence = m_nextSequence,
+        .generation = m_processor.generation(),
+        .guestTick = guestTick,
+        .publicationToken = publicationToken,
+    };
+    Vu1CommandResult result =
+        m_processor.processVifStateUpdate(identity, command);
     if (result.disposition == Vu1CommandDisposition::Completed)
     {
         if (m_nextSequence ==

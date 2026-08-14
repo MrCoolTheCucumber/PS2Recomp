@@ -450,6 +450,12 @@ public:
         return m_path1Packets;
     }
 
+    [[nodiscard]] std::vector<std::vector<uint8_t>>
+    takePath1Packets()
+    {
+        return std::move(m_path1Packets);
+    }
+
     void clear();
     void commitTo(IVuSideEffectSink &destination) const;
 
