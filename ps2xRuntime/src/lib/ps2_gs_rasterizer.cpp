@@ -1779,7 +1779,11 @@ namespace
 
         const uint32_t hardwareThreads =
             std::max(std::thread::hardware_concurrency(), 1u);
-        uint32_t count = std::min(hardwareThreads, 8u);
+        // The GS owner participates as worker zero. Keep the default pool
+        // compact enough to leave host capacity for EE, Vulkan, and VU owner
+        // work; platforms with a measured benefit can still opt into up to
+        // sixteen participants through the environment override below.
+        uint32_t count = std::min(hardwareThreads, 5u);
         if (const char *text =
                 std::getenv("PS2X_GS_RASTER_THREADS"))
         {
