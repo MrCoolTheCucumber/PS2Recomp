@@ -1574,6 +1574,15 @@ public:
     {
         m_vu1VifStateUpdateCallback = std::move(cb);
     }
+    using Vu1MemoryObservationCallback = std::function<void()>;
+    void setVu1MemoryObservationCallback(
+        Vu1MemoryObservationCallback callback)
+    {
+        m_vu1MemoryObservationCallback =
+            std::move(callback);
+    }
+    void publishVu1MemorySnapshot(
+        const Vu1Snapshot &snapshot);
     using Vif1ResetCallback = std::function<void()>;
     void setVif1ResetCallback(Vif1ResetCallback cb) { m_vif1ResetCallback = std::move(cb); }
     using Vif1DmaScheduleCallback =
@@ -1690,10 +1699,26 @@ public:
     [[nodiscard]] ScratchpadDmaSnapshot
     scratchpadDmaSnapshot(DmacChannel channel) const;
 
-    uint8_t *getVU1Code() { return m_vu1Code; }
-    const uint8_t *getVU1Code() const { return m_vu1Code; }
-    uint8_t *getVU1Data() { return m_vu1Data; }
-    const uint8_t *getVU1Data() const { return m_vu1Data; }
+    uint8_t *getVU1Code()
+    {
+        observeVu1Memory();
+        return m_vu1Code;
+    }
+    const uint8_t *getVU1Code() const
+    {
+        observeVu1Memory();
+        return m_vu1Code;
+    }
+    uint8_t *getVU1Data()
+    {
+        observeVu1Memory();
+        return m_vu1Data;
+    }
+    const uint8_t *getVU1Data() const
+    {
+        observeVu1Memory();
+        return m_vu1Data;
+    }
     uint8_t *getVU0Code() { return m_vu0Code; }
     const uint8_t *getVU0Code() const { return m_vu0Code; }
     uint8_t *getVU0Data() { return m_vu0Data; }
@@ -1927,6 +1952,8 @@ public:
     Vu1CommandCallback m_vu1CommandCallback;
     Vu1DecodedUnpackCallback m_vu1DecodedUnpackCallback;
     Vu1VifStateUpdateCallback m_vu1VifStateUpdateCallback;
+    Vu1MemoryObservationCallback
+        m_vu1MemoryObservationCallback;
     Vif1ResetCallback m_vif1ResetCallback;
     Vif1DmaScheduleCallback m_vif1DmaScheduleCallback;
     Vif1DmaCancelCallback m_vif1DmaCancelCallback;
@@ -2244,6 +2271,7 @@ public:
     void publishVu1VifState(
         const Vu1VifState &state) noexcept;
     void submitVu1VifStateUpdate();
+    void observeVu1Memory() const;
     bool isScratchpad(uint32_t address) const;
     uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit);
     const uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const;

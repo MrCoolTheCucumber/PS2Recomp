@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 
+#include "ps2_runtime.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1_command_stream.h"
 
@@ -516,6 +517,16 @@ void register_ps2_vu1_command_stream_tests()
                      "an unbound reset should still advance owner generation");
             t.Equals(processor.nextSequence(), uint64_t{2u},
                      "an unbound reset should consume exactly one sequence");
+            const Vu1CommandResult snapshotResult =
+                executor.submit(Vu1SnapshotCommand{});
+            const auto *const snapshot =
+                std::get_if<Vu1SnapshotResult>(
+                    &snapshotResult.payload);
+            t.IsTrue(
+                snapshot && snapshot->snapshot &&
+                    snapshot->snapshot->microMemory.empty() &&
+                    snapshot->snapshot->dataMemory.empty(),
+                "pre-initialization diagnostics should snapshot unbound state");
         });
 
         tc.Run("mapped writes MPG and UNPACK enter one ordered owner stream", [](TestCase &t)
@@ -1373,17 +1384,13 @@ void register_ps2_vu1_command_stream_tests()
 
             (void)submitBoth(
                 Vu1BindMemoryCommand{
-                    .microMemory = inlineCode.data(),
-                    .microMemorySize = static_cast<uint32_t>(inlineCode.size()),
-                    .dataMemory = inlineData.data(),
-                    .dataMemorySize = static_cast<uint32_t>(inlineData.size()),
+                    .microMemory = inlineCode,
+                    .dataMemory = inlineData,
                     .codeGeneration = 1u,
                 },
                 Vu1BindMemoryCommand{
-                    .microMemory = threadedCode.data(),
-                    .microMemorySize = static_cast<uint32_t>(threadedCode.size()),
-                    .dataMemory = threadedData.data(),
-                    .dataMemorySize = static_cast<uint32_t>(threadedData.size()),
+                    .microMemory = threadedCode,
+                    .dataMemory = threadedData,
                     .codeGeneration = 1u,
                 },
                 0u);
@@ -1507,12 +1514,232 @@ void register_ps2_vu1_command_stream_tests()
             t.IsTrue(
                 inlineHash && threadedHash &&
                     inlineHash->architecturalStateHash ==
-                        threadedHash->architecturalStateHash &&
-                    inlineCode == threadedCode &&
-                    inlineData == threadedData,
+                        threadedHash->architecturalStateHash,
                 "restore and barrier should retain byte-exact owner state");
             t.IsTrue(threadedExecutor.statistics().resultWaitCount > 0u,
                      "synchronous mode should expose its conservative rendezvous cost");
+        });
+
+        tc.Run("threaded VU1 defers diagnostics for EE publication", [](TestCase &t)
+        {
+            class Observer final : public IVuExecutionObserver
+            {
+            public:
+                bool vuTraceEnabled() const override
+                {
+                    return true;
+                }
+
+                void traceVuInvocation(
+                    uint32_t, uint32_t, uint32_t, bool,
+                    const VuExecutionState &) override
+                {
+                    ++invocations;
+                    publicationThread = std::this_thread::get_id();
+                }
+
+                void traceVuInstruction(
+                    uint32_t, uint32_t, uint32_t,
+                    const VuExecutionState &) override
+                {
+                    ++instructions;
+                    publicationThread = std::this_thread::get_id();
+                }
+
+                uint64_t invocations = 0u;
+                uint64_t instructions = 0u;
+                std::thread::id publicationThread{};
+            } observer;
+
+            VuUnit unit(VuUnitId::Vu1);
+            Vu1CommandProcessor processor(unit);
+            ThreadedVu1Executor executor(processor);
+            (void)executor.submit(Vu1BindMemoryCommand{
+                .microMemory =
+                    std::vector<uint8_t>(PS2_VU1_CODE_SIZE),
+                .dataMemory =
+                    std::vector<uint8_t>(PS2_VU1_DATA_SIZE),
+                .codeGeneration = 1u,
+                .deferredDiagnostics = true,
+            });
+            (void)executor.submit(Vu1SetDiagnosticsCommand{
+                .traceEnabled = true,
+            });
+            const auto pair = instructionPair(
+                makeVuIaddiu(1u, 0u, 7), kVuUpperEnd);
+            (void)executor.submit(Vu1MicroMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = std::vector<uint8_t>(
+                    pair.begin(), pair.end()),
+            });
+            const Vu1CommandResult start =
+                executor.submit(Vu1MscalCommand{});
+            t.Equals(observer.invocations, 0ull,
+                     "the owner must not call the EE observer directly");
+            t.Equals(start.diagnostics.size(), size_t{1u},
+                     "start should return one owned invocation record");
+            replayVu1Diagnostics(start.diagnostics, observer);
+            t.Equals(observer.invocations, 1ull,
+                     "EE replay should publish the deferred invocation");
+            t.IsTrue(observer.publicationThread ==
+                         std::this_thread::get_id(),
+                     "diagnostics should publish on the waiting EE thread");
+
+            const Vu1CommandResult slice = executor.submit(
+                Vu1AdvanceSliceCommand{
+                    .maximumCycles = 2u,
+                });
+            t.Equals(observer.instructions, 0ull,
+                     "slice tracing should remain private on completion");
+            t.IsTrue(!slice.diagnostics.empty(),
+                     "the slice should own its trace records");
+            replayVu1Diagnostics(slice.diagnostics, observer);
+            t.IsTrue(observer.instructions >= 1u,
+                     "EE replay should publish traced instruction pairs");
+        });
+
+        tc.Run("threaded VU1 snapshots backend diagnostics on the owner", [](TestCase &t)
+        {
+            VuUnit unit(VuUnitId::Vu1);
+            Vu1CommandProcessor processor(unit);
+            ThreadedVu1Executor executor(processor);
+            (void)executor.submit(Vu1BindMemoryCommand{
+                .microMemory =
+                    std::vector<uint8_t>(PS2_VU1_CODE_SIZE),
+                .dataMemory =
+                    std::vector<uint8_t>(PS2_VU1_DATA_SIZE),
+                .codeGeneration = 1u,
+                .deferredDiagnostics = true,
+            });
+
+            if (VuRecompilerBackend::supported())
+            {
+                const Vu1CommandResult backendResult =
+                    executor.submit(Vu1SetBackendCommand{
+                        .backend = VuBackendKind::Recompiler,
+                    });
+                const auto *const backendStatus =
+                    std::get_if<Vu1BackendStatusResult>(
+                        &backendResult.payload);
+                t.IsTrue(
+                    backendStatus && backendStatus->accepted,
+                    "the owner should accept the supported native backend");
+                const auto pair = instructionPair(
+                    makeVuIaddiu(1u, 0u, 7), kVuUpperEnd);
+                (void)executor.submit(Vu1MicroMemoryWriteCommand{
+                    .offset = 0u,
+                    .bytes = std::vector<uint8_t>(
+                        pair.begin(), pair.end()),
+                });
+                (void)executor.submit(Vu1MscalCommand{});
+                (void)executor.submit(Vu1AdvanceSliceCommand{
+                    .maximumCycles = 16u,
+                });
+            }
+
+            const Vu1CommandResult snapshotResult =
+                executor.submit(Vu1SnapshotCommand{
+                    .includeBackendDiagnostics = true,
+                });
+            const auto *const snapshot =
+                std::get_if<Vu1SnapshotResult>(
+                    &snapshotResult.payload);
+            t.IsTrue(
+                snapshot && snapshot->snapshot &&
+                    snapshot->snapshot->backendDiagnostics,
+                "the typed owner snapshot should include requested diagnostics");
+            if (!snapshot || !snapshot->snapshot ||
+                !snapshot->snapshot->backendDiagnostics)
+            {
+                return;
+            }
+            if (VuRecompilerBackend::supported())
+            {
+                const Vu1BackendDiagnosticsSnapshot &diagnostics =
+                    *snapshot->snapshot->backendDiagnostics;
+                t.IsTrue(
+                    diagnostics.programCache.has_value(),
+                    "native execution should publish cache diagnostics");
+                t.IsTrue(
+                    diagnostics.recompiler.has_value(),
+                    "native execution should publish recompiler diagnostics");
+                if (diagnostics.recompiler)
+                {
+                    t.IsTrue(
+                        diagnostics.recompiler->diagnostics.nativeEntries !=
+                            0u,
+                        "the owner should snapshot native activity");
+                }
+            }
+        });
+
+        tc.Run("runtime selects synchronous VU1 ownership and mirrors observations", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedSynchronous;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.captureVu1ArchitecturalStateHashes = true;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "threaded runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "threaded runtime should bind owned VU1 images");
+            t.IsTrue(
+                runtime.vu1ExecutionMode() ==
+                    Vu1ExecutionMode::ThreadedSynchronous,
+                "the runtime should retain its selected VU1 mode");
+            t.IsTrue(runtime.vu1OwnerStatistics().started,
+                     "binding should lazily start the VU1 owner");
+            t.IsTrue(
+                captureException(
+                    [&runtime]()
+                    {
+                        (void)runtime.vu1().isActive();
+                    }) ==
+                    "direct VU1 access is unavailable in threaded mode",
+                "threaded runtime should reject direct unit access");
+            t.IsTrue(
+                captureException(
+                    [&runtime]()
+                    {
+                        (void)runtime.vu1CommandProcessor().generation();
+                    }) ==
+                    "direct VU1 processor access is unavailable in threaded mode",
+                "threaded runtime should reject direct processor access");
+
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE, 0x44332211u);
+            runtime.memory().write32(
+                PS2_VU1_DATA_BASE + 4u, 0xaabbccddu);
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            uint32_t codeWord = 0u;
+            uint32_t dataWord = 0u;
+            std::memcpy(
+                &codeWord, snapshot->microMemory.data(),
+                sizeof(codeWord));
+            std::memcpy(
+                &dataWord, snapshot->dataMemory.data() + 4u,
+                sizeof(dataWord));
+            t.Equals(codeWord, uint32_t{0x44332211u},
+                     "mapped MPG-style writes should reach owner micro memory");
+            t.Equals(dataWord, uint32_t{0xaabbccddu},
+                     "mapped writes should reach owner data memory");
+            t.Equals(
+                runtime.memory().read32(PS2_VU1_DATA_BASE + 4u),
+                uint32_t{0xaabbccddu},
+                "EE mapped reads should observe an ordered owner snapshot");
+
+            uint8_t *const mirror = runtime.memory().getVU1Data();
+            mirror[4u] ^= 0xffu;
+            const std::shared_ptr<const Vu1Snapshot> ownerAfterMirrorEdit =
+                runtime.snapshotVu1Owner();
+            t.Equals(ownerAfterMirrorEdit->dataMemory[4u], uint8_t{0xddu},
+                     "the EE observation mirror must not be canonical owner storage");
         });
     });
 }

@@ -122,25 +122,76 @@ bool PS2Memory::writeVu1OwnerMemory(
     const auto *const first =
         static_cast<const uint8_t *>(bytes);
     std::vector<uint8_t> owned(first, first + size);
+    bool submitted = false;
     if (vuMemory == m_vu1Code)
     {
-        return submitVu1OwnerCommand(
+        submitted = submitVu1OwnerCommand(
             Vu1MicroMemoryWriteCommand{
                 .offset = offset,
                 .bytes = std::move(owned),
                 .wrap = wrap,
             });
     }
-    if (vuMemory == m_vu1Data)
+    else if (vuMemory == m_vu1Data)
     {
-        return submitVu1OwnerCommand(
+        submitted = submitVu1OwnerCommand(
             Vu1DataMemoryWriteCommand{
                 .offset = offset,
                 .bytes = std::move(owned),
                 .wrap = wrap,
             });
     }
-    return false;
+    if (!submitted)
+        return false;
+
+    const uint32_t memorySize =
+        vuMemory == m_vu1Code
+            ? PS2_VU1_CODE_SIZE
+            : PS2_VU1_DATA_SIZE;
+    if (!wrap)
+    {
+        std::memcpy(vuMemory + offset, bytes, size);
+        return true;
+    }
+    const size_t firstSize = std::min<size_t>(
+        size, memorySize - offset);
+    std::memcpy(vuMemory + offset, bytes, firstSize);
+    if (firstSize != size)
+    {
+        std::memcpy(
+            vuMemory,
+            static_cast<const uint8_t *>(bytes) + firstSize,
+            size - firstSize);
+    }
+    return true;
+}
+
+void PS2Memory::observeVu1Memory() const
+{
+    if (m_vu1MemoryObservationCallback)
+        m_vu1MemoryObservationCallback();
+}
+
+void PS2Memory::publishVu1MemorySnapshot(
+    const Vu1Snapshot &snapshot)
+{
+    if (!m_vu1Code || !m_vu1Data ||
+        snapshot.microMemory.size() != PS2_VU1_CODE_SIZE ||
+        snapshot.dataMemory.size() != PS2_VU1_DATA_SIZE)
+    {
+        throw std::invalid_argument(
+            "VU1 memory snapshot has incompatible storage");
+    }
+    std::memcpy(
+        m_vu1Code, snapshot.microMemory.data(),
+        snapshot.microMemory.size());
+    std::memcpy(
+        m_vu1Data, snapshot.dataMemory.data(),
+        snapshot.dataMemory.size());
+    m_vu1CodeGeneration.store(
+        snapshot.codeGeneration,
+        std::memory_order_relaxed);
+    publishVu1VifState(snapshot.vif);
 }
 
 void PS2Memory::markVU1CodeModified()
@@ -2503,6 +2554,7 @@ void PS2Memory::traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop
 {
     if (!isVif1DmaTraceActive())
         return;
+    observeVu1Memory();
 
     const uint64_t ordinal = m_gsDmaTrace->vu1Runs;
     ++m_gsDmaTrace->vu1Runs;
@@ -4098,6 +4150,13 @@ uint8_t PS2Memory::read8(
     {
         return m_rdram[physAddr];
     }
+    if ((physAddr >= PS2_VU1_CODE_BASE &&
+         physAddr < PS2_VU1_CODE_BASE + PS2_VU1_CODE_SIZE) ||
+        (physAddr >= PS2_VU1_DATA_BASE &&
+         physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE))
+    {
+        observeVu1Memory();
+    }
     uint32_t vuOffset = 0;
     uint32_t vuLimit = 0;
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint8_t), vuOffset, vuLimit))
@@ -4139,6 +4198,13 @@ uint16_t PS2Memory::read16(
     if (physAddr < PS2_RAM_SIZE)
     {
         return loadScalar<uint16_t>(m_rdram, physAddr, PS2_RAM_SIZE, "read16 rdram", address);
+    }
+    if ((physAddr >= PS2_VU1_CODE_BASE &&
+         physAddr < PS2_VU1_CODE_BASE + PS2_VU1_CODE_SIZE) ||
+        (physAddr >= PS2_VU1_DATA_BASE &&
+         physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE))
+    {
+        observeVu1Memory();
     }
     uint32_t vuOffset = 0;
     uint32_t vuLimit = 0;
@@ -4199,6 +4265,13 @@ uint32_t PS2Memory::read32(
     {
         return loadScalar<uint32_t>(m_rdram, physAddr, PS2_RAM_SIZE, "read32 rdram", address);
     }
+    if ((physAddr >= PS2_VU1_CODE_BASE &&
+         physAddr < PS2_VU1_CODE_BASE + PS2_VU1_CODE_SIZE) ||
+        (physAddr >= PS2_VU1_DATA_BASE &&
+         physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE))
+    {
+        observeVu1Memory();
+    }
     uint32_t vuOffset = 0;
     uint32_t vuLimit = 0;
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
@@ -4249,6 +4322,13 @@ uint64_t PS2Memory::read64(
     if (physAddr < PS2_RAM_SIZE)
     {
         return loadScalar<uint64_t>(m_rdram, physAddr, PS2_RAM_SIZE, "read64 rdram", address);
+    }
+    if ((physAddr >= PS2_VU1_CODE_BASE &&
+         physAddr < PS2_VU1_CODE_BASE + PS2_VU1_CODE_SIZE) ||
+        (physAddr >= PS2_VU1_DATA_BASE &&
+         physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE))
+    {
+        observeVu1Memory();
     }
     uint32_t vuOffset = 0;
     uint32_t vuLimit = 0;
@@ -4316,6 +4396,13 @@ __m128i PS2Memory::read128(
     {
         inRange(physAddr, sizeof(__m128i), PS2_RAM_SIZE, "read128 rdram", address);
         return _mm_loadu_si128(reinterpret_cast<__m128i *>(&m_rdram[physAddr]));
+    }
+    if ((physAddr >= PS2_VU1_CODE_BASE &&
+         physAddr < PS2_VU1_CODE_BASE + PS2_VU1_CODE_SIZE) ||
+        (physAddr >= PS2_VU1_DATA_BASE &&
+         physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE))
+    {
+        observeVu1Memory();
     }
     uint32_t vuOffset = 0;
     uint32_t vuLimit = 0;

@@ -683,10 +683,12 @@ namespace
                 using T = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<T, Vu1BindMemoryCommand>)
                 {
-                    return value.microMemory != nullptr &&
-                           value.microMemorySize != 0u &&
-                           value.dataMemory != nullptr &&
-                           value.dataMemorySize != 0u;
+                    return !value.microMemory.empty() &&
+                           !value.dataMemory.empty() &&
+                           value.microMemory.size() <=
+                               std::numeric_limits<uint32_t>::max() &&
+                           value.dataMemory.size() <=
+                               std::numeric_limits<uint32_t>::max();
                 }
                 else if constexpr (
                     std::is_same_v<T, Vu1MicroMemoryWriteCommand> ||
@@ -736,6 +738,10 @@ const char *vu1CommandTypeName(Vu1CommandType type) noexcept
     {
     case Vu1CommandType::BindMemory:
         return "bind-memory";
+    case Vu1CommandType::SetDiagnostics:
+        return "set-diagnostics";
+    case Vu1CommandType::SetBackend:
+        return "set-backend";
     case Vu1CommandType::MicroMemoryWrite:
         return "micro-memory-write";
     case Vu1CommandType::DataMemoryWrite:
@@ -777,6 +783,10 @@ Vu1CommandType vu1CommandType(
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, Vu1BindMemoryCommand>)
                 return Vu1CommandType::BindMemory;
+            else if constexpr (std::is_same_v<T, Vu1SetDiagnosticsCommand>)
+                return Vu1CommandType::SetDiagnostics;
+            else if constexpr (std::is_same_v<T, Vu1SetBackendCommand>)
+                return Vu1CommandType::SetBackend;
             else if constexpr (std::is_same_v<T, Vu1MicroMemoryWriteCommand>)
                 return Vu1CommandType::MicroMemoryWrite;
             else if constexpr (std::is_same_v<T, Vu1DataMemoryWriteCommand>)
@@ -818,8 +828,18 @@ uint64_t vu1CommandPayloadSize(
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, Vu1BindMemoryCommand>)
             {
-                return 2u * sizeof(uint32_t) + sizeof(uint64_t) +
-                       2u * sizeof(bool);
+                return 2u * sizeof(uint64_t) + sizeof(uint64_t) +
+                       sizeof(bool) + value.microMemory.size() +
+                       value.dataMemory.size();
+            }
+            else if constexpr (
+                std::is_same_v<T, Vu1SetDiagnosticsCommand>)
+            {
+                return 2u * sizeof(bool);
+            }
+            else if constexpr (std::is_same_v<T, Vu1SetBackendCommand>)
+            {
+                return sizeof(uint8_t);
             }
             else if constexpr (
                 std::is_same_v<T, Vu1MicroMemoryWriteCommand> ||
@@ -862,6 +882,10 @@ uint64_t vu1CommandPayloadSize(
             {
                 return 2u * sizeof(bool);
             }
+            else if constexpr (std::is_same_v<T, Vu1SnapshotCommand>)
+            {
+                return sizeof(bool);
+            }
             else if constexpr (std::is_same_v<T, Vu1RestoreCommand>)
             {
                 return sizeof(uint64_t) +
@@ -889,11 +913,24 @@ uint64_t vu1CommandPayloadHash(
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, Vu1BindMemoryCommand>)
             {
-                hashScalar(hash, value.microMemorySize);
-                hashScalar(hash, value.dataMemorySize);
+                hashVector(hash, value.microMemory);
+                hashVector(hash, value.dataMemory);
                 hashScalar(hash, value.codeGeneration);
-                hashScalar(hash, value.microMemory != nullptr);
-                hashScalar(hash, value.dataMemory != nullptr);
+                hashScalar(hash, value.deferredDiagnostics);
+            }
+            else if constexpr (
+                std::is_same_v<T, Vu1SetDiagnosticsCommand>)
+            {
+                hashScalar(hash, value.traceEnabled);
+                hashScalar(hash, value.workloadProfileEnabled);
+            }
+            else if constexpr (std::is_same_v<T, Vu1SetBackendCommand>)
+            {
+                hashScalar(hash, value.backend);
+            }
+            else if constexpr (std::is_same_v<T, Vu1SnapshotCommand>)
+            {
+                hashScalar(hash, value.includeBackendDiagnostics);
             }
             else if constexpr (
                 std::is_same_v<T, Vu1MicroMemoryWriteCommand> ||
@@ -1007,6 +1044,79 @@ uint64_t vu1ArchitecturalStateHash(
     return hash;
 }
 
+void replayVu1Diagnostics(
+    std::span<const Vu1DiagnosticRecord> diagnostics,
+    IVuExecutionObserver &observer)
+{
+    for (const Vu1DiagnosticRecord &record : diagnostics)
+    {
+        std::visit(
+            [&](const auto &value)
+            {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (
+                    std::is_same_v<T, Vu1TraceInvocationDiagnostic>)
+                {
+                    observer.traceVuInvocation(
+                        value.startPc, value.top, value.itop,
+                        value.resume, value.state);
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1TraceInstructionDiagnostic>)
+                {
+                    observer.traceVuInstruction(
+                        value.pc, value.lower, value.upper,
+                        value.state);
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1TraceXgkickDiagnostic>)
+                {
+                    observer.traceVuXgkick(value.sourceQword);
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1TraceInvocationEndDiagnostic>)
+                {
+                    observer.traceVuInvocationEnd(
+                        value.finalPc, value.ended,
+                        value.hitCycleLimit,
+                        value.viRegisters.data(),
+                        value.viRegisters.size());
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1WorkloadBeginDiagnostic>)
+                {
+                    observer.beginVuWorkloadProfileInvocation(
+                        value.startPc, value.code.data(),
+                        static_cast<uint32_t>(value.code.size()),
+                        value.generation);
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1WorkloadInstructionDiagnostic>)
+                {
+                    observer.recordVuWorkloadProfileInstruction(
+                        value.pc, value.lower, value.upper);
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1WorkloadTransitionDiagnostic>)
+                {
+                    observer.recordVuWorkloadProfileTransition(
+                        value.pc, value.nextPc);
+                }
+                else if constexpr (
+                    std::is_same_v<T, Vu1WorkloadEndDiagnostic>)
+                {
+                    observer.endVuWorkloadProfileInvocation(
+                        value.completed);
+                }
+                else
+                {
+                    observer.resetVuWorkloadProfileEpoch();
+                }
+            },
+            record);
+    }
+}
+
 Vu1CommandProcessor::Vu1CommandProcessor(
     VuUnit &unit,
     Vu1CommandProcessorConfiguration configuration)
@@ -1054,12 +1164,29 @@ void Vu1CommandProcessor::bindMemory(
         throw std::invalid_argument(
             "VU1 command processor requires complete memory");
     }
+    m_ownedMicroMemory.clear();
+    m_ownedDataMemory.clear();
     m_microMemory = microMemory;
     m_microMemorySize = microMemorySize;
     m_dataMemory = dataMemory;
     m_dataMemorySize = dataMemorySize;
     m_codeGeneration.store(
         codeGeneration, std::memory_order_relaxed);
+    m_diagnosticsObserver = diagnosticsObserver;
+    m_deferredDiagnostics = false;
+    m_traceEnabled = false;
+    m_workloadProfileEnabled = false;
+}
+
+void Vu1CommandProcessor::bindInlineDiagnosticsObserver(
+    IVuExecutionObserver *diagnosticsObserver)
+{
+    assertOwnerThread();
+    if (m_deferredDiagnostics)
+    {
+        throw std::logic_error(
+            "deferred VU1 diagnostics cannot bind an inline observer");
+    }
     m_diagnosticsObserver = diagnosticsObserver;
 }
 
@@ -1095,12 +1222,21 @@ void Vu1CommandProcessor::writeMemory(
     }
 }
 
-Vu1Snapshot Vu1CommandProcessor::captureSnapshot() const
+Vu1Snapshot Vu1CommandProcessor::captureSnapshot(
+    bool includeBackendDiagnostics) const
 {
     Vu1Snapshot snapshot{
         .state = m_unit.state(),
         .vif = m_vifState,
         .codeGeneration = codeGeneration(),
+        .lastExitReason = m_unit.lastExitReason(),
+        .requestedBackend = m_unit.requestedBackend(),
+        .resolvedBackend = m_unit.resolvedBackend(),
+        .backendName = std::string(m_unit.backendName()),
+        .nativeInstrumentationEnabled =
+            m_unit.nativeInstrumentationEnabled(),
+        .progress = m_unit.getProgressSnapshot(),
+        .verify = m_unit.verifyDiagnostics(),
     };
     if (m_microMemory && m_microMemorySize != 0u)
     {
@@ -1113,6 +1249,38 @@ Vu1Snapshot Vu1CommandProcessor::captureSnapshot() const
         snapshot.dataMemory.assign(
             m_dataMemory,
             m_dataMemory + m_dataMemorySize);
+    }
+    if (includeBackendDiagnostics)
+    {
+        Vu1BackendDiagnosticsSnapshot diagnostics{};
+        if (const VuProgramCache *const cache =
+                m_unit.programCacheIfCreated())
+        {
+            diagnostics.programCache =
+                cache->diagnosticsWhileExecutionQuiescent();
+        }
+        if (const VuRecompilerBackend *const backend =
+                m_unit.recompilerIfCreated())
+        {
+            diagnostics.recompiler = Vu1RecompilerSnapshot{
+                .diagnostics = backend->diagnostics(),
+                .blockProfile =
+                    backend->
+                        blockProfilingSnapshotWhileExecutionQuiescent(),
+                .lastJitDiagnostic = backend->lastJitDiagnostic(),
+                .blockLinkingEnabled =
+                    backend->blockLinkingEnabled(),
+                .blockBudgetGuardsEnabled =
+                    backend->blockBudgetGuardsEnabled(),
+                .blockLocalVfRegistersEnabled =
+                    backend->blockLocalVfRegistersEnabled(),
+                .blockLocalVfRegistersAutomatic =
+                    backend->blockLocalVfRegistersAutomatic(),
+                .inlineXgkickEnabled =
+                    backend->inlineXgkickEnabled(),
+            };
+        }
+        snapshot.backendDiagnostics = std::move(diagnostics);
     }
     return snapshot;
 }
@@ -1151,9 +1319,8 @@ Vu1SliceResult Vu1CommandProcessor::advanceSlice(
         .codeGeneration = codeGeneration(),
         .trackedCode = true,
         // Inline mode can use the already-narrow diagnostics observer
-        // directly. Avoid an adapter hop on every native block generation
-        // check; a standalone or future owner-local processor still supplies
-        // its own tracked code generation when no recorder is bound.
+        // directly. A threaded owner records diagnostics locally through the
+        // processor and returns the journal for publication by EE.
         .observer = m_diagnosticsObserver
                         ? m_diagnosticsObserver
                         : this,
@@ -1183,21 +1350,53 @@ Vu1SliceResult Vu1CommandProcessor::advanceSlice(
 }
 
 Vu1CommandResultPayload Vu1CommandProcessor::apply(
-    const Vu1CommandPayload &payload,
+    Vu1CommandPayload &payload,
     Vu1CommandDisposition &disposition)
 {
     return std::visit(
-        [&](const auto &value) -> Vu1CommandResultPayload
+        [&](auto &value) -> Vu1CommandResultPayload
         {
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, Vu1BindMemoryCommand>)
             {
-                bindMemory(
-                    value.microMemory, value.microMemorySize,
-                    value.dataMemory, value.dataMemorySize,
+                m_ownedMicroMemory = std::move(value.microMemory);
+                m_ownedDataMemory = std::move(value.dataMemory);
+                m_microMemory = m_ownedMicroMemory.data();
+                m_microMemorySize = static_cast<uint32_t>(
+                    m_ownedMicroMemory.size());
+                m_dataMemory = m_ownedDataMemory.data();
+                m_dataMemorySize = static_cast<uint32_t>(
+                    m_ownedDataMemory.size());
+                m_codeGeneration.store(
                     value.codeGeneration,
-                    value.diagnosticsObserver);
+                    std::memory_order_relaxed);
+                m_deferredDiagnostics =
+                    value.deferredDiagnostics;
+                if (m_deferredDiagnostics)
+                    m_diagnosticsObserver = nullptr;
                 return Vu1NoResult{};
+            }
+            else if constexpr (
+                std::is_same_v<T, Vu1SetDiagnosticsCommand>)
+            {
+                m_traceEnabled = value.traceEnabled;
+                m_workloadProfileEnabled =
+                    value.workloadProfileEnabled;
+                return Vu1NoResult{};
+            }
+            else if constexpr (std::is_same_v<T, Vu1SetBackendCommand>)
+            {
+                std::string diagnostic;
+                const bool accepted = m_unit.setBackend(
+                    value.backend, &diagnostic);
+                return Vu1BackendStatusResult{
+                    .accepted = accepted,
+                    .requested = m_unit.requestedBackend(),
+                    .resolved = m_unit.resolvedBackend(),
+                    .name = std::string(m_unit.backendName()),
+                    .active = m_unit.isActive(),
+                    .diagnostic = std::move(diagnostic),
+                };
             }
             else if constexpr (std::is_same_v<T, Vu1MicroMemoryWriteCommand>)
             {
@@ -1365,7 +1564,8 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
                 Vu1SnapshotResult result{
                     .snapshot =
                         std::make_shared<const Vu1Snapshot>(
-                            captureSnapshot()),
+                            captureSnapshot(
+                                value.includeBackendDiagnostics)),
                 };
                 result.architecturalStateHash =
                     m_configuration.captureArchitecturalStateHashes
@@ -1418,6 +1618,11 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
 Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
 {
     assertOwnerThread();
+    if (!m_pendingDiagnostics.empty())
+    {
+        throw std::logic_error(
+            "VU1 diagnostic journal was not published");
+    }
     Vu1CommandResult result{
         .identity = command.identity,
         .ownerGeneration = m_generation,
@@ -1486,7 +1691,10 @@ Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
     }
     const bool requiresBoundMemory =
         command.type != Vu1CommandType::BindMemory &&
+        command.type != Vu1CommandType::SetDiagnostics &&
+        command.type != Vu1CommandType::SetBackend &&
         command.type != Vu1CommandType::Reset &&
+        command.type != Vu1CommandType::Snapshot &&
         command.type != Vu1CommandType::Barrier &&
         command.type != Vu1CommandType::Shutdown;
     if (command.type != vu1CommandType(command.payload) ||
@@ -1500,6 +1708,8 @@ Vu1CommandResult Vu1CommandProcessor::process(Vu1Command command)
     }
 
     result.payload = apply(command.payload, result.disposition);
+    result.diagnostics = std::move(m_pendingDiagnostics);
+    m_pendingDiagnostics.clear();
     result.codeGeneration = codeGeneration();
     if (result.disposition == Vu1CommandDisposition::Completed)
     {
@@ -1530,6 +1740,11 @@ Vu1CommandResult Vu1CommandProcessor::processDecodedUnpack(
     const Vu1DecodedUnpackCommand &command)
 {
     assertOwnerThread();
+    if (!m_pendingDiagnostics.empty())
+    {
+        throw std::logic_error(
+            "VU1 diagnostic journal was not published");
+    }
     const uint64_t payloadSize =
         11u + sizeof(uint64_t) + command.bytes.size();
     Vu1CommandResult result{
@@ -1611,6 +1826,11 @@ Vu1CommandResult Vu1CommandProcessor::processVifStateUpdate(
     const Vu1VifStateUpdateCommand &command)
 {
     assertOwnerThread();
+    if (!m_pendingDiagnostics.empty())
+    {
+        throw std::logic_error(
+            "VU1 diagnostic journal was not published");
+    }
     constexpr uint64_t payloadSize =
         12u * sizeof(uint32_t);
     Vu1CommandResult result{
@@ -1681,6 +1901,11 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
     const Vu1AdvanceSliceCommand &command)
 {
     assertOwnerThread();
+    if (!m_pendingDiagnostics.empty())
+    {
+        throw std::logic_error(
+            "VU1 diagnostic journal was not published");
+    }
     constexpr uint64_t payloadSize =
         sizeof(command.maximumCycles) +
         sizeof(command.captureState);
@@ -1733,6 +1958,8 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
     }
 
     result.payload = advanceSlice(command);
+    result.diagnostics = std::move(m_pendingDiagnostics);
+    m_pendingDiagnostics.clear();
     result.codeGeneration = codeGeneration();
     if (m_nextSequence ==
         std::numeric_limits<uint64_t>::max())
@@ -1749,12 +1976,16 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
 
 bool Vu1CommandProcessor::vuTraceEnabled() const
 {
+    if (m_deferredDiagnostics)
+        return m_traceEnabled;
     return m_diagnosticsObserver &&
            m_diagnosticsObserver->vuTraceEnabled();
 }
 
 bool Vu1CommandProcessor::vuWorkloadProfileEnabled() const
 {
+    if (m_deferredDiagnostics)
+        return m_workloadProfileEnabled;
     return m_diagnosticsObserver &&
            m_diagnosticsObserver->vuWorkloadProfileEnabled();
 }
@@ -1773,6 +2004,18 @@ void Vu1CommandProcessor::traceVuInvocation(
     uint32_t startPc, uint32_t top, uint32_t itop,
     bool resume, const VuExecutionState &state)
 {
+    if (m_deferredDiagnostics)
+    {
+        m_pendingDiagnostics.emplace_back(
+            Vu1TraceInvocationDiagnostic{
+                .startPc = startPc,
+                .top = top,
+                .itop = itop,
+                .resume = resume,
+                .state = state,
+            });
+        return;
+    }
     if (m_diagnosticsObserver)
     {
         m_diagnosticsObserver->traceVuInvocation(
@@ -1784,6 +2027,17 @@ void Vu1CommandProcessor::traceVuInstruction(
     uint32_t pc, uint32_t lower, uint32_t upper,
     const VuExecutionState &state)
 {
+    if (m_deferredDiagnostics)
+    {
+        m_pendingDiagnostics.emplace_back(
+            Vu1TraceInstructionDiagnostic{
+                .pc = pc,
+                .lower = lower,
+                .upper = upper,
+                .state = state,
+            });
+        return;
+    }
     if (m_diagnosticsObserver)
     {
         m_diagnosticsObserver->traceVuInstruction(
@@ -1793,6 +2047,12 @@ void Vu1CommandProcessor::traceVuInstruction(
 
 void Vu1CommandProcessor::traceVuXgkick(uint32_t sourceQword)
 {
+    if (m_deferredDiagnostics)
+    {
+        m_pendingDiagnostics.emplace_back(
+            Vu1TraceXgkickDiagnostic{sourceQword});
+        return;
+    }
     if (m_diagnosticsObserver)
         m_diagnosticsObserver->traceVuXgkick(sourceQword);
 }
@@ -1801,6 +2061,22 @@ void Vu1CommandProcessor::traceVuInvocationEnd(
     uint32_t finalPc, bool ended, bool hitCycleLimit,
     const int32_t *viRegisters, size_t viRegisterCount)
 {
+    if (m_deferredDiagnostics)
+    {
+        Vu1TraceInvocationEndDiagnostic record{
+            .finalPc = finalPc,
+            .ended = ended,
+            .hitCycleLimit = hitCycleLimit,
+        };
+        if (viRegisters && viRegisterCount != 0u)
+        {
+            record.viRegisters.assign(
+                viRegisters,
+                viRegisters + viRegisterCount);
+        }
+        m_pendingDiagnostics.emplace_back(std::move(record));
+        return;
+    }
     if (m_diagnosticsObserver)
     {
         m_diagnosticsObserver->traceVuInvocationEnd(
@@ -1813,6 +2089,17 @@ void Vu1CommandProcessor::beginVuWorkloadProfileInvocation(
     uint32_t startPc, const uint8_t *code,
     uint32_t codeSize, uint64_t generation)
 {
+    if (m_deferredDiagnostics)
+    {
+        Vu1WorkloadBeginDiagnostic record{
+            .startPc = startPc,
+            .generation = generation,
+        };
+        if (code && codeSize != 0u)
+            record.code.assign(code, code + codeSize);
+        m_pendingDiagnostics.emplace_back(std::move(record));
+        return;
+    }
     if (m_diagnosticsObserver)
     {
         m_diagnosticsObserver->beginVuWorkloadProfileInvocation(
@@ -1823,6 +2110,16 @@ void Vu1CommandProcessor::beginVuWorkloadProfileInvocation(
 void Vu1CommandProcessor::recordVuWorkloadProfileInstruction(
     uint32_t pc, uint32_t lower, uint32_t upper)
 {
+    if (m_deferredDiagnostics)
+    {
+        m_pendingDiagnostics.emplace_back(
+            Vu1WorkloadInstructionDiagnostic{
+                .pc = pc,
+                .lower = lower,
+                .upper = upper,
+            });
+        return;
+    }
     if (m_diagnosticsObserver)
     {
         m_diagnosticsObserver->recordVuWorkloadProfileInstruction(
@@ -1833,6 +2130,15 @@ void Vu1CommandProcessor::recordVuWorkloadProfileInstruction(
 void Vu1CommandProcessor::recordVuWorkloadProfileTransition(
     uint32_t pc, uint32_t nextPc)
 {
+    if (m_deferredDiagnostics)
+    {
+        m_pendingDiagnostics.emplace_back(
+            Vu1WorkloadTransitionDiagnostic{
+                .pc = pc,
+                .nextPc = nextPc,
+            });
+        return;
+    }
     if (m_diagnosticsObserver)
     {
         m_diagnosticsObserver->recordVuWorkloadProfileTransition(
@@ -1843,12 +2149,24 @@ void Vu1CommandProcessor::recordVuWorkloadProfileTransition(
 void Vu1CommandProcessor::endVuWorkloadProfileInvocation(
     bool completed)
 {
+    if (m_deferredDiagnostics)
+    {
+        m_pendingDiagnostics.emplace_back(
+            Vu1WorkloadEndDiagnostic{completed});
+        return;
+    }
     if (m_diagnosticsObserver)
         m_diagnosticsObserver->endVuWorkloadProfileInvocation(completed);
 }
 
 void Vu1CommandProcessor::resetVuWorkloadProfileEpoch()
 {
+    if (m_deferredDiagnostics)
+    {
+        m_pendingDiagnostics.emplace_back(
+            Vu1WorkloadResetDiagnostic{});
+        return;
+    }
     if (m_diagnosticsObserver)
         m_diagnosticsObserver->resetVuWorkloadProfileEpoch();
 }
@@ -1949,6 +2267,10 @@ Vu1CommandResult InlineVu1Executor::submit(
     uint64_t guestTick,
     uint64_t publicationToken)
 {
+    // Inline execution has no persistent worker. The runtime serializes its
+    // EE and control callers at a guest boundary, so the caller becomes the
+    // physical owner for this command without adding a hot-path mutex.
+    m_processor.claimOwnerThread(std::this_thread::get_id());
     const bool opensGeneration = startsVu1Generation(payload);
     const Vu1WorkIdentity identity = nextIdentity(
         opensGeneration, guestTick, publicationToken);
@@ -1969,6 +2291,7 @@ Vu1CommandResult InlineVu1Executor::submitAdvanceSlice(
     uint64_t guestTick,
     uint64_t publicationToken)
 {
+    m_processor.claimOwnerThread(std::this_thread::get_id());
     const Vu1WorkIdentity identity = nextIdentity(
         false, guestTick, publicationToken);
     Vu1CommandResult result =
@@ -1982,6 +2305,7 @@ Vu1CommandResult InlineVu1Executor::submitDecodedUnpack(
     uint64_t guestTick,
     uint64_t publicationToken)
 {
+    m_processor.claimOwnerThread(std::this_thread::get_id());
     const Vu1WorkIdentity identity = nextIdentity(
         false, guestTick, publicationToken);
     Vu1CommandResult result =
@@ -1995,6 +2319,7 @@ Vu1CommandResult InlineVu1Executor::submitVifStateUpdate(
     uint64_t guestTick,
     uint64_t publicationToken)
 {
+    m_processor.claimOwnerThread(std::this_thread::get_id());
     const Vu1WorkIdentity identity = nextIdentity(
         false, guestTick, publicationToken);
     Vu1CommandResult result =

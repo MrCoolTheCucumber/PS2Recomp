@@ -28,6 +28,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 
 #include "runtime/ps2_build_config.h"
 #include "ps2_log.h"
@@ -91,6 +92,14 @@ struct PS2RuntimeConfiguration
         gsBeforeProcess;
     std::function<void(const GsCommandResult &, uint64_t)>
         gsBeforePublish;
+    Vu1ExecutionMode vu1ExecutionMode = Vu1ExecutionMode::Inline;
+    size_t vu1CommandQueueCapacity = 64u;
+    uint64_t vu1CommandPayloadCapacityBytes =
+        8u * 1024u * 1024u;
+    std::function<void(const Vu1Command &, uint64_t)>
+        vu1BeforeProcess;
+    std::function<void(const Vu1CommandResult &, uint64_t)>
+        vu1BeforePublish;
     EeExecutionBackendKind eeExecutionBackend =
         EeExecutionBackendKind::LegacyHostThread;
     bool useEeExecutionBackendEnvironment = true;
@@ -746,6 +755,24 @@ public:
     lastCompletedGsFieldSequence() const noexcept;
     [[nodiscard]] GsAsyncRuntimeStatistics
     gsAsyncStatistics() const;
+    [[nodiscard]] Vu1ExecutionMode
+    vu1ExecutionMode() const noexcept
+    {
+        return m_vu1ExecutionMode;
+    }
+    [[nodiscard]] ThreadedVu1ExecutorStatistics
+    vu1OwnerStatistics() const;
+    [[nodiscard]] std::shared_ptr<const Vu1Snapshot>
+    snapshotVu1Owner();
+    [[nodiscard]] VuProgressSnapshot
+    vu1ProgressSnapshot() const
+    {
+        return m_vu1.getProgressSnapshot();
+    }
+    void setVu1ProgressTrackingEnabled(bool enabled)
+    {
+        m_vu1.setProgressTrackingEnabled(enabled);
+    }
     [[nodiscard]] ps2x::timing::EeTick currentEeTick() const noexcept;
     void resetEeTiming(R5900Context *context = nullptr);
     void setRealtimeVSyncPacingEnabled(bool enabled);
@@ -2137,14 +2164,43 @@ public:
     inline const GifArbiter &gifArbiter() const { return m_gifArbiter; }
     inline VuUnit &vu0() { return m_vu0; }
     inline const VuUnit &vu0() const { return m_vu0; }
-    inline VuUnit &vu1() { return m_vu1; }
-    inline const VuUnit &vu1() const { return m_vu1; }
+    // Compatibility/test access to the semantic unit is valid only while
+    // the caller itself is the inline owner. Threaded modes must use ordered
+    // commands or immutable snapshots.
+    inline VuUnit &vu1()
+    {
+        if (m_vu1ExecutionMode != Vu1ExecutionMode::Inline)
+        {
+            throw std::logic_error(
+                "direct VU1 access is unavailable in threaded mode");
+        }
+        return m_vu1;
+    }
+    inline const VuUnit &vu1() const
+    {
+        if (m_vu1ExecutionMode != Vu1ExecutionMode::Inline)
+        {
+            throw std::logic_error(
+                "direct VU1 access is unavailable in threaded mode");
+        }
+        return m_vu1;
+    }
     inline Vu1CommandProcessor &vu1CommandProcessor()
     {
+        if (m_vu1ExecutionMode != Vu1ExecutionMode::Inline)
+        {
+            throw std::logic_error(
+                "direct VU1 processor access is unavailable in threaded mode");
+        }
         return m_vu1CommandProcessor;
     }
     inline const Vu1CommandProcessor &vu1CommandProcessor() const
     {
+        if (m_vu1ExecutionMode != Vu1ExecutionMode::Inline)
+        {
+            throw std::logic_error(
+                "direct VU1 processor access is unavailable in threaded mode");
+        }
         return m_vu1CommandProcessor;
     }
 
@@ -2378,6 +2434,23 @@ private:
         Vu1AdvanceSliceCommand command,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u);
+    [[nodiscard]] Vu1CommandResult submitVu1DecodedUnpack(
+        Vu1DecodedUnpackCommand command,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+    [[nodiscard]] Vu1CommandResult submitVu1VifStateUpdate(
+        Vu1VifStateUpdateCommand command,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+    void refreshVu1DiagnosticsConfiguration(
+        uint64_t guestTick,
+        uint64_t publicationToken);
+    void publishVu1CommandResult(
+        const Vu1CommandResult &result);
+    void synchronizeVu1MemoryMirror();
+    [[nodiscard]] std::shared_ptr<const Vu1Snapshot>
+    captureVu1OwnerSnapshot(
+        bool includeBackendDiagnostics = false);
     void publishVu1SliceEffects(
         const Vu1SliceResult &slice);
     bool scheduleVif1DmaFromMemory(
@@ -2607,6 +2680,16 @@ private:
     VuUnit m_vu1;
     Vu1CommandProcessor m_vu1CommandProcessor;
     std::unique_ptr<Vu1CommandExecutor> m_vu1Executor;
+    ThreadedVu1Executor *m_threadedVu1Executor = nullptr;
+    Vu1ExecutionMode m_vu1ExecutionMode =
+        Vu1ExecutionMode::Inline;
+    std::atomic<bool> m_publishedVu1Active{false};
+    std::atomic<uint32_t> m_publishedVu1ProgramCounter{0u};
+    std::atomic<uint64_t> m_publishedVu1CodeGeneration{0u};
+    bool m_publishedVu1TraceEnabled = false;
+    bool m_publishedVu1WorkloadProfileEnabled = false;
+    bool m_vu1MemoryMirrorDirty = false;
+    bool m_vu1MemoryMirrorSynchronizationActive = false;
     ps2x::timing::Cop0Timing m_cop0Timing;
     static constexpr size_t kEeBranchHistoryEntries = 4096u;
     std::array<uint32_t, kEeBranchHistoryEntries>

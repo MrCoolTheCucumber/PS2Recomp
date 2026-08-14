@@ -3,6 +3,7 @@
 
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu_program_cache.h"
+#include "runtime/ps2_vu_recompiler.h"
 #include "runtime/ps2_spsc_queue.h"
 
 #include <array>
@@ -38,6 +39,8 @@ struct Vu1WorkIdentity
 enum class Vu1CommandType : uint8_t
 {
     BindMemory,
+    SetDiagnostics,
+    SetBackend,
     MicroMemoryWrite,
     DataMemoryWrite,
     DecodedUnpack,
@@ -59,12 +62,21 @@ enum class Vu1CommandType : uint8_t
 
 struct Vu1BindMemoryCommand
 {
-    uint8_t *microMemory = nullptr;
-    uint32_t microMemorySize = 0u;
-    uint8_t *dataMemory = nullptr;
-    uint32_t dataMemorySize = 0u;
+    std::vector<uint8_t> microMemory;
+    std::vector<uint8_t> dataMemory;
     uint64_t codeGeneration = 0u;
-    IVuExecutionObserver *diagnosticsObserver = nullptr;
+    bool deferredDiagnostics = false;
+};
+
+struct Vu1SetDiagnosticsCommand
+{
+    bool traceEnabled = false;
+    bool workloadProfileEnabled = false;
+};
+
+struct Vu1SetBackendCommand
+{
+    VuBackendKind backend = VuBackendKind::Auto;
 };
 
 struct Vu1MicroMemoryWriteCommand
@@ -174,6 +186,25 @@ struct Vu1ResetCommand
 
 struct Vu1SnapshotCommand
 {
+    bool includeBackendDiagnostics = false;
+};
+
+struct Vu1RecompilerSnapshot
+{
+    VuRecompilerDiagnostics diagnostics{};
+    VuBlockProfilingSnapshot blockProfile{};
+    std::string lastJitDiagnostic;
+    bool blockLinkingEnabled = false;
+    bool blockBudgetGuardsEnabled = false;
+    bool blockLocalVfRegistersEnabled = false;
+    bool blockLocalVfRegistersAutomatic = false;
+    bool inlineXgkickEnabled = false;
+};
+
+struct Vu1BackendDiagnosticsSnapshot
+{
+    std::optional<VuProgramCacheDiagnostics> programCache;
+    std::optional<Vu1RecompilerSnapshot> recompiler;
 };
 
 struct Vu1Snapshot
@@ -183,6 +214,15 @@ struct Vu1Snapshot
     std::vector<uint8_t> dataMemory;
     Vu1VifState vif{};
     uint64_t codeGeneration = 0u;
+    VuExitReason lastExitReason = VuExitReason::Inactive;
+    VuBackendKind requestedBackend = VuBackendKind::Auto;
+    VuBackendKind resolvedBackend = VuBackendKind::Interpreter;
+    std::string backendName;
+    bool nativeInstrumentationEnabled = false;
+    VuProgressSnapshot progress{};
+    VuVerifyDiagnostics verify{};
+    std::optional<Vu1BackendDiagnosticsSnapshot>
+        backendDiagnostics;
 };
 
 struct Vu1RestoreCommand
@@ -202,6 +242,8 @@ struct Vu1ShutdownCommand
 
 using Vu1CommandPayload = std::variant<
     Vu1BindMemoryCommand,
+    Vu1SetDiagnosticsCommand,
+    Vu1SetBackendCommand,
     Vu1MicroMemoryWriteCommand,
     Vu1DataMemoryWriteCommand,
     Vu1DecodedUnpackCommand,
@@ -245,6 +287,76 @@ struct Vu1Path1Packet
     std::optional<uint32_t> cycleOffset;
 };
 
+struct Vu1TraceInvocationDiagnostic
+{
+    uint32_t startPc = 0u;
+    uint32_t top = 0u;
+    uint32_t itop = 0u;
+    bool resume = false;
+    VuExecutionState state{};
+};
+
+struct Vu1TraceInstructionDiagnostic
+{
+    uint32_t pc = 0u;
+    uint32_t lower = 0u;
+    uint32_t upper = 0u;
+    VuExecutionState state{};
+};
+
+struct Vu1TraceXgkickDiagnostic
+{
+    uint32_t sourceQword = 0u;
+};
+
+struct Vu1TraceInvocationEndDiagnostic
+{
+    uint32_t finalPc = 0u;
+    bool ended = false;
+    bool hitCycleLimit = false;
+    std::vector<int32_t> viRegisters;
+};
+
+struct Vu1WorkloadBeginDiagnostic
+{
+    uint32_t startPc = 0u;
+    std::vector<uint8_t> code;
+    uint64_t generation = 0u;
+};
+
+struct Vu1WorkloadInstructionDiagnostic
+{
+    uint32_t pc = 0u;
+    uint32_t lower = 0u;
+    uint32_t upper = 0u;
+};
+
+struct Vu1WorkloadTransitionDiagnostic
+{
+    uint32_t pc = 0u;
+    uint32_t nextPc = 0u;
+};
+
+struct Vu1WorkloadEndDiagnostic
+{
+    bool completed = false;
+};
+
+struct Vu1WorkloadResetDiagnostic
+{
+};
+
+using Vu1DiagnosticRecord = std::variant<
+    Vu1TraceInvocationDiagnostic,
+    Vu1TraceInstructionDiagnostic,
+    Vu1TraceXgkickDiagnostic,
+    Vu1TraceInvocationEndDiagnostic,
+    Vu1WorkloadBeginDiagnostic,
+    Vu1WorkloadInstructionDiagnostic,
+    Vu1WorkloadTransitionDiagnostic,
+    Vu1WorkloadEndDiagnostic,
+    Vu1WorkloadResetDiagnostic>;
+
 struct Vu1NoResult
 {
 };
@@ -279,12 +391,23 @@ struct Vu1VifStateResult
     Vu1VifState state{};
 };
 
+struct Vu1BackendStatusResult
+{
+    bool accepted = false;
+    VuBackendKind requested = VuBackendKind::Auto;
+    VuBackendKind resolved = VuBackendKind::Interpreter;
+    std::string name;
+    bool active = false;
+    std::string diagnostic;
+};
+
 using Vu1CommandResultPayload = std::variant<
     Vu1NoResult,
     Vu1SliceResult,
     Vu1SnapshotResult,
     Vu1BarrierResult,
-    Vu1VifStateResult>;
+    Vu1VifStateResult,
+    Vu1BackendStatusResult>;
 
 enum class Vu1CommandDisposition : uint8_t
 {
@@ -306,8 +429,13 @@ struct Vu1CommandResult
     uint64_t codeGeneration = 0u;
     uint32_t programCounter = 0u;
     bool active = false;
+    std::vector<Vu1DiagnosticRecord> diagnostics;
     Vu1CommandResultPayload payload = Vu1NoResult{};
 };
+
+void replayVu1Diagnostics(
+    std::span<const Vu1DiagnosticRecord> diagnostics,
+    IVuExecutionObserver &observer);
 
 [[nodiscard]] Vu1CommandType vu1CommandType(
     const Vu1CommandPayload &payload) noexcept;
@@ -337,9 +465,10 @@ struct Vu1CommandProcessorConfiguration
     bool captureArchitecturalStateHashes = false;
 };
 
-// This is the sole semantic entry point for VU1 owner-facing work. Memory is
-// externally allocated in inline mode so M6 remains a seam-only change; M7
-// can move those allocations without changing command semantics.
+// This is the sole semantic entry point for VU1 owner-facing work. A
+// BindMemory command transfers canonical micro/data images into processor-owned
+// storage; the pointer-binding helper remains only for standalone inline
+// fixtures which already own their backing storage.
 class Vu1CommandProcessor final : public IVuExecutionObserver
 {
 public:
@@ -352,6 +481,8 @@ public:
         uint8_t *dataMemory, uint32_t dataMemorySize,
         uint64_t codeGeneration,
         IVuExecutionObserver *diagnosticsObserver = nullptr);
+    void bindInlineDiagnosticsObserver(
+        IVuExecutionObserver *diagnosticsObserver);
     void claimOwnerThread(std::thread::id owner);
     [[nodiscard]] std::thread::id ownerThreadId() const noexcept
     {
@@ -421,10 +552,11 @@ private:
         uint8_t *destination, uint32_t destinationSize,
         uint32_t offset, std::span<const uint8_t> bytes,
         bool wrap);
-    [[nodiscard]] Vu1Snapshot captureSnapshot() const;
+    [[nodiscard]] Vu1Snapshot captureSnapshot(
+        bool includeBackendDiagnostics) const;
     [[nodiscard]] uint64_t stateHash() const noexcept;
     [[nodiscard]] Vu1CommandResultPayload apply(
-        const Vu1CommandPayload &payload,
+        Vu1CommandPayload &payload,
         Vu1CommandDisposition &disposition);
     [[nodiscard]] Vu1SliceResult advanceSlice(
         const Vu1AdvanceSliceCommand &command);
@@ -437,6 +569,12 @@ private:
     uint32_t m_dataMemorySize = 0u;
     std::atomic<uint64_t> m_codeGeneration{0u};
     IVuExecutionObserver *m_diagnosticsObserver = nullptr;
+    std::vector<uint8_t> m_ownedMicroMemory;
+    std::vector<uint8_t> m_ownedDataMemory;
+    bool m_deferredDiagnostics = false;
+    bool m_traceEnabled = false;
+    bool m_workloadProfileEnabled = false;
+    std::vector<Vu1DiagnosticRecord> m_pendingDiagnostics;
     Vu1VifState m_vifState{};
     uint64_t m_generation = 1u;
     uint64_t m_nextSequence = 1u;

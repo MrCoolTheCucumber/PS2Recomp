@@ -649,7 +649,7 @@ struct PS2DebugServer::Impl
         const VuProgressSnapshot vu0 =
             runtime.vu0().getProgressSnapshot();
         const VuProgressSnapshot vu1 =
-            runtime.vu1().getProgressSnapshot();
+            runtime.vu1ProgressSnapshot();
         const auto threads =
             ps2_syscalls::debugThreadSnapshots(&runtime);
 
@@ -970,7 +970,9 @@ struct PS2DebugServer::Impl
         const VuProgressSnapshot vu0Progress =
             runtime.vu0().getProgressSnapshot();
         const VuProgressSnapshot vu1Progress =
-            runtime.vu1().getProgressSnapshot();
+            runtime.vu1ProgressSnapshot();
+        const std::shared_ptr<const Vu1Snapshot> vu1Owner =
+            runtime.snapshotVu1Owner();
         const auto vuDiagnostics =
             runtime.debugVuBackendDiagnosticsSnapshot();
         Value result(rapidjson::kObjectType);
@@ -1247,21 +1249,25 @@ struct PS2DebugServer::Impl
         result.AddMember("gs_async", gsAsyncValue, allocator);
 
         const auto vuBackendStatus =
-            [&](const VuUnit &unit,
+            [&](VuBackendKind requested,
+                VuBackendKind resolved,
+                std::string_view name,
+                bool active,
+                bool nativeInstrumentation,
                 const PS2Runtime::DebugVuBackendDiagnostics &diagnostics)
         {
             Value value(rapidjson::kObjectType);
             addString(
                 value, "requested",
-                vuBackendKindName(unit.requestedBackend()), allocator);
+                vuBackendKindName(requested), allocator);
             addString(
                 value, "resolved",
-                vuBackendKindName(unit.resolvedBackend()), allocator);
-            addString(value, "name", unit.backendName(), allocator);
-            value.AddMember("active", unit.isActive(), allocator);
+                vuBackendKindName(resolved), allocator);
+            addString(value, "name", name, allocator);
+            value.AddMember("active", active, allocator);
             value.AddMember(
                 "native_instrumentation",
-                unit.nativeInstrumentationEnabled(), allocator);
+                nativeInstrumentation, allocator);
             value.AddMember(
                 "diagnostics_captured",
                 diagnostics.captured, allocator);
@@ -1611,11 +1617,23 @@ struct PS2DebugServer::Impl
         Value vuBackends(rapidjson::kObjectType);
         vuBackends.AddMember(
             "vu0",
-            vuBackendStatus(runtime.vu0(), vuDiagnostics[0u]),
+            vuBackendStatus(
+                runtime.vu0().requestedBackend(),
+                runtime.vu0().resolvedBackend(),
+                runtime.vu0().backendName(),
+                runtime.vu0().isActive(),
+                runtime.vu0().nativeInstrumentationEnabled(),
+                vuDiagnostics[0u]),
             allocator);
         vuBackends.AddMember(
             "vu1",
-            vuBackendStatus(runtime.vu1(), vuDiagnostics[1u]),
+            vuBackendStatus(
+                vu1Owner->requestedBackend,
+                vu1Owner->resolvedBackend,
+                vu1Owner->backendName,
+                vu1Owner->state.active,
+                vu1Owner->nativeInstrumentationEnabled,
+                vuDiagnostics[1u]),
             allocator);
         result.AddMember("vu_backends", vuBackends, allocator);
 
@@ -2565,12 +2583,11 @@ struct PS2DebugServer::Impl
         return result;
     }
 
-    Value vuRegisters(bool vu1, Allocator &allocator)
+    Value vuRegistersFromState(
+        bool vu1,
+        const VuExecutionState &state,
+        Allocator &allocator)
     {
-        QuiesceGuard guard(runtime);
-        const VuExecutionState state =
-            vu1 ? runtime.vu1().state()
-                : runtime.debugVu0ArchitecturalSnapshot();
         const auto floatValue = [](float value)
         {
             Value result;
@@ -2649,6 +2666,15 @@ struct PS2DebugServer::Impl
         result.AddMember("top", state.top, allocator);
         result.AddMember("itop", state.itop, allocator);
         return result;
+    }
+
+    Value vuRegisters(bool vu1, Allocator &allocator)
+    {
+        QuiesceGuard guard(runtime);
+        const VuExecutionState state =
+            vu1 ? runtime.snapshotVu1Owner()->state
+                : runtime.debugVu0ArchitecturalSnapshot();
+        return vuRegistersFromState(vu1, state, allocator);
     }
 
     Value iopRegisters(Allocator &allocator)
@@ -3360,27 +3386,39 @@ struct PS2DebugServer::Impl
                     : diagnostic);
         }
 
-        const VuUnit &selected =
-            unit == VuUnitId::Vu0
-                ? runtime.vu0()
-                : runtime.vu1();
         Value result(rapidjson::kObjectType);
         addString(result, "unit", unitText, allocator);
-        addString(
-            result, "requested",
-            vuBackendKindName(
-                selected.requestedBackend()),
-            allocator);
-        addString(
-            result, "resolved",
-            vuBackendKindName(
-                selected.resolvedBackend()),
-            allocator);
-        addString(
-            result, "name",
-            selected.backendName(), allocator);
-        result.AddMember(
-            "active", selected.isActive(), allocator);
+        if (unit == VuUnitId::Vu1)
+        {
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            addString(
+                result, "requested",
+                vuBackendKindName(snapshot->requestedBackend),
+                allocator);
+            addString(
+                result, "resolved",
+                vuBackendKindName(snapshot->resolvedBackend),
+                allocator);
+            addString(
+                result, "name", snapshot->backendName, allocator);
+            result.AddMember("active", snapshot->state.active, allocator);
+        }
+        else
+        {
+            const VuUnit &selected = runtime.vu0();
+            addString(
+                result, "requested",
+                vuBackendKindName(selected.requestedBackend()),
+                allocator);
+            addString(
+                result, "resolved",
+                vuBackendKindName(selected.resolvedBackend()),
+                allocator);
+            addString(
+                result, "name", selected.backendName(), allocator);
+            result.AddMember("active", selected.isActive(), allocator);
+        }
         return result;
     }
 
@@ -3901,9 +3939,17 @@ struct PS2DebugServer::Impl
                       Value &artifacts,
                       Allocator &allocator)
     {
+        QuiesceGuard guard(runtime);
+        const std::shared_ptr<const Vu1Snapshot> vu1Snapshot =
+            vu1 ? runtime.snapshotVu1Owner() : nullptr;
+        const VuExecutionState state =
+            vu1 ? vu1Snapshot->state
+                : runtime.debugVu0ArchitecturalSnapshot();
         Document document;
         document.SetObject();
-        document.CopyFrom(vuRegisters(vu1, document.GetAllocator()),
+        document.CopyFrom(
+                          vuRegistersFromState(
+                              vu1, state, document.GetAllocator()),
                           document.GetAllocator());
         const std::string prefix = vu1 ? "vu1" : "vu0";
         const auto statePath = root / (prefix + "-state.json");
@@ -3912,7 +3958,6 @@ struct PS2DebugServer::Impl
 
         if (vu1)
         {
-            const VuExecutionState state = runtime.vu1().state();
             std::array<uint32_t, 159> words{};
             words[0] = 0x31555652u; // "RVU1"
             words[1] = 1u;
@@ -3946,16 +3991,24 @@ struct PS2DebugServer::Impl
                 allocator);
         }
 
-        const uint8_t *code =
-            vu1 ? runtime.memory().getVU1Code() : runtime.memory().getVU0Code();
-        const uint8_t *data =
-            vu1 ? runtime.memory().getVU1Data() : runtime.memory().getVU0Data();
+        const uint8_t *code = vu1
+                                  ? vu1Snapshot->microMemory.data()
+                                  : runtime.memory().getVU0Code();
+        const uint8_t *data = vu1
+                                  ? vu1Snapshot->dataMemory.data()
+                                  : runtime.memory().getVU0Data();
         if (code == nullptr || data == nullptr)
         {
             return false;
         }
         const uint32_t codeSize = vu1 ? PS2_VU1_CODE_SIZE : PS2_VU0_CODE_SIZE;
         const uint32_t dataSize = vu1 ? PS2_VU1_DATA_SIZE : PS2_VU0_DATA_SIZE;
+        if (vu1 &&
+            (vu1Snapshot->microMemory.size() != codeSize ||
+             vu1Snapshot->dataMemory.size() != dataSize))
+        {
+            return false;
+        }
         const auto codePath = root / (prefix + "-code.bin");
         const auto dataPath = root / (prefix + "-data.bin");
         writeBytes(codePath, code, codeSize);
@@ -5223,7 +5276,7 @@ struct PS2DebugServer::Impl
             GsSetProgressTrackingCommand{
                 .enabled = true});
         runtime.vu0().setProgressTrackingEnabled(true);
-        runtime.vu1().setProgressTrackingEnabled(true);
+        runtime.setVu1ProgressTrackingEnabled(true);
         // Establish the requested initial execution state before the request
         // thread can consume a client command. The socket is already
         // listening here, so an eager client may queue a request, but that
@@ -5279,7 +5332,7 @@ struct PS2DebugServer::Impl
             GsSetProgressTrackingCommand{
                 .enabled = false});
         runtime.vu0().setProgressTrackingEnabled(false);
-        runtime.vu1().setProgressTrackingEnabled(false);
+        runtime.setVu1ProgressTrackingEnabled(false);
         (void)runtime.submitGsCommand(
             GsSetDebugHistoryPausedCommand{
                 .paused = true});

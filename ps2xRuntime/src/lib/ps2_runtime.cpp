@@ -1435,9 +1435,7 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
             "unsupported GS execution mode");
     }
 
-    m_vu1Executor =
-        std::make_unique<InlineVu1Executor>(
-            m_vu1CommandProcessor);
+    m_vu1ExecutionMode = configuration.vu1ExecutionMode;
 
     m_memory.installPostBiosTlbState();
     m_hostPresentationUploadState =
@@ -1577,6 +1575,45 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     configureNativeInstrumentation(
         m_vu1, configuration.vu1NativeInstrumentation,
         "PS2X_VU1_NATIVE_INSTRUMENTATION");
+
+    // Finish configuring VU1 before a threaded executor claims ownership.
+    // Once the worker exists, all architectural and backend mutation enters
+    // the ordered command stream.
+    switch (m_vu1ExecutionMode)
+    {
+    case Vu1ExecutionMode::Inline:
+        m_vu1Executor =
+            std::make_unique<InlineVu1Executor>(
+                m_vu1CommandProcessor);
+        break;
+    case Vu1ExecutionMode::ThreadedSynchronous:
+    {
+        auto executor =
+            std::make_unique<ThreadedVu1Executor>(
+                m_vu1CommandProcessor,
+                ThreadedVu1ExecutorOptions{
+                    .queueCapacity =
+                        configuration.vu1CommandQueueCapacity,
+                    .payloadCapacityBytes =
+                        configuration.
+                            vu1CommandPayloadCapacityBytes,
+                    .beforeProcess =
+                        std::move(configuration.vu1BeforeProcess),
+                    .beforePublish =
+                        std::move(configuration.vu1BeforePublish),
+                });
+        m_threadedVu1Executor = executor.get();
+        m_vu1Executor = std::move(executor);
+        break;
+    }
+    case Vu1ExecutionMode::ThreadedAsync:
+        throw std::invalid_argument(
+            "asynchronous VU1 execution is not enabled until its "
+            "publication pipeline is configured");
+    default:
+        throw std::invalid_argument(
+            "unsupported VU1 execution mode");
+    }
 
     m_eeThreadDiagnosticsEnabled =
         configuration.eeThreadDiagnostics;
@@ -1886,6 +1923,11 @@ PS2Runtime::~PS2Runtime()
         {
             m_threadedGsExecutor->shutdown(
                 GsExecutorShutdownMode::Drain);
+        }
+        if (m_threadedVu1Executor)
+        {
+            m_threadedVu1Executor->shutdown(
+                Vu1ExecutorShutdownMode::Drain);
         }
         m_iopSubsystem.reset();
         m_iopHost.reset();
@@ -3485,6 +3527,32 @@ PS2Runtime::gsAsyncStatistics() const
     return statistics;
 }
 
+ThreadedVu1ExecutorStatistics
+PS2Runtime::vu1OwnerStatistics() const
+{
+    return m_threadedVu1Executor
+        ? m_threadedVu1Executor->statistics()
+        : ThreadedVu1ExecutorStatistics{};
+}
+
+std::shared_ptr<const Vu1Snapshot>
+PS2Runtime::snapshotVu1Owner()
+{
+    std::shared_ptr<const Vu1Snapshot> result;
+    const auto capture =
+        [this, &result]()
+        {
+            result = captureVu1OwnerSnapshot();
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+        return result;
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
+    return result;
+}
+
 void PS2Runtime::cancelEeCounterEvent() noexcept
 {
     if (m_eeCounterEventToken.generation != 0u)
@@ -5008,7 +5076,8 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     if (m_boundRdram == rdram && m_boundGSVram == gsVram &&
-        m_vu1CommandProcessor.codeGeneration() ==
+        m_publishedVu1CodeGeneration.load(
+            std::memory_order_acquire) ==
             m_memory.getVU1CodeGeneration())
     {
         return true;
@@ -5018,10 +5087,29 @@ bool PS2Runtime::syncCoreSubsystems()
         gsVram,
         static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
         m_gsAsyncEnabled ? nullptr : &m_memory.gs());
-    m_vu1CommandProcessor.bindMemory(
-        m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-        m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-        m_memory.getVU1CodeGeneration(), &m_memory);
+    if (m_vu1ExecutionMode == Vu1ExecutionMode::Inline)
+    {
+        m_vu1CommandProcessor.claimOwnerThread(
+            std::this_thread::get_id());
+        m_vu1CommandProcessor.bindInlineDiagnosticsObserver(
+            &m_memory);
+    }
+    const uint8_t *const vu1Code = m_memory.getVU1Code();
+    const uint8_t *const vu1Data = m_memory.getVU1Data();
+    if (!vu1Code || !vu1Data)
+        return false;
+    (void)submitVu1Command(
+        Vu1BindMemoryCommand{
+            .microMemory = std::vector<uint8_t>(
+                vu1Code, vu1Code + PS2_VU1_CODE_SIZE),
+            .dataMemory = std::vector<uint8_t>(
+                vu1Data, vu1Data + PS2_VU1_DATA_SIZE),
+            .codeGeneration =
+                m_memory.getVU1CodeGeneration(),
+            .deferredDiagnostics =
+                m_vu1ExecutionMode != Vu1ExecutionMode::Inline,
+        });
+    m_vu1MemoryMirrorDirty = false;
     m_gifArbiter.reset();
     m_gifArbiter.setProcessBatchFn(
         [this](GifArbiterDrainBatch batch)
@@ -5084,14 +5172,14 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setVu1DecodedUnpackCallback(
         [this](Vu1DecodedUnpackCommand command)
         {
-            return m_vu1Executor->submitDecodedUnpack(
+            return submitVu1DecodedUnpack(
                 std::move(command), currentEeTick().raw(),
                 m_vu1ExecutionTiming.generation);
         });
     m_memory.setVu1VifStateUpdateCallback(
         [this](Vu1VifStateUpdateCommand command)
         {
-            return m_vu1Executor->submitVifStateUpdate(
+            return submitVu1VifStateUpdate(
                 command, currentEeTick().raw(),
                 m_vu1ExecutionTiming.generation);
         });
@@ -5110,7 +5198,13 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setVu1BusyCallback(
         [this]()
         {
-            return m_vu1.isActive();
+            return m_publishedVu1Active.load(
+                std::memory_order_acquire);
+        });
+    m_memory.setVu1MemoryObservationCallback(
+        [this]()
+        {
+            synchronizeVu1MemoryMirror();
         });
     m_memory.setVif1ResetCallback(
         [this]()
@@ -6148,6 +6242,12 @@ Vu1CommandResult PS2Runtime::submitVu1Command(
         throw std::runtime_error(
             "VU1 command executor is unavailable");
     }
+    const Vu1CommandType type = vu1CommandType(payload);
+    if (type != Vu1CommandType::SetDiagnostics)
+    {
+        refreshVu1DiagnosticsConfiguration(
+            guestTick, publicationToken);
+    }
     Vu1CommandResult result = m_vu1Executor->submit(
         std::move(payload), guestTick, publicationToken);
     if (result.disposition !=
@@ -6157,6 +6257,7 @@ Vu1CommandResult PS2Runtime::submitVu1Command(
             std::string("VU1 command rejected: ") +
             vu1CommandTypeName(result.digest.type));
     }
+    publishVu1CommandResult(result);
     return result;
 }
 
@@ -6170,6 +6271,8 @@ Vu1CommandResult PS2Runtime::submitVu1AdvanceSlice(
         throw std::runtime_error(
             "VU1 command executor is unavailable");
     }
+    refreshVu1DiagnosticsConfiguration(
+        guestTick, publicationToken);
     Vu1CommandResult result =
         m_vu1Executor->submitAdvanceSlice(
             command, guestTick, publicationToken);
@@ -6180,7 +6283,171 @@ Vu1CommandResult PS2Runtime::submitVu1AdvanceSlice(
             std::string("VU1 command rejected: ") +
             vu1CommandTypeName(result.digest.type));
     }
+    publishVu1CommandResult(result);
     return result;
+}
+
+Vu1CommandResult PS2Runtime::submitVu1DecodedUnpack(
+    Vu1DecodedUnpackCommand command,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    if (!m_vu1Executor)
+    {
+        throw std::runtime_error(
+            "VU1 command executor is unavailable");
+    }
+    refreshVu1DiagnosticsConfiguration(
+        guestTick, publicationToken);
+    Vu1CommandResult result =
+        m_vu1Executor->submitDecodedUnpack(
+            std::move(command), guestTick,
+            publicationToken);
+    if (result.disposition !=
+        Vu1CommandDisposition::Completed)
+    {
+        throw std::runtime_error(
+            "VU1 command rejected: decoded-unpack");
+    }
+    publishVu1CommandResult(result);
+    return result;
+}
+
+Vu1CommandResult PS2Runtime::submitVu1VifStateUpdate(
+    Vu1VifStateUpdateCommand command,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    if (!m_vu1Executor)
+    {
+        throw std::runtime_error(
+            "VU1 command executor is unavailable");
+    }
+    refreshVu1DiagnosticsConfiguration(
+        guestTick, publicationToken);
+    Vu1CommandResult result =
+        m_vu1Executor->submitVifStateUpdate(
+            command, guestTick, publicationToken);
+    if (result.disposition !=
+        Vu1CommandDisposition::Completed)
+    {
+        throw std::runtime_error(
+            "VU1 command rejected: vif-state-update");
+    }
+    publishVu1CommandResult(result);
+    return result;
+}
+
+void PS2Runtime::refreshVu1DiagnosticsConfiguration(
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    const bool traceEnabled = m_memory.vuTraceEnabled();
+    const bool workloadProfileEnabled =
+        m_memory.vuWorkloadProfileEnabled();
+    if (traceEnabled == m_publishedVu1TraceEnabled &&
+        workloadProfileEnabled ==
+            m_publishedVu1WorkloadProfileEnabled)
+    {
+        return;
+    }
+
+    Vu1CommandResult result = m_vu1Executor->submit(
+        Vu1SetDiagnosticsCommand{
+            .traceEnabled = traceEnabled,
+            .workloadProfileEnabled =
+                workloadProfileEnabled,
+        },
+        guestTick, publicationToken);
+    if (result.disposition !=
+        Vu1CommandDisposition::Completed)
+    {
+        throw std::runtime_error(
+            "VU1 command rejected: set-diagnostics");
+    }
+    m_publishedVu1TraceEnabled = traceEnabled;
+    m_publishedVu1WorkloadProfileEnabled =
+        workloadProfileEnabled;
+    publishVu1CommandResult(result);
+}
+
+void PS2Runtime::publishVu1CommandResult(
+    const Vu1CommandResult &result)
+{
+    m_publishedVu1Active.store(
+        result.active, std::memory_order_release);
+    m_publishedVu1ProgramCounter.store(
+        result.programCounter,
+        std::memory_order_release);
+    m_publishedVu1CodeGeneration.store(
+        result.codeGeneration,
+        std::memory_order_release);
+
+    switch (result.digest.type)
+    {
+    case Vu1CommandType::BindMemory:
+        m_vu1MemoryMirrorDirty = false;
+        break;
+    case Vu1CommandType::MicroMemoryWrite:
+    case Vu1CommandType::DataMemoryWrite:
+    case Vu1CommandType::DecodedUnpack:
+    case Vu1CommandType::AdvanceSlice:
+    case Vu1CommandType::Reset:
+    case Vu1CommandType::Restore:
+        m_vu1MemoryMirrorDirty = true;
+        break;
+    default:
+        break;
+    }
+
+    if (!result.diagnostics.empty())
+    {
+        replayVu1Diagnostics(result.diagnostics, m_memory);
+    }
+}
+
+std::shared_ptr<const Vu1Snapshot>
+PS2Runtime::captureVu1OwnerSnapshot(
+    bool includeBackendDiagnostics)
+{
+    const Vu1CommandResult result = submitVu1Command(
+        Vu1SnapshotCommand{
+            .includeBackendDiagnostics =
+                includeBackendDiagnostics},
+        currentEeTick().raw(),
+        m_vu1ExecutionTiming.generation);
+    const auto *const snapshot =
+        std::get_if<Vu1SnapshotResult>(&result.payload);
+    if (!snapshot || !snapshot->snapshot)
+    {
+        throw std::runtime_error(
+            "VU1 snapshot command returned no state");
+    }
+    return snapshot->snapshot;
+}
+
+void PS2Runtime::synchronizeVu1MemoryMirror()
+{
+    if (!m_vu1MemoryMirrorDirty ||
+        m_vu1MemoryMirrorSynchronizationActive)
+    {
+        return;
+    }
+
+    m_vu1MemoryMirrorSynchronizationActive = true;
+    try
+    {
+        const std::shared_ptr<const Vu1Snapshot> snapshot =
+            captureVu1OwnerSnapshot();
+        m_memory.publishVu1MemorySnapshot(*snapshot);
+        m_vu1MemoryMirrorDirty = false;
+        m_vu1MemoryMirrorSynchronizationActive = false;
+    }
+    catch (...)
+    {
+        m_vu1MemoryMirrorSynchronizationActive = false;
+        throw;
+    }
 }
 
 void PS2Runtime::publishVu1SliceEffects(
@@ -6275,11 +6542,12 @@ void PS2Runtime::serviceVU1AtEvent(
     m_vu1ExecutionTiming.eventToken = {
         ps2x::timing::EeEventSource::VifVu1Finish, 0u};
 
-    if (!m_vu1.isActive())
+    if (!m_publishedVu1Active.load(std::memory_order_acquire))
     {
         setVU1BusyFlag(ctx, false);
         (void)m_memory.resumeVIF1AfterVu();
-        if (!m_vu1.isActive() &&
+        if (!m_publishedVu1Active.load(
+                std::memory_order_acquire) &&
             !m_memory.vif1DmaSnapshot().active)
             m_memory.finishVif1DmaTrace();
         return;
@@ -6325,7 +6593,7 @@ void PS2Runtime::serviceVU1AtEvent(
     m_vu1ExecutionTiming.totalAdvancedCycles +=
         advance.executedCycles;
 
-    if (m_vu1.isActive())
+    if (commandResult.active)
     {
         m_vu1ExecutionTiming.lastAdvancedTick =
             ps2x::timing::saturatingAdd(
@@ -6344,7 +6612,8 @@ void PS2Runtime::serviceVU1AtEvent(
         service.serviceTick;
     setVU1BusyFlag(ctx, false);
     (void)m_memory.resumeVIF1AfterVu();
-    if (!m_vu1.isActive() &&
+    if (!m_publishedVu1Active.load(
+            std::memory_order_acquire) &&
         !m_memory.vif1DmaSnapshot().active)
         m_memory.finishVif1DmaTrace();
 }
@@ -9293,8 +9562,10 @@ PS2Runtime::debugEeEventDeviceState(
             m_vu1ExecutionTiming.lastAdvancedTick.raw();
         result.totalAdvancedCycles =
             m_vu1ExecutionTiming.totalAdvancedCycles;
-        result.pc = m_vu1.state().pc;
-        result.active = m_vu1.isActive();
+        result.pc = m_publishedVu1ProgramCounter.load(
+            std::memory_order_acquire);
+        result.active = m_publishedVu1Active.load(
+            std::memory_order_acquire);
         return result;
     case ps2x::timing::EeEventSource::VifVu0Finish:
         result.kind = DebugEeEventDeviceKind::Vu0;
@@ -11137,17 +11408,20 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
 {
     const uint64_t sequence =
         ++m_debugVuBackendDiagnosticsSequence;
-    const auto captureUnit =
-        [sequence](const VuUnit &unit)
+    const auto convertSnapshot =
+        [sequence](
+            const VuExecutionState &state,
+            VuExitReason lastExitReason,
+            const VuVerifyDiagnostics &verify,
+            const VuProgramCacheDiagnostics *cacheSnapshot,
+            const Vu1RecompilerSnapshot *recompilerSnapshot)
         {
             DebugVuBackendDiagnostics result{};
             result.snapshotSequence = sequence;
-            result.issuedCycles = unit.state().issuedCycles;
-            result.pc = unit.state().pc;
-            result.lastExitReason = unit.lastExitReason();
+            result.issuedCycles = state.issuedCycles;
+            result.pc = state.pc;
+            result.lastExitReason = lastExitReason;
             result.captured = true;
-            const VuVerifyDiagnostics &verify =
-                unit.verifyDiagnostics();
             result.verify = {
                 .runs = verify.runs,
                 .comparedPairs = verify.comparedPairs,
@@ -11158,12 +11432,10 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                 .lastMismatch = verify.lastMismatch,
             };
 
-            if (const VuProgramCache *const cache =
-                    unit.programCacheIfCreated())
+            if (cacheSnapshot)
             {
-                const VuProgramCacheDiagnostics source =
-                    cache->
-                        diagnosticsWhileExecutionQuiescent();
+                const VuProgramCacheDiagnostics &source =
+                    *cacheSnapshot;
                 result.cacheCreated = true;
                 result.cache = {
                     .hits = source.hits,
@@ -11211,26 +11483,27 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                 };
             }
 
-            if (const VuRecompilerBackend *const backend =
-                    unit.recompilerIfCreated())
+            if (recompilerSnapshot)
             {
-                const VuRecompilerDiagnostics source =
-                    backend->diagnostics();
+                const VuRecompilerDiagnostics &source =
+                    recompilerSnapshot->diagnostics;
                 result.recompilerCreated = true;
                 result.recompiler = {
                     .blockLinkingEnabled =
-                        backend->blockLinkingEnabled(),
+                        recompilerSnapshot->
+                            blockLinkingEnabled,
                     .blockBudgetGuardsEnabled =
-                        backend->
-                            blockBudgetGuardsEnabled(),
+                        recompilerSnapshot->
+                            blockBudgetGuardsEnabled,
                     .blockLocalVfRegistersEnabled =
-                        backend->
-                            blockLocalVfRegistersEnabled(),
+                        recompilerSnapshot->
+                            blockLocalVfRegistersEnabled,
                     .blockLocalVfRegistersAutomatic =
-                        backend->
-                            blockLocalVfRegistersAutomatic(),
+                        recompilerSnapshot->
+                            blockLocalVfRegistersAutomatic,
                     .inlineXgkickEnabled =
-                        backend->inlineXgkickEnabled(),
+                        recompilerSnapshot->
+                            inlineXgkickEnabled,
                     .nativeEntries = source.nativeEntries,
                     .nativeBlocks = source.nativeBlocks,
                     .nativePairs = source.nativePairs,
@@ -11290,12 +11563,11 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                     .jitDumpFailures =
                         source.jitDumpFailures,
                     .lastJitDiagnostic =
-                        backend->lastJitDiagnostic(),
+                        recompilerSnapshot->lastJitDiagnostic,
                 };
 
-                const VuBlockProfilingSnapshot profile =
-                    backend->
-                        blockProfilingSnapshotWhileExecutionQuiescent();
+                const VuBlockProfilingSnapshot &profile =
+                    recompilerSnapshot->blockProfile;
                 auto &destination = result.recompiler;
                 destination.blockProfileEnabled =
                     profile.enabled;
@@ -11420,9 +11692,75 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
             return result;
         };
 
+    const auto captureUnit =
+        [&](const VuUnit &unit)
+        {
+            std::optional<VuProgramCacheDiagnostics> cache;
+            if (const VuProgramCache *const source =
+                    unit.programCacheIfCreated())
+            {
+                cache =
+                    source->
+                        diagnosticsWhileExecutionQuiescent();
+            }
+            std::optional<Vu1RecompilerSnapshot> recompiler;
+            if (const VuRecompilerBackend *const source =
+                    unit.recompilerIfCreated())
+            {
+                recompiler = Vu1RecompilerSnapshot{
+                    .diagnostics = source->diagnostics(),
+                    .blockProfile =
+                        source->
+                            blockProfilingSnapshotWhileExecutionQuiescent(),
+                    .lastJitDiagnostic =
+                        source->lastJitDiagnostic(),
+                    .blockLinkingEnabled =
+                        source->blockLinkingEnabled(),
+                    .blockBudgetGuardsEnabled =
+                        source->blockBudgetGuardsEnabled(),
+                    .blockLocalVfRegistersEnabled =
+                        source->blockLocalVfRegistersEnabled(),
+                    .blockLocalVfRegistersAutomatic =
+                        source->
+                            blockLocalVfRegistersAutomatic(),
+                    .inlineXgkickEnabled =
+                        source->inlineXgkickEnabled(),
+                };
+            }
+            return convertSnapshot(
+                unit.state(), unit.lastExitReason(),
+                unit.verifyDiagnostics(),
+                cache ? &*cache : nullptr,
+                recompiler ? &*recompiler : nullptr);
+        };
+
+    DebugVuBackendDiagnostics vu1Diagnostics{};
+    if (m_threadedVu1Executor)
+    {
+        const std::shared_ptr<const Vu1Snapshot> snapshot =
+            captureVu1OwnerSnapshot(true);
+        const Vu1BackendDiagnosticsSnapshot *const backend =
+            snapshot->backendDiagnostics
+                ? &*snapshot->backendDiagnostics
+                : nullptr;
+        vu1Diagnostics = convertSnapshot(
+            snapshot->state, snapshot->lastExitReason,
+            snapshot->verify,
+            backend && backend->programCache
+                ? &*backend->programCache
+                : nullptr,
+            backend && backend->recompiler
+                ? &*backend->recompiler
+                : nullptr);
+    }
+    else
+    {
+        vu1Diagnostics = captureUnit(m_vu1);
+    }
+
     const std::array<DebugVuBackendDiagnostics, 2u> snapshots{
         captureUnit(m_vu0),
-        captureUnit(m_vu1),
+        std::move(vu1Diagnostics),
     };
     std::lock_guard<std::mutex> lock(
         m_debugVuBackendDiagnosticsMutex);
@@ -11795,6 +12133,53 @@ bool PS2Runtime::debugSetVuBackend(
             "VU backend changes require paused guest execution");
     }
 
+    const auto applyBackend =
+        [this, unit, backend, diagnostic]()
+        {
+            if (unit == VuUnitId::Vu1 &&
+                m_threadedVu1Executor)
+            {
+                const Vu1CommandResult result =
+                    submitVu1Command(
+                        Vu1SetBackendCommand{backend},
+                        currentEeTick().raw(),
+                        m_vu1ExecutionTiming.generation);
+                const auto *const status =
+                    std::get_if<Vu1BackendStatusResult>(
+                        &result.payload);
+                if (!status)
+                {
+                    if (diagnostic)
+                    {
+                        *diagnostic =
+                            "VU1 owner returned no backend status";
+                    }
+                    return false;
+                }
+                if (diagnostic)
+                    *diagnostic = status->diagnostic;
+                return status->accepted;
+            }
+
+            VuUnit *target = nullptr;
+            switch (unit)
+            {
+            case VuUnitId::Vu0:
+                target = &m_vu0;
+                break;
+            case VuUnitId::Vu1:
+                target = &m_vu1;
+                break;
+            }
+            if (!target)
+            {
+                if (diagnostic)
+                    *diagnostic = "unknown VU unit";
+                return false;
+            }
+            return target->setBackend(backend, diagnostic);
+        };
+
     if (m_eeRuntimeExecutor &&
         m_eeRuntimeExecutor->running() &&
         !m_eeRuntimeExecutor->ownsCurrentThread())
@@ -11802,35 +12187,14 @@ bool PS2Runtime::debugSetVuBackend(
         bool changed = false;
         const bool invoked =
             invokeEeExecutorTaskAtBoundary(
-                [this, unit, backend, diagnostic, &changed]()
+                [this, diagnostic, &changed, applyBackend]()
                 {
                     if (!debugIsPaused())
                     {
                         return;
                     }
 
-                    VuUnit *target = nullptr;
-                    switch (unit)
-                    {
-                    case VuUnitId::Vu0:
-                        target = &m_vu0;
-                        break;
-                    case VuUnitId::Vu1:
-                        target = &m_vu1;
-                        break;
-                    }
-                    if (!target)
-                    {
-                        if (diagnostic)
-                        {
-                            *diagnostic =
-                                "unknown VU unit";
-                        }
-                        return;
-                    }
-                    changed =
-                        target->setBackend(
-                            backend, diagnostic);
+                    changed = applyBackend();
                     if (changed)
                     {
                         debugPublishVuBackendDiagnostics();
@@ -11867,19 +12231,7 @@ bool PS2Runtime::debugSetVuBackend(
             "guest execution resumed before the VU backend change");
     }
 
-    VuUnit *target = nullptr;
-    switch (unit)
-    {
-    case VuUnitId::Vu0:
-        target = &m_vu0;
-        break;
-    case VuUnitId::Vu1:
-        target = &m_vu1;
-        break;
-    }
-    if (!target)
-        return fail("unknown VU unit");
-    if (!target->setBackend(backend, diagnostic))
+    if (!applyBackend())
         return false;
 
     debugPublishVuBackendDiagnostics();
@@ -12426,8 +12778,10 @@ PS2Runtime::debugVu1TimingSnapshot()
             result.totalAdvancedCycles =
                 m_vu1ExecutionTiming
                     .totalAdvancedCycles;
-            result.pc = m_vu1.state().pc;
-            result.active = m_vu1.isActive();
+            result.pc = m_publishedVu1ProgramCounter.load(
+                std::memory_order_acquire);
+            result.active = m_publishedVu1Active.load(
+                std::memory_order_acquire);
             result.vifWaitingForVu =
                 m_memory.vif1WaitingForVu();
             const auto event =

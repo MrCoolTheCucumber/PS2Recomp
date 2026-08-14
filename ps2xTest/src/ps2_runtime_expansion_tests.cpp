@@ -231,6 +231,21 @@ namespace
         std::memcpy(code + pc + sizeof(lower), &upper, sizeof(upper));
     }
 
+    void writeVu1DataBytes(
+        PS2Memory &memory,
+        uint32_t offset,
+        const uint8_t *bytes,
+        size_t size)
+    {
+        for (size_t index = 0u; index < size; ++index)
+        {
+            memory.write8(
+                PS2_VU1_DATA_BASE + offset +
+                    static_cast<uint32_t>(index),
+                bytes[index]);
+        }
+    }
+
     bool hasSignedRdWrite(const std::string &generated, uint8_t rd)
     {
         if (rd == 0u)
@@ -5769,9 +5784,7 @@ void register_ps2_runtime_expansion_tests()
             constexpr uint32_t kVuUpperNop = 0x000002FFu;
             constexpr uint32_t kVuUpperEnd = 0x400002FFu;
             uint8_t *const code = runtime.memory().getVU1Code();
-            uint8_t *const data = runtime.memory().getVU1Data();
             std::memset(code, 0, PS2_VU1_CODE_SIZE);
-            std::memset(data, 0, PS2_VU1_DATA_SIZE);
             writeVuInstructionPair(
                 code, 0u,
                 makeVuLowerSpecial(0x6Cu, 0u),
@@ -5780,7 +5793,13 @@ void register_ps2_runtime_expansion_tests()
             runtime.memory().markVU1CodeModified();
             const uint64_t path1Tag =
                 makeGifTag(0u, GIF_FMT_PACKED, 1u);
-            std::memcpy(data, &path1Tag, sizeof(path1Tag));
+            std::array<uint8_t, 16u> path1Packet{};
+            std::memcpy(
+                path1Packet.data(), &path1Tag,
+                sizeof(path1Tag));
+            writeVu1DataBytes(
+                runtime.memory(), 0u,
+                path1Packet.data(), path1Packet.size());
 
             const std::array<uint32_t, 3u> commands = {
                 makeVifCmd(0x14u, 0u, 0u), // MSCAL.
@@ -8308,9 +8327,7 @@ void register_ps2_runtime_expansion_tests()
 
             constexpr uint32_t kVuUpperNop = 0x000002FFu;
             uint8_t *const code = runtime.memory().getVU1Code();
-            uint8_t *const data = runtime.memory().getVU1Data();
             std::memset(code, 0, PS2_VU1_CODE_SIZE);
-            std::memset(data, 0, PS2_VU1_DATA_SIZE);
             for (uint32_t pc = 0u; pc < 2048u; pc += 8u)
                 writeVuInstructionPair(code, pc, 0u, kVuUpperNop);
             writeVuInstructionPair(
@@ -8322,13 +8339,18 @@ void register_ps2_runtime_expansion_tests()
             constexpr uint16_t kPayloadQwords = 12u;
             const uint64_t tag =
                 makeGifTag(kPayloadQwords, GIF_FMT_IMAGE, 0u);
-            std::memcpy(data, &tag, sizeof(tag));
+            std::vector<uint8_t> packet(
+                (kPayloadQwords + 1u) * 16u, 0u);
+            std::memcpy(packet.data(), &tag, sizeof(tag));
             for (uint32_t index = 0u;
                  index < kPayloadQwords * 16u; ++index)
             {
-                data[16u + index] =
+                packet[16u + index] =
                     static_cast<uint8_t>(index);
             }
+            writeVu1DataBytes(
+                runtime.memory(), 0u,
+                packet.data(), packet.size());
 
             const uint32_t mscal = makeVifCmd(0x14u, 0u, 0u);
             runtime.memory().processVIF1Data(
@@ -8396,10 +8418,7 @@ void register_ps2_runtime_expansion_tests()
             constexpr uint32_t kVuUpperNop = 0x000002FFu;
             uint8_t *const code =
                 runtime.memory().getVU1Code();
-            uint8_t *const data =
-                runtime.memory().getVU1Data();
             std::memset(code, 0, PS2_VU1_CODE_SIZE);
-            std::memset(data, 0, PS2_VU1_DATA_SIZE);
             for (uint32_t pc = 0u; pc < 2048u; pc += 8u)
             {
                 writeVuInstructionPair(
@@ -8415,13 +8434,18 @@ void register_ps2_runtime_expansion_tests()
             const uint64_t tag =
                 makeGifTag(
                     kPayloadQwords, GIF_FMT_IMAGE, 0u);
-            std::memcpy(data, &tag, sizeof(tag));
+            std::vector<uint8_t> packet(
+                (kPayloadQwords + 1u) * 16u, 0u);
+            std::memcpy(packet.data(), &tag, sizeof(tag));
             for (uint32_t index = 0u;
                  index < kPayloadQwords * 16u; ++index)
             {
-                data[16u + index] =
+                packet[16u + index] =
                     static_cast<uint8_t>(index);
             }
+            writeVu1DataBytes(
+                runtime.memory(), 0u,
+                packet.data(), packet.size());
 
             const uint32_t mscal =
                 makeVifCmd(0x14u, 0u, 0u);

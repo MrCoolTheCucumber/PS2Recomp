@@ -970,6 +970,8 @@ PS2Memory::processVif1Stream()
             {
                 const bool profileUpload =
                     isVu1WorkloadProfileEnabled();
+                if (profileUpload)
+                    observeVu1Memory();
                 const bool identical =
                     profileUpload &&
                     equalsWrappedMicroMemory(

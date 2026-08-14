@@ -143,12 +143,28 @@ namespace
         return true;
     }
 
+    bool parseVu1ExecutionMode(
+        const std::string &text,
+        Vu1ExecutionMode &mode)
+    {
+        if (text == "inline")
+            mode = Vu1ExecutionMode::Inline;
+        else if (text == "threaded-sync")
+            mode = Vu1ExecutionMode::ThreadedSynchronous;
+        else if (text == "threaded-async")
+            mode = Vu1ExecutionMode::ThreadedAsync;
+        else
+            return false;
+        return true;
+    }
+
     void printUsage(const char *program)
     {
         std::cout
             << "Usage: " << program
             << " [--renderer software|hybrid|verify|gpu-strict]"
                " [--gs-execution inline|threaded-sync|threaded-async]"
+               " [--vu1-execution inline|threaded-sync|threaded-async]"
                " [ELF [CD_IMAGE]]\n";
     }
 
@@ -157,6 +173,7 @@ namespace
         bool showHelp = false;
         GsRendererMode rendererMode = GsRendererMode::Software;
         GsExecutionMode gsExecutionMode = GsExecutionMode::Inline;
+        Vu1ExecutionMode vu1ExecutionMode = Vu1ExecutionMode::Inline;
         std::vector<std::filesystem::path> positionalPaths;
     };
 
@@ -195,6 +212,17 @@ namespace
                 {
                     throw std::invalid_argument(
                         "--gs-execution requires inline, threaded-sync, or threaded-async");
+                }
+                continue;
+            }
+            if (!optionsEnded && argument == "--vu1-execution")
+            {
+                if (++i >= argc || !argv[i] ||
+                    !parseVu1ExecutionMode(
+                        argv[i], options.vu1ExecutionMode))
+                {
+                    throw std::invalid_argument(
+                        "--vu1-execution requires inline, threaded-sync, or threaded-async");
                 }
                 continue;
             }
@@ -292,6 +320,8 @@ int main(int argc, char *argv[])
             defaultPs2RuntimeConfiguration();
         runtimeConfiguration.gsExecutionMode =
             options.gsExecutionMode;
+        runtimeConfiguration.vu1ExecutionMode =
+            options.vu1ExecutionMode;
         PS2Runtime runtime(runtimeConfiguration);
         configureOptionalCdImage(runtime, options);
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
@@ -344,6 +374,10 @@ int main(int argc, char *argv[])
         std::cout
             << "GS execution: "
             << gsExecutionModeName(options.gsExecutionMode)
+            << std::endl;
+        std::cout
+            << "VU1 execution: "
+            << vu1ExecutionModeName(options.vu1ExecutionMode)
             << std::endl;
 
         if (!runtime.loadELF(filePathStr))
