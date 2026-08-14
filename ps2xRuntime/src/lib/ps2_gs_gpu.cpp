@@ -566,6 +566,49 @@ namespace
     std::atomic<uint32_t> s_debugLocalCopyCount{0};
 }
 
+void publishGsPrivilegedSideEffects(
+    GSRegisters &registers,
+    const std::vector<GsPrivilegedSideEffect> &effects)
+{
+    for (const GsPrivilegedSideEffect &effect : effects)
+    {
+        std::visit(
+            [&](const auto &value)
+            {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, GsSignalEffect>)
+                {
+                    const uint32_t low =
+                        (static_cast<uint32_t>(registers.siglblid) &
+                         ~value.mask) |
+                        (value.id & value.mask);
+                    registers.siglblid =
+                        (registers.siglblid & 0xFFFFFFFF00000000ull) |
+                        low;
+                    registers.csr.fetch_or(
+                        0x1u, std::memory_order_release);
+                }
+                else if constexpr (std::is_same_v<T, GsFinishEffect>)
+                {
+                    registers.csr.fetch_or(
+                        0x2u, std::memory_order_release);
+                }
+                else if constexpr (std::is_same_v<T, GsLabelEffect>)
+                {
+                    const uint32_t high =
+                        (static_cast<uint32_t>(
+                             registers.siglblid >> 32u) &
+                         ~value.mask) |
+                        (value.id & value.mask);
+                    registers.siglblid =
+                        (static_cast<uint64_t>(high) << 32u) |
+                        (registers.siglblid & 0xFFFFFFFFull);
+                }
+            },
+            effect);
+    }
+}
+
 using namespace GSInternal;
 
 GS::GS()
@@ -1462,12 +1505,34 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
 void GS::latchHostPresentationFrame()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    latchHostPresentationFrameUnlocked();
+    GsPrivilegedRegisterSnapshot registers{};
+    if (m_privRegs)
+    {
+        registers = {
+            .valid = true,
+            .pmode = m_privRegs->pmode,
+            .smode2 = m_privRegs->smode2,
+            .dispfb1 = m_privRegs->dispfb1,
+            .display1 = m_privRegs->display1,
+            .dispfb2 = m_privRegs->dispfb2,
+            .display2 = m_privRegs->display2,
+            .bgcolor = m_privRegs->bgcolor,
+        };
+    }
+    latchHostPresentationFrameUnlocked(registers);
 }
 
-void GS::latchHostPresentationFrameUnlocked()
+void GS::latchHostPresentationFrame(
+    const GsPrivilegedRegisterSnapshot &registers)
 {
-    if (!m_privRegs || !m_vram || m_vramSize == 0u)
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    latchHostPresentationFrameUnlocked(registers);
+}
+
+void GS::latchHostPresentationFrameUnlocked(
+    const GsPrivilegedRegisterSnapshot &registers)
+{
+    if (!registers.valid || !m_vram || m_vramSize == 0u)
     {
         m_hostPresentationFrame.clear();
         m_hostPresentationWidth = 0u;
@@ -1479,27 +1544,27 @@ void GS::latchHostPresentationFrameUnlocked()
         return;
     }
 
-    const GSPmodeState pmode = decodePmode(m_privRegs->pmode);
-    const GSSmode2State smode2 = decodeSMode2(m_privRegs->smode2);
-    const GSFrameReg displayFrame1 = decodeDisplayFrame(m_privRegs->dispfb1);
-    const GSFrameReg displayFrame2 = decodeDisplayFrame(m_privRegs->dispfb2);
-    const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(m_privRegs->dispfb1);
-    const GSDisplayReadOrigin displayOrigin2 = decodeDisplayReadOrigin(m_privRegs->dispfb2);
+    const GSPmodeState pmode = decodePmode(registers.pmode);
+    const GSSmode2State smode2 = decodeSMode2(registers.smode2);
+    const GSFrameReg displayFrame1 = decodeDisplayFrame(registers.dispfb1);
+    const GSFrameReg displayFrame2 = decodeDisplayFrame(registers.dispfb2);
+    const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(registers.dispfb1);
+    const GSDisplayReadOrigin displayOrigin2 = decodeDisplayReadOrigin(registers.dispfb2);
 
     uint32_t width1 = 0u;
     uint32_t height1 = 0u;
     uint32_t width2 = 0u;
     uint32_t height2 = 0u;
-    decodeDisplaySize(m_privRegs->display1, width1, height1);
-    decodeDisplaySize(m_privRegs->display2, width2, height2);
+    decodeDisplaySize(registers.display1, width1, height1);
+    decodeDisplaySize(registers.display2, width2, height2);
     if (smode2.interlaced && smode2.frameMode)
     {
         height1 = (height1 + 1u) / 2u;
         height2 = (height2 + 1u) / 2u;
     }
 
-    const bool validCrt1 = pmode.enableCrt1 && hasDisplaySetup(m_privRegs->display1, displayFrame1);
-    const bool validCrt2 = pmode.enableCrt2 && hasDisplaySetup(m_privRegs->display2, displayFrame2);
+    const bool validCrt1 = pmode.enableCrt1 && hasDisplaySetup(registers.display1, displayFrame1);
+    const bool validCrt2 = pmode.enableCrt2 && hasDisplaySetup(registers.display2, displayFrame2);
 
     GsVramPageMask presentationPages;
     const auto addPresentationSurface = [&presentationPages](
@@ -1716,9 +1781,9 @@ void GS::latchHostPresentationFrameUnlocked()
         {
             const uint32_t width = std::max(width1, width2);
             const uint32_t height = std::max(height1, height2);
-            const uint8_t bgR = static_cast<uint8_t>(m_privRegs->bgcolor & 0xFFu);
-            const uint8_t bgG = static_cast<uint8_t>((m_privRegs->bgcolor >> 8) & 0xFFu);
-            const uint8_t bgB = static_cast<uint8_t>((m_privRegs->bgcolor >> 16) & 0xFFu);
+            const uint8_t bgR = static_cast<uint8_t>(registers.bgcolor & 0xFFu);
+            const uint8_t bgG = static_cast<uint8_t>((registers.bgcolor >> 8) & 0xFFu);
+            const uint8_t bgB = static_cast<uint8_t>((registers.bgcolor >> 16) & 0xFFu);
             const uint8_t bgA = pmode.alp;
 
             std::vector<uint8_t> merged(
@@ -1839,6 +1904,16 @@ void GS::latchHostPresentationFrameUnlocked()
                                     m_hostPresentationWidth,
                                     m_hostPresentationHeight,
                                     m_hostPresentationUsedPreferred);
+}
+
+std::vector<GsPrivilegedSideEffect> *
+GS::exchangePrivilegedSideEffectSink(
+    std::vector<GsPrivilegedSideEffect> *sink) noexcept
+{
+    std::vector<GsPrivilegedSideEffect> *const previous =
+        m_privilegedSideEffectSink;
+    m_privilegedSideEffectSink = sink;
+    return previous;
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
@@ -2892,10 +2967,15 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_SIGNAL:
     {
-        if (m_privRegs)
+        const uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
+        const uint32_t mask = static_cast<uint32_t>(value >> 32);
+        if (m_privilegedSideEffectSink)
         {
-            uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
-            uint32_t mask = static_cast<uint32_t>(value >> 32);
+            m_privilegedSideEffectSink->emplace_back(
+                GsSignalEffect{.id = id, .mask = mask});
+        }
+        else if (m_privRegs)
+        {
             uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
             lo = (lo & ~mask) | (id & mask);
             m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
@@ -2906,16 +2986,23 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case GS_REG_FINISH:
     {
         m_rasterizer.flushDrawBatch(this, GsFlushReason::Finish);
-        if (m_privRegs)
+        if (m_privilegedSideEffectSink)
+            m_privilegedSideEffectSink->emplace_back(GsFinishEffect{});
+        else if (m_privRegs)
             m_privRegs->csr.fetch_or(0x2);
         break;
     }
     case GS_REG_LABEL:
     {
-        if (m_privRegs)
+        const uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
+        const uint32_t mask = static_cast<uint32_t>(value >> 32);
+        if (m_privilegedSideEffectSink)
         {
-            uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
-            uint32_t mask = static_cast<uint32_t>(value >> 32);
+            m_privilegedSideEffectSink->emplace_back(
+                GsLabelEffect{.id = id, .mask = mask});
+        }
+        else if (m_privRegs)
+        {
             uint32_t hi = static_cast<uint32_t>(m_privRegs->siglblid >> 32);
             hi = (hi & ~mask) | (id & mask);
             m_privRegs->siglblid = (static_cast<uint64_t>(hi) << 32) | (m_privRegs->siglblid & 0xFFFFFFFF);

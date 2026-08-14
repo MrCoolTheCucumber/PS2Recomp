@@ -20,6 +20,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -83,6 +84,12 @@ struct PS2RuntimeConfiguration
     size_t gsCommandQueueCapacity = 64u;
     uint64_t gsCommandPayloadCapacityBytes =
         64u * 1024u * 1024u;
+    uint32_t gsMaximumFieldLead = 1u;
+    // Deterministic owner hooks are intended for focused scheduling tests.
+    std::function<void(const GsCommand &, uint64_t)>
+        gsBeforeProcess;
+    std::function<void(const GsCommandResult &, uint64_t)>
+        gsBeforePublish;
     EeExecutionBackendKind eeExecutionBackend =
         EeExecutionBackendKind::LegacyHostThread;
     bool useEeExecutionBackendEnvironment = true;
@@ -95,6 +102,21 @@ struct PS2RuntimeConfiguration
     bool useEeThreadDiagnosticsEnvironment = true;
     bool eeTlbTranslationCacheDiagnostics = false;
     bool useEeTlbTranslationCacheDiagnosticsEnvironment = true;
+};
+
+struct GsAsyncRuntimeStatistics
+{
+    bool enabled = false;
+    size_t pendingCompletions = 0u;
+    size_t pendingHighWater = 0u;
+    uint64_t fieldsSubmitted = 0u;
+    uint64_t fieldsCompleted = 0u;
+    uint64_t lastSubmittedFieldSequence = 0u;
+    uint64_t lastCompletedFieldSequence = 0u;
+    uint64_t fieldLeadHighWater = 0u;
+    uint64_t fieldLeadBlockCount = 0u;
+    uint64_t fieldLeadBlockedNanoseconds = 0u;
+    ThreadedGsExecutorStatistics owner{};
 };
 
 [[nodiscard]] PS2RuntimeConfiguration
@@ -713,6 +735,14 @@ public:
     [[nodiscard]] GsCommandResult submitEeGsCommand(
         GsCommandPayload payload,
         uint64_t publicationToken = 0u);
+    [[nodiscard]] bool usesAsyncGsExecution() const noexcept
+    {
+        return m_gsAsyncEnabled;
+    }
+    [[nodiscard]] uint64_t
+    lastCompletedGsFieldSequence() const noexcept;
+    [[nodiscard]] GsAsyncRuntimeStatistics
+    gsAsyncStatistics() const;
     [[nodiscard]] ps2x::timing::EeTick currentEeTick() const noexcept;
     void resetEeTiming(R5900Context *context = nullptr);
     void setRealtimeVSyncPacingEnabled(bool enabled);
@@ -2424,9 +2454,19 @@ private:
     [[nodiscard]] static EeVSyncVideoModeClass
     eeVSyncVideoModeClassForMode(
         uint32_t videoMode) noexcept;
-    void publishEeVSyncField() noexcept;
+    void publishEeVSyncField();
     void resetEeVSyncStateUnlocked() noexcept;
     void resetEeVSyncPacingUnlocked() noexcept;
+    [[nodiscard]] GsPrivilegedRegisterSnapshot
+    captureGsPrivilegedRegisters() const noexcept;
+    void applyGsPrivilegedSideEffects(
+        const std::vector<GsPrivilegedSideEffect> &effects);
+    void consumePendingEeGsResult(GsCommandResult result);
+    bool consumeFrontEeGsSubmission(bool wait);
+    void reapEeGsSubmissions(bool waitAll);
+    void submitEeGsDrainBatch(GifArbiterDrainBatch batch);
+    void submitEeGsFieldMarker(uint64_t fieldSequence);
+    void updateGsPendingHighWater(size_t pending) noexcept;
     void paceEeVSyncStart(
         ps2x::timing::EeTick scheduledTick);
     [[nodiscard]] static std::chrono::steady_clock::duration
@@ -2516,6 +2556,22 @@ private:
     GS m_gs;
     GsCommandProcessor m_gsCommandProcessor;
     std::unique_ptr<GsCommandExecutor> m_gsExecutor;
+    ThreadedGsExecutor *m_threadedGsExecutor = nullptr;
+    bool m_gsAsyncEnabled = false;
+    uint32_t m_gsMaximumFieldLead = 1u;
+    size_t m_gsAsyncPendingLimit = 1u;
+    mutable std::mutex m_gsEeJournalMutex;
+    std::deque<GsCommandSubmission>
+        m_pendingEeGsSubmissions;
+    std::atomic<size_t> m_gsPendingCompletions{0u};
+    std::atomic<size_t> m_gsPendingHighWater{0u};
+    std::atomic<uint64_t> m_gsFieldsSubmitted{0u};
+    std::atomic<uint64_t> m_gsFieldsCompleted{0u};
+    std::atomic<uint64_t> m_gsLastSubmittedFieldSequence{0u};
+    std::atomic<uint64_t> m_gsLastCompletedFieldSequence{0u};
+    std::atomic<uint64_t> m_gsFieldLeadHighWater{0u};
+    std::atomic<uint64_t> m_gsFieldLeadBlockCount{0u};
+    std::atomic<uint64_t> m_gsFieldLeadBlockedNanoseconds{0u};
     std::atomic<uint64_t> m_publishedGsGuestTick{0u};
     std::unique_ptr<HostPresentationUploadState>
         m_hostPresentationUploadState;

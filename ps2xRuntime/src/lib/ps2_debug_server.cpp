@@ -1009,6 +1009,9 @@ struct PS2DebugServer::Impl
         Value progress(rapidjson::kObjectType);
         progress.AddMember("dispatches", core.dispatches, allocator);
         progress.AddMember("ee_instructions", core.eeInstructions, allocator);
+        progress.AddMember(
+            "ee_tick", runtime.currentEeTick().raw(), allocator);
+        progress.AddMember("vsync_fields", core.vsyncFields, allocator);
         progress.AddMember("dma_starts", runtime.memory().dmaStartCount(), allocator);
         progress.AddMember("gif_copies", runtime.memory().gifCopyCount(), allocator);
         progress.AddMember("gs_writes", runtime.memory().gsWriteCount(), allocator);
@@ -1024,6 +1027,114 @@ struct PS2DebugServer::Impl
         progress.AddMember("vu0_cycles", vu0Progress.cycles, allocator);
         progress.AddMember("vu1_cycles", vu1Progress.cycles, allocator);
         result.AddMember("progress", progress, allocator);
+
+        const GsAsyncRuntimeStatistics gsAsync =
+            runtime.gsAsyncStatistics();
+        Value gsAsyncValue(rapidjson::kObjectType);
+        gsAsyncValue.AddMember("enabled", gsAsync.enabled, allocator);
+        gsAsyncValue.AddMember(
+            "pending_completions",
+            static_cast<uint64_t>(gsAsync.pendingCompletions), allocator);
+        gsAsyncValue.AddMember(
+            "pending_high_water",
+            static_cast<uint64_t>(gsAsync.pendingHighWater), allocator);
+        gsAsyncValue.AddMember(
+            "fields_submitted", gsAsync.fieldsSubmitted, allocator);
+        gsAsyncValue.AddMember(
+            "fields_completed", gsAsync.fieldsCompleted, allocator);
+        gsAsyncValue.AddMember(
+            "last_submitted_field_sequence",
+            gsAsync.lastSubmittedFieldSequence, allocator);
+        gsAsyncValue.AddMember(
+            "last_completed_field_sequence",
+            gsAsync.lastCompletedFieldSequence, allocator);
+        gsAsyncValue.AddMember(
+            "field_lead_high_water",
+            gsAsync.fieldLeadHighWater, allocator);
+        gsAsyncValue.AddMember(
+            "field_lead_block_count",
+            gsAsync.fieldLeadBlockCount, allocator);
+        gsAsyncValue.AddMember(
+            "field_lead_blocked_ns",
+            gsAsync.fieldLeadBlockedNanoseconds, allocator);
+
+        const ThreadedGsExecutorStatistics &owner = gsAsync.owner;
+        Value ownerValue(rapidjson::kObjectType);
+        ownerValue.AddMember(
+            "queue_capacity",
+            static_cast<uint64_t>(owner.queueCapacity), allocator);
+        ownerValue.AddMember(
+            "payload_capacity_bytes",
+            owner.payloadCapacityBytes, allocator);
+        ownerValue.AddMember(
+            "queue_depth",
+            static_cast<uint64_t>(owner.queueDepth), allocator);
+        ownerValue.AddMember(
+            "queue_high_water",
+            static_cast<uint64_t>(owner.queueHighWater), allocator);
+        ownerValue.AddMember(
+            "queued_payload_bytes",
+            owner.queuedPayloadBytes, allocator);
+        ownerValue.AddMember(
+            "payload_high_water_bytes",
+            owner.payloadHighWaterBytes, allocator);
+        ownerValue.AddMember(
+            "submitted_tickets",
+            owner.submittedTickets, allocator);
+        ownerValue.AddMember(
+            "completed_tickets",
+            owner.completedTickets, allocator);
+        ownerValue.AddMember(
+            "submitted_generation",
+            owner.submittedGeneration, allocator);
+        ownerValue.AddMember(
+            "submitted_sequence",
+            owner.submittedSequence, allocator);
+        ownerValue.AddMember(
+            "completed_generation",
+            owner.completedGeneration, allocator);
+        ownerValue.AddMember(
+            "completed_sequence",
+            owner.completedSequence, allocator);
+        ownerValue.AddMember(
+            "producer_block_count",
+            owner.producerBlockCount, allocator);
+        ownerValue.AddMember(
+            "producer_blocked_ns",
+            owner.producerBlockedNanoseconds, allocator);
+        ownerValue.AddMember(
+            "worker_active_ns",
+            owner.workerActiveNanoseconds, allocator);
+        ownerValue.AddMember(
+            "worker_idle_ns",
+            owner.workerIdleNanoseconds, allocator);
+        ownerValue.AddMember(
+            "barriers_completed",
+            owner.barriersCompleted, allocator);
+        ownerValue.AddMember(
+            "barrier_wait_count",
+            owner.barrierWaitCount, allocator);
+        ownerValue.AddMember(
+            "barrier_wait_ns",
+            owner.barrierWaitNanoseconds, allocator);
+        ownerValue.AddMember(
+            "field_markers_submitted",
+            owner.fieldMarkersSubmitted, allocator);
+        ownerValue.AddMember(
+            "field_markers_completed",
+            owner.fieldMarkersCompleted, allocator);
+        ownerValue.AddMember(
+            "last_submitted_field_sequence",
+            owner.lastSubmittedFieldSequence, allocator);
+        ownerValue.AddMember(
+            "last_completed_field_sequence",
+            owner.lastCompletedFieldSequence, allocator);
+        ownerValue.AddMember("started", owner.started, allocator);
+        ownerValue.AddMember("running", owner.running, allocator);
+        ownerValue.AddMember("accepting", owner.accepting, allocator);
+        ownerValue.AddMember("failed", owner.failed, allocator);
+        gsAsyncValue.AddMember("owner", ownerValue, allocator);
+        result.AddMember("gs_async", gsAsyncValue, allocator);
 
         const auto vuBackendStatus =
             [&](const VuUnit &unit,

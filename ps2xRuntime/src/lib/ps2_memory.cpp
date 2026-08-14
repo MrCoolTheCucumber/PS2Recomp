@@ -179,9 +179,8 @@ namespace
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
     // write-one-to-clear; everything else is a plain merge. Uses compare_exchange
-    // so the whole read-modify-write is a single atomic step -- this register is
-    // also touched by the vsync worker (FIELD bit) and the GIF (SIGNAL/FINISH) on
-    // other threads, so a load-then-store here would race with them.
+    // so the whole read-modify-write is a single atomic step alongside EE VSync,
+    // ordered GS-result publication, and host diagnostics.
     inline void writeCsrHalf(
         std::atomic<uint64_t> &csr,
         uint32_t off,
@@ -3931,6 +3930,8 @@ uint32_t PS2Memory::read32(
 
     if (isGsPrivReg(address))
     {
+        if (m_gsPrivilegedObservationCallback)
+            m_gsPrivilegedObservationCallback(address, false);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -3985,6 +3986,8 @@ uint64_t PS2Memory::read64(
 
     if (isGsPrivReg(address))
     {
+        if (m_gsPrivilegedObservationCallback)
+            m_gsPrivilegedObservationCallback(address, false);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -4218,6 +4221,8 @@ void PS2Memory::write32(
 
     if (isGsPrivReg(address))
     {
+        if (m_gsPrivilegedObservationCallback)
+            m_gsPrivilegedObservationCallback(address, true);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -4283,6 +4288,8 @@ void PS2Memory::write64(
 
     if (isGsPrivReg(address))
     {
+        if (m_gsPrivilegedObservationCallback)
+            m_gsPrivilegedObservationCallback(address, true);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -4363,6 +4370,8 @@ void PS2Memory::writeMasked32(
         Ps2ExpandByteEnableMask(byteEnable, 4u));
     if (isGsPrivReg(address))
     {
+        if (m_gsPrivilegedObservationCallback)
+            m_gsPrivilegedObservationCallback(address, true);
         const uint32_t off = address & 7u;
         const uint32_t regOff =
             (address - PS2_GS_PRIV_REG_BASE) & ~7u;
@@ -4465,6 +4474,8 @@ void PS2Memory::writeMasked64(
         Ps2ExpandByteEnableMask(byteEnable, 8u);
     if (isGsPrivReg(address))
     {
+        if (m_gsPrivilegedObservationCallback)
+            m_gsPrivilegedObservationCallback(address, true);
         const uint32_t regOff =
             (address - PS2_GS_PRIV_REG_BASE) & ~7u;
         if (regOff == kGsCsrRegOffset)
@@ -4694,6 +4705,8 @@ bool PS2Memory::writeIORegisterMasked(
 
     if (isGsPrivReg(address))
     {
+        if (m_gsPrivilegedObservationCallback)
+            m_gsPrivilegedObservationCallback(address, true);
         // NB: unreachable from write8/16/32/64 today since those all funnel IO
         // register writes through addresses in PS2_IO_BASE's range, which is
         // disjoint from PS2_GS_PRIV_REG_BASE; kept correct for direct callers.
@@ -9830,6 +9843,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 {
     if (isGsPrivReg(address))
     {
+        if (m_gsPrivilegedObservationCallback)
+            m_gsPrivilegedObservationCallback(address, false);
         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;

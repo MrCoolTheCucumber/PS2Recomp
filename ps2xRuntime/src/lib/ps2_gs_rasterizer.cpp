@@ -1,4 +1,5 @@
 #include "runtime/ps2_gs_rasterizer.h"
+#include "ThreadNaming.h"
 #include "runtime/ps2_gs_backend.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_common.h"
@@ -1887,6 +1888,7 @@ struct GSRasterizer::ParallelState
 
     void workerLoop(uint32_t workerIndex)
     {
+        ThreadNaming::SetCurrentThreadName("PS2GsRaster");
         uint64_t observedGeneration = 0u;
         std::unique_lock<std::mutex> lock(workMutex);
         for (;;)

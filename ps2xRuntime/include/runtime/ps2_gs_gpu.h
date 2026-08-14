@@ -9,6 +9,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <variant>
 #include <vector>
 
 #include "ps2_gs_types.h"
@@ -56,6 +57,44 @@ struct GSProgressSnapshot
     uint32_t activeDraws = 0;
     uint32_t activePrimitive = 0;
 };
+
+// The privileged GS register mirror belongs to the EE side of the runtime.
+// Commands that cross the GS ownership boundary carry the display state by
+// value, and return GIF-authored privileged writes as typed effects.
+struct GsPrivilegedRegisterSnapshot
+{
+    bool valid = false;
+    uint64_t pmode = 0u;
+    uint64_t smode2 = 0u;
+    uint64_t dispfb1 = 0u;
+    uint64_t display1 = 0u;
+    uint64_t dispfb2 = 0u;
+    uint64_t display2 = 0u;
+    uint64_t bgcolor = 0u;
+};
+
+struct GsSignalEffect
+{
+    uint32_t id = 0u;
+    uint32_t mask = 0u;
+};
+
+struct GsFinishEffect
+{
+};
+
+struct GsLabelEffect
+{
+    uint32_t id = 0u;
+    uint32_t mask = 0u;
+};
+
+using GsPrivilegedSideEffect = std::variant<
+    GsSignalEffect, GsFinishEffect, GsLabelEffect>;
+
+void publishGsPrivilegedSideEffects(
+    struct GSRegisters &registers,
+    const std::vector<GsPrivilegedSideEffect> &effects);
 
 enum class GSDebugEventKind : uint8_t
 {
@@ -170,6 +209,8 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    void latchHostPresentationFrame(
+        const GsPrivilegedRegisterSnapshot &registers);
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -207,6 +248,13 @@ public:
 
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
+    // Command processors install a sink only for the duration of one command.
+    // Returning the previous sink makes exception-safe scoped restoration
+    // possible without exposing GS internals to the runtime.
+    std::vector<GsPrivilegedSideEffect> *
+    exchangePrivilegedSideEffectSink(
+        std::vector<GsPrivilegedSideEffect> *sink) noexcept;
+
     void refreshDisplaySnapshot();
 
     inline void WriteVram(u32 psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
@@ -225,7 +273,8 @@ private:
     void snapshotVRAM();
     void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);
     void vertexKick(bool drawing);
-    void latchHostPresentationFrameUnlocked();
+    void latchHostPresentationFrameUnlocked(
+        const GsPrivilegedRegisterSnapshot &registers);
     uint64_t currentVSyncTickUnlocked() const;
     void flushForObservation(GsFlushReason reason) const;
 
@@ -257,6 +306,7 @@ private:
     uint8_t *m_vram = nullptr;
     uint32_t m_vramSize = 0;
     struct GSRegisters *m_privRegs = nullptr;
+    std::vector<GsPrivilegedSideEffect> *m_privilegedSideEffectSink = nullptr;
     mutable std::recursive_mutex m_stateMutex;
     std::function<uint64_t()> m_vsyncTickProvider;
 

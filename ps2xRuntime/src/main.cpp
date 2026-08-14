@@ -136,6 +136,8 @@ namespace
             mode = GsExecutionMode::Inline;
         else if (text == "threaded-sync")
             mode = GsExecutionMode::ThreadedSynchronous;
+        else if (text == "threaded-async")
+            mode = GsExecutionMode::ThreadedAsync;
         else
             return false;
         return true;
@@ -146,7 +148,7 @@ namespace
         std::cout
             << "Usage: " << program
             << " [--renderer software|hybrid|verify|gpu-strict]"
-               " [--gs-execution inline|threaded-sync]"
+               " [--gs-execution inline|threaded-sync|threaded-async]"
                " [ELF [CD_IMAGE]]\n";
     }
 
@@ -192,7 +194,7 @@ namespace
                         argv[i], options.gsExecutionMode))
                 {
                     throw std::invalid_argument(
-                        "--gs-execution requires inline or threaded-sync");
+                        "--gs-execution requires inline, threaded-sync, or threaded-async");
                 }
                 continue;
             }

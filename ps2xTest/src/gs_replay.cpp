@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -68,7 +69,7 @@ namespace
                "[--state-in FILE] "
                "[--packet-sizes FILE] [--hash-trace FILE] "
                "[--renderer software|hybrid|verify|gpu-strict] "
-               "[--gs-execution inline|threaded-sync] "
+               "[--gs-execution inline|threaded-sync|threaded-async] "
                "[--verify-dump-dir DIRECTORY] "
                "[--vulkan-max-resident-batch COUNT] "
                "[--vulkan-min-hybrid-pixels COUNT] "
@@ -132,6 +133,8 @@ namespace
             mode = GsExecutionMode::Inline;
         else if (text == "threaded-sync")
             mode = GsExecutionMode::ThreadedSynchronous;
+        else if (text == "threaded-async")
+            mode = GsExecutionMode::ThreadedAsync;
         else
             return false;
         return true;
@@ -1564,8 +1567,12 @@ int main(int argc, char **argv)
     }
 
     GS gs;
-    gs.init(memory.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
-            &memory.gs());
+    gs.init(
+        memory.getGSVRAM(),
+        static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
+        executionMode == GsExecutionMode::ThreadedAsync
+            ? nullptr
+            : &memory.gs());
     GsCommandProcessor gsProcessor(gs, true);
     std::unique_ptr<GsCommandExecutor> gsExecutor;
     switch (executionMode)
@@ -1578,18 +1585,57 @@ int main(int argc, char **argv)
         gsExecutor = std::make_unique<ThreadedGsExecutor>(
             gsProcessor);
         break;
+    case GsExecutionMode::ThreadedAsync:
+        gsExecutor = std::make_unique<ThreadedGsExecutor>(
+            gsProcessor);
+        break;
     }
+    auto *const threadedGsExecutor =
+        dynamic_cast<ThreadedGsExecutor *>(
+            gsExecutor.get());
     uint64_t commandDigest = 14695981039346656037ull;
     uint64_t gsCommands = 0u;
-    auto submitGs = [&](GsCommandPayload payload)
+    std::deque<GsCommandSubmission> pendingGsCommands;
+    auto recordGsResult = [&](const GsCommandResult &result)
     {
-        GsCommandResult result =
-            gsExecutor->submit(std::move(payload));
+        publishGsPrivilegedSideEffects(
+            memory.gs(), result.privilegedEffects);
         appendU64ToFnv(
             commandDigest,
             gsCommandDigestHash(result.digest));
         ++gsCommands;
+    };
+    auto reapPendingGs = [&](bool waitAll)
+    {
+        while (!pendingGsCommands.empty() &&
+               (waitAll || pendingGsCommands.front().ready()))
+        {
+            GsCommandResult result =
+                pendingGsCommands.front().wait();
+            pendingGsCommands.pop_front();
+            recordGsResult(result);
+        }
+    };
+    auto submitGs = [&](GsCommandPayload payload)
+    {
+        if (executionMode == GsExecutionMode::ThreadedAsync)
+            reapPendingGs(true);
+        GsCommandResult result =
+            gsExecutor->submit(std::move(payload));
+        recordGsResult(result);
         return result;
+    };
+    auto submitGsDrain = [&](GsDrainBatchCommand batch)
+    {
+        if (executionMode != GsExecutionMode::ThreadedAsync)
+        {
+            (void)submitGs(std::move(batch));
+            return;
+        }
+        pendingGsCommands.push_back(
+            threadedGsExecutor->submitAsync(
+                std::move(batch)));
+        reapPendingGs(false);
     };
 
     if (rendererMode != GsRendererMode::Software)
@@ -1791,7 +1837,7 @@ int main(int argc, char **argv)
             packet.size = size;
             batch.batch.storage[3].assign(data, data + size);
             batch.batch.packets.push_back(std::move(packet));
-            (void)submitGs(std::move(batch));
+            submitGsDrain(std::move(batch));
         }
         catch (const std::exception &error)
         {
@@ -1900,6 +1946,10 @@ int main(int argc, char **argv)
             takeGsCommandResult<GsBackendCountersResult>(
                 submitGs(GsBackendCountersCommand{}));
     }
+    const ThreadedGsExecutorStatistics ownerStatistics =
+        threadedGsExecutor
+            ? threadedGsExecutor->statistics()
+            : ThreadedGsExecutorStatistics{};
 
     const VramDifference difference = expectedVram.empty()
         ? VramDifference{}
@@ -1934,6 +1984,33 @@ int main(int argc, char **argv)
               << std::hex << std::setw(16) << std::setfill('0')
               << fnv1a64(memory.getGSVRAM(), PS2_GS_VRAM_SIZE)
               << '\"' << std::dec;
+
+    if (threadedGsExecutor)
+    {
+        std::cout
+            << ",\"gs_owner_statistics\":{"
+            << "\"submitted_sequence\":"
+            << ownerStatistics.submittedSequence
+            << ",\"completed_sequence\":"
+            << ownerStatistics.completedSequence
+            << ",\"queue_high_water\":"
+            << ownerStatistics.queueHighWater
+            << ",\"payload_high_water_bytes\":"
+            << ownerStatistics.payloadHighWaterBytes
+            << ",\"producer_block_count\":"
+            << ownerStatistics.producerBlockCount
+            << ",\"producer_blocked_nanoseconds\":"
+            << ownerStatistics.producerBlockedNanoseconds
+            << ",\"worker_active_nanoseconds\":"
+            << ownerStatistics.workerActiveNanoseconds
+            << ",\"worker_idle_nanoseconds\":"
+            << ownerStatistics.workerIdleNanoseconds
+            << ",\"barrier_wait_count\":"
+            << ownerStatistics.barrierWaitCount
+            << ",\"barrier_wait_nanoseconds\":"
+            << ownerStatistics.barrierWaitNanoseconds
+            << '}';
+    }
 
     if (!expectedVram.empty())
     {

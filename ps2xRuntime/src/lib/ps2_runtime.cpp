@@ -1247,15 +1247,21 @@ static void UploadFrame(
     uint32_t &outWidth,
     uint32_t &outHeight)
 {
-    const uint64_t currentTick =
-        ps2_syscalls::GetCurrentVSyncTick(rt);
+    const bool asynchronous =
+        rt->usesAsyncGsExecution();
+    const uint64_t currentTick = asynchronous
+        ? rt->lastCompletedGsFieldSequence()
+        : ps2_syscalls::GetCurrentVSyncTick(rt);
     const bool needsLatch =
         !state.hasLatchedInitialFrame ||
         currentTick != state.lastPresentationTick;
     if (needsLatch)
     {
-        (void)rt->submitGsCommand(
-            GsLatchPresentationCommand{});
+        if (!asynchronous)
+        {
+            (void)rt->submitGsCommand(
+                GsLatchPresentationCommand{});
+        }
         state.lastPresentationTick = currentTick;
         state.hasLatchedInitialFrame = true;
     }
@@ -1276,6 +1282,11 @@ static void UploadFrame(
         takeGsCommandResult<GsPresentationResult>(
             rt->submitGsCommand(
                 GsCopyPresentationCommand{}));
+    if (asynchronous)
+    {
+        state.lastPresentationTick =
+            frame.completedFieldSequence;
+    }
     state.scratch = std::move(frame.pixels);
     const uint32_t width = frame.width;
     const uint32_t height = frame.height;
@@ -1364,6 +1375,22 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
             "generated EE function table uses an incompatible fast/precise ABI");
     }
 
+    if (configuration.gsMaximumFieldLead > 1u)
+    {
+        throw std::invalid_argument(
+            "the asynchronous GS field lead must be zero or one");
+    }
+    if (configuration.gsCommandQueueCapacity >
+        std::numeric_limits<size_t>::max() - 2u)
+    {
+        throw std::invalid_argument(
+            "the GS command queue capacity is too large");
+    }
+    m_gsMaximumFieldLead =
+        configuration.gsMaximumFieldLead;
+    m_gsAsyncPendingLimit = std::max<size_t>(
+        1u, configuration.gsCommandQueueCapacity + 2u);
+
     switch (configuration.gsExecutionMode)
     {
     case GsExecutionMode::Inline:
@@ -1371,7 +1398,9 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
             m_gsCommandProcessor);
         break;
     case GsExecutionMode::ThreadedSynchronous:
-        m_gsExecutor =
+    case GsExecutionMode::ThreadedAsync:
+    {
+        auto executor =
             std::make_unique<ThreadedGsExecutor>(
                 m_gsCommandProcessor,
                 ThreadedGsExecutorOptions{
@@ -1380,8 +1409,18 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
                     .payloadCapacityBytes =
                         configuration.
                             gsCommandPayloadCapacityBytes,
+                    .beforeProcess =
+                        std::move(configuration.gsBeforeProcess),
+                    .beforePublish =
+                        std::move(configuration.gsBeforePublish),
                 });
+        m_threadedGsExecutor = executor.get();
+        m_gsExecutor = std::move(executor);
+        m_gsAsyncEnabled =
+            configuration.gsExecutionMode ==
+            GsExecutionMode::ThreadedAsync;
         break;
+    }
     default:
         throw std::invalid_argument(
             "unsupported GS execution mode");
@@ -1824,6 +1863,17 @@ PS2Runtime::~PS2Runtime()
         // notification releases every kernel wait, so workers must be joined
         // before those runtime-owned objects are destroyed.
         ps2_syscalls::joinAllGuestHostThreads(this);
+        if (m_gsAsyncEnabled)
+        {
+            std::lock_guard<std::mutex> lock(
+                m_gsEeJournalMutex);
+            reapEeGsSubmissions(true);
+        }
+        if (m_threadedGsExecutor)
+        {
+            m_threadedGsExecutor->shutdown(
+                GsExecutorShutdownMode::Drain);
+        }
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -3085,25 +3135,341 @@ GsCommandResult PS2Runtime::submitGsCommand(
     GsCommandPayload payload,
     uint64_t publicationToken)
 {
-    return m_gsExecutor->submit(
+    if (m_gsAsyncEnabled &&
+        (std::holds_alternative<GsDrainBatchCommand>(payload) ||
+         std::holds_alternative<GsWriteRegisterCommand>(payload) ||
+         std::holds_alternative<GsNativePackedGifCommand>(payload) ||
+         std::holds_alternative<GsNativeImageUploadCommand>(payload) ||
+         std::holds_alternative<GsClearFramebufferCommand>(payload) ||
+         std::holds_alternative<GsFieldMarkerCommand>(payload)))
+    {
+        throw std::logic_error(
+            "asynchronous GS hot commands must be submitted by the EE path");
+    }
+    if (auto *const latch =
+            std::get_if<GsLatchPresentationCommand>(&payload);
+        latch && !latch->registers.valid)
+    {
+        if (m_gsAsyncEnabled)
+        {
+            throw std::logic_error(
+                "asynchronous GS presentation latches require an EE-owned privileged-register snapshot");
+        }
+        latch->registers =
+            captureGsPrivilegedRegisters();
+    }
+    GsCommandResult result = m_gsExecutor->submit(
         std::move(payload),
         m_publishedGsGuestTick.load(
             std::memory_order_acquire),
         publicationToken,
         ps2_syscalls::GetCurrentVSyncTick(this));
+    applyGsPrivilegedSideEffects(
+        result.privilegedEffects);
+    return result;
 }
 
 GsCommandResult PS2Runtime::submitEeGsCommand(
     GsCommandPayload payload,
     uint64_t publicationToken)
 {
+    std::unique_lock<std::mutex> journalLock;
+    if (m_gsAsyncEnabled)
+    {
+        journalLock = std::unique_lock<std::mutex>(
+            m_gsEeJournalMutex);
+        reapEeGsSubmissions(true);
+    }
+    if (auto *const latch =
+            std::get_if<GsLatchPresentationCommand>(&payload);
+        latch && !latch->registers.valid)
+    {
+        latch->registers =
+            captureGsPrivilegedRegisters();
+    }
     const uint64_t guestTick = currentEeTick().raw();
     m_publishedGsGuestTick.store(
         guestTick, std::memory_order_release);
-    return m_gsExecutor->submit(
+    GsCommandResult result = m_gsExecutor->submit(
         std::move(payload), guestTick,
         publicationToken,
         ps2_syscalls::GetCurrentVSyncTick(this));
+    applyGsPrivilegedSideEffects(
+        result.privilegedEffects);
+    return result;
+}
+
+GsPrivilegedRegisterSnapshot
+PS2Runtime::captureGsPrivilegedRegisters() const noexcept
+{
+    const GSRegisters &registers = m_memory.gs();
+    return {
+        .valid = true,
+        .pmode = registers.pmode,
+        .smode2 = registers.smode2,
+        .dispfb1 = registers.dispfb1,
+        .display1 = registers.display1,
+        .dispfb2 = registers.dispfb2,
+        .display2 = registers.display2,
+        .bgcolor = registers.bgcolor,
+    };
+}
+
+void PS2Runtime::applyGsPrivilegedSideEffects(
+    const std::vector<GsPrivilegedSideEffect> &effects)
+{
+    publishGsPrivilegedSideEffects(
+        m_memory.gs(), effects);
+}
+
+void PS2Runtime::consumePendingEeGsResult(
+    GsCommandResult result)
+{
+    if (!result.completed())
+    {
+        throw std::logic_error(
+            std::string("asynchronous GS command rejected: ") +
+            gsCommandTypeName(result.digest.type));
+    }
+    applyGsPrivilegedSideEffects(
+        result.privilegedEffects);
+    if (auto *const batch =
+            std::get_if<GsDrainBatchResult>(&result.payload))
+    {
+        m_gifArbiter.recycleDrainBatch(
+            std::move(batch->batch));
+    }
+    else if (const auto *const field =
+                 std::get_if<GsFieldMarkerResult>(&result.payload))
+    {
+        m_gsFieldsCompleted.fetch_add(
+            1u, std::memory_order_relaxed);
+        m_gsLastCompletedFieldSequence.store(
+            field->fieldSequence,
+            std::memory_order_release);
+    }
+}
+
+bool PS2Runtime::consumeFrontEeGsSubmission(bool wait)
+{
+    if (m_pendingEeGsSubmissions.empty() ||
+        (!wait &&
+         !m_pendingEeGsSubmissions.front().ready()))
+    {
+        return false;
+    }
+    GsCommandSubmission submission =
+        std::move(m_pendingEeGsSubmissions.front());
+    m_pendingEeGsSubmissions.pop_front();
+    m_gsPendingCompletions.store(
+        m_pendingEeGsSubmissions.size(),
+        std::memory_order_release);
+    consumePendingEeGsResult(submission.wait());
+    return true;
+}
+
+void PS2Runtime::reapEeGsSubmissions(bool waitAll)
+{
+    while (consumeFrontEeGsSubmission(waitAll))
+    {
+    }
+}
+
+void PS2Runtime::updateGsPendingHighWater(
+    size_t pending) noexcept
+{
+    size_t current = m_gsPendingHighWater.load(
+        std::memory_order_relaxed);
+    while (current < pending &&
+           !m_gsPendingHighWater.compare_exchange_weak(
+               current, pending,
+               std::memory_order_relaxed,
+               std::memory_order_relaxed))
+    {
+    }
+}
+
+void PS2Runtime::submitEeGsDrainBatch(
+    GifArbiterDrainBatch batch)
+{
+    if (!m_gsAsyncEnabled)
+    {
+        GsDrainBatchCommand command{};
+        command.batch = std::move(batch);
+        GsCommandResult result =
+            submitEeGsCommand(std::move(command));
+        m_gifArbiter.recycleDrainBatch(
+            std::move(takeGsCommandResult<GsDrainBatchResult>(
+                std::move(result))
+                .batch));
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        m_gsEeJournalMutex);
+    reapEeGsSubmissions(false);
+    while (m_pendingEeGsSubmissions.size() >=
+           m_gsAsyncPendingLimit)
+    {
+        (void)consumeFrontEeGsSubmission(true);
+    }
+
+    GsDrainBatchCommand command{};
+    command.batch = std::move(batch);
+    const uint64_t guestTick = currentEeTick().raw();
+    m_publishedGsGuestTick.store(
+        guestTick, std::memory_order_release);
+    m_pendingEeGsSubmissions.push_back(
+        m_threadedGsExecutor->submitAsync(
+            std::move(command), guestTick, 0u,
+            ps2_syscalls::GetCurrentVSyncTick(this)));
+    m_gsPendingCompletions.store(
+        m_pendingEeGsSubmissions.size(),
+        std::memory_order_release);
+    updateGsPendingHighWater(
+        m_pendingEeGsSubmissions.size());
+    reapEeGsSubmissions(false);
+}
+
+void PS2Runtime::submitEeGsFieldMarker(
+    uint64_t fieldSequence)
+{
+    if (!m_gsAsyncEnabled)
+        return;
+
+    std::lock_guard<std::mutex> lock(
+        m_gsEeJournalMutex);
+    reapEeGsSubmissions(false);
+    const auto outstandingFields = [this]()
+    {
+        return m_gsFieldsSubmitted.load(
+                   std::memory_order_acquire) -
+               m_gsFieldsCompleted.load(
+                   std::memory_order_acquire);
+    };
+    if (m_gsMaximumFieldLead != 0u &&
+        outstandingFields() >= m_gsMaximumFieldLead)
+    {
+        const auto blockedAt =
+            std::chrono::steady_clock::now();
+        m_gsFieldLeadBlockCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        while (outstandingFields() >=
+               m_gsMaximumFieldLead)
+        {
+            if (!consumeFrontEeGsSubmission(true))
+            {
+                throw std::logic_error(
+                    "GS field lead has no pending completion");
+            }
+        }
+        m_gsFieldLeadBlockedNanoseconds.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - blockedAt)
+                    .count()),
+            std::memory_order_relaxed);
+    }
+    while (m_pendingEeGsSubmissions.size() >=
+           m_gsAsyncPendingLimit)
+    {
+        (void)consumeFrontEeGsSubmission(true);
+    }
+
+    const uint64_t guestTick = currentEeTick().raw();
+    m_publishedGsGuestTick.store(
+        guestTick, std::memory_order_release);
+    m_pendingEeGsSubmissions.push_back(
+        m_threadedGsExecutor->submitAsync(
+            GsFieldMarkerCommand{
+                .fieldSequence = fieldSequence,
+                .registers = captureGsPrivilegedRegisters(),
+            },
+            guestTick, 0u,
+            ps2_syscalls::GetCurrentVSyncTick(this)));
+    m_gsFieldsSubmitted.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_gsLastSubmittedFieldSequence.store(
+        fieldSequence, std::memory_order_release);
+    const uint64_t lead = outstandingFields();
+    uint64_t highWater = m_gsFieldLeadHighWater.load(
+        std::memory_order_relaxed);
+    while (highWater < lead &&
+           !m_gsFieldLeadHighWater.compare_exchange_weak(
+               highWater, lead,
+               std::memory_order_relaxed,
+               std::memory_order_relaxed))
+    {
+    }
+    m_gsPendingCompletions.store(
+        m_pendingEeGsSubmissions.size(),
+        std::memory_order_release);
+    updateGsPendingHighWater(
+        m_pendingEeGsSubmissions.size());
+
+    if (m_gsMaximumFieldLead == 0u)
+    {
+        while (m_gsLastCompletedFieldSequence.load(
+                   std::memory_order_acquire) < fieldSequence)
+        {
+            if (!consumeFrontEeGsSubmission(true))
+            {
+                throw std::logic_error(
+                    "GS field marker lost its completion");
+            }
+        }
+    }
+    else
+    {
+        reapEeGsSubmissions(false);
+    }
+}
+
+uint64_t PS2Runtime::lastCompletedGsFieldSequence() const noexcept
+{
+    if (!m_gsAsyncEnabled || !m_threadedGsExecutor)
+        return 0u;
+    return m_threadedGsExecutor
+        ->lastCompletedFieldSequence();
+}
+
+GsAsyncRuntimeStatistics
+PS2Runtime::gsAsyncStatistics() const
+{
+    GsAsyncRuntimeStatistics statistics{
+        .enabled = m_gsAsyncEnabled,
+        .pendingCompletions =
+            m_gsPendingCompletions.load(
+                std::memory_order_acquire),
+        .pendingHighWater =
+            m_gsPendingHighWater.load(
+                std::memory_order_acquire),
+        .fieldsSubmitted =
+            m_gsFieldsSubmitted.load(
+                std::memory_order_acquire),
+        .fieldsCompleted =
+            m_gsFieldsCompleted.load(
+                std::memory_order_acquire),
+        .lastSubmittedFieldSequence =
+            m_gsLastSubmittedFieldSequence.load(
+                std::memory_order_acquire),
+        .lastCompletedFieldSequence =
+            m_gsLastCompletedFieldSequence.load(
+                std::memory_order_acquire),
+        .fieldLeadHighWater =
+            m_gsFieldLeadHighWater.load(
+                std::memory_order_acquire),
+        .fieldLeadBlockCount =
+            m_gsFieldLeadBlockCount.load(
+                std::memory_order_acquire),
+        .fieldLeadBlockedNanoseconds =
+            m_gsFieldLeadBlockedNanoseconds.load(
+                std::memory_order_acquire),
+    };
+    if (m_threadedGsExecutor)
+        statistics.owner =
+            m_threadedGsExecutor->statistics();
+    return statistics;
 }
 
 void PS2Runtime::cancelEeCounterEvent() noexcept
@@ -3732,7 +4098,7 @@ void PS2Runtime::paceEeVSyncStart(
     m_eeVSyncPacing.hostDeadline = deadline;
 }
 
-void PS2Runtime::publishEeVSyncField() noexcept
+void PS2Runtime::publishEeVSyncField()
 {
     constexpr uint64_t kGsCsrFieldMask = 0x2000ull;
     std::atomic<uint64_t> &csr = m_memory.gs().csr;
@@ -3748,8 +4114,10 @@ void PS2Runtime::publishEeVSyncField() noexcept
             kGsCsrFieldMask,
             std::memory_order_relaxed);
     }
-    m_debugVSyncFields.fetch_add(
-        1u, std::memory_order_relaxed);
+    const uint64_t fieldSequence =
+        m_debugVSyncFields.fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+    submitEeGsFieldMarker(fieldSequence);
 }
 
 bool PS2Runtime::queuePendingVSyncDelivery(
@@ -4631,20 +4999,35 @@ bool PS2Runtime::syncCoreSubsystems()
         return true;
     }
 
-    m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    m_gs.init(
+        gsVram,
+        static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
+        m_gsAsyncEnabled ? nullptr : &m_memory.gs());
     m_gifArbiter.reset();
     m_gifArbiter.setProcessBatchFn(
         [this](GifArbiterDrainBatch batch)
         {
-            GsDrainBatchCommand command{};
-            command.batch = std::move(batch);
-            GsCommandResult result =
-                submitEeGsCommand(std::move(command));
-            m_gifArbiter.recycleDrainBatch(
-                std::move(takeGsCommandResult<GsDrainBatchResult>(
-                    std::move(result))
-                    .batch));
+            submitEeGsDrainBatch(std::move(batch));
         });
+    m_memory.setGsPrivilegedObservationCallback(
+        m_gsAsyncEnabled
+            ? PS2Memory::GsPrivilegedObservationCallback(
+                  [this](uint32_t address, bool)
+                  {
+                      const uint32_t registerOffset =
+                          (address - PS2_GS_PRIV_REG_BASE) &
+                          ~0x7u;
+                      // GIF-authored effects can change CSR/SIGLBLID and
+                      // affect interrupt/FIFO control. Display registers are
+                      // EE-owned inputs copied into ordered field markers;
+                      // synchronizing them would collapse ordinary overlap.
+                      if (registerOffset < 0x1000u)
+                          return;
+                      std::lock_guard<std::mutex> lock(
+                          m_gsEeJournalMutex);
+                      reapEeGsSubmissions(true);
+                  })
+            : PS2Memory::GsPrivilegedObservationCallback{});
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVif1GifPathAvailableCallback(
         [this](bool directHl)

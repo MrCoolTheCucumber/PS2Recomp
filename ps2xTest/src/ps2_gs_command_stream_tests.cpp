@@ -83,6 +83,19 @@ namespace
             const GsCommand &,
             uint64_t ticket)
         {
+            block(ticket);
+        }
+
+        void beforePublish(
+            const GsCommandResult &,
+            uint64_t ticket)
+        {
+            block(ticket);
+        }
+
+    private:
+        void block(uint64_t ticket)
+        {
             if (ticket != m_blockedTicket)
                 return;
             std::unique_lock<std::mutex> lock(m_mutex);
@@ -101,6 +114,7 @@ namespace
             }
         }
 
+    public:
         [[nodiscard]] bool waitUntilEntered()
         {
             return waitFor(
@@ -163,6 +177,89 @@ namespace
                 .size = command.batch.storage[2].size(),
             });
         return command;
+    }
+
+    GsDrainBatchCommand makePrivilegedEffectBatch()
+    {
+        constexpr uint64_t packedAdTag =
+            3ull | (1ull << 15u) |
+            (1ull << 60u);
+        std::vector<uint8_t> bytes;
+        appendU64(bytes, packedAdTag);
+        appendU64(bytes, 0x0Eull);
+        appendU64(bytes, 0x00FF00AAull |
+                             (0x0FFF0FFFull << 32u));
+        appendU64(bytes, GS_REG_SIGNAL);
+        appendU64(bytes, 0u);
+        appendU64(bytes, GS_REG_FINISH);
+        appendU64(bytes, 0xA5005A00ull |
+                             (0xFF00FFF0ull << 32u));
+        appendU64(bytes, GS_REG_LABEL);
+
+        GsDrainBatchCommand command{};
+        command.batch.storage[1] = std::move(bytes);
+        command.batch.packets.push_back(
+            GifArbiterDrainBatch::Packet{
+                .pathId = GifPathId::Path1,
+                .storageIndex = 1u,
+                .size = command.batch.storage[1].size(),
+            });
+        return command;
+    }
+
+    std::vector<uint8_t> makePrivilegedRegisterPacket(
+        uint8_t address,
+        uint64_t value)
+    {
+        constexpr uint64_t packedAdTag =
+            1ull | (1ull << 15u) |
+            (1ull << 60u);
+        std::vector<uint8_t> bytes;
+        appendU64(bytes, packedAdTag);
+        appendU64(bytes, 0x0Eull);
+        appendU64(bytes, value);
+        appendU64(bytes, address);
+        return bytes;
+    }
+
+    std::vector<uint8_t> makeTwoByTwoImageUploadPacket()
+    {
+        constexpr uint64_t packedAdTag =
+            4ull | (1ull << 60u);
+        constexpr uint64_t imageTag =
+            1ull | (1ull << 15u) | (2ull << 58u);
+        constexpr uint64_t bitbltbuf = 1ull << 48u;
+        constexpr uint64_t trxreg =
+            2ull | (2ull << 32u);
+
+        std::vector<uint8_t> bytes;
+        appendU64(bytes, packedAdTag);
+        appendU64(bytes, 0x0Eull);
+        appendU64(bytes, bitbltbuf);
+        appendU64(bytes, GS_REG_BITBLTBUF);
+        appendU64(bytes, 0u);
+        appendU64(bytes, GS_REG_TRXPOS);
+        appendU64(bytes, trxreg);
+        appendU64(bytes, GS_REG_TRXREG);
+        appendU64(bytes, 0u);
+        appendU64(bytes, GS_REG_TRXDIR);
+        appendU64(bytes, imageTag);
+        appendU64(bytes, 0u);
+        appendU64(bytes, 0x8877665544332211ull);
+        appendU64(bytes, 0xFFEEDDCCBBAA0099ull);
+        return bytes;
+    }
+
+    void advanceEeCycles(
+        PS2Runtime &runtime,
+        R5900Context &context,
+        uint32_t cycles)
+    {
+        constexpr uint32_t kTicksPerEeCycle = 8u;
+        context.advanceEeCycleTicks(
+            cycles * kTicksPerEeCycle);
+        runtime.serviceEeEventsAtBlockBoundary(
+            runtime.memory().getRDRAM(), &context);
     }
 
     struct GsFixture
@@ -372,6 +469,35 @@ void register_ps2_gs_command_stream_tests()
                      "the result must own its bytes after the command completes");
         });
 
+        tc.Run("threaded GS generation changes clear completed presentation identity", [](TestCase &t)
+        {
+            GsFixture fixture;
+            ThreadedGsExecutor executor(fixture.processor);
+            const GsPrivilegedRegisterSnapshot registers{
+                .valid = true,
+            };
+
+            (void)executor.submit(
+                GsFieldMarkerCommand{
+                    .fieldSequence = 7u,
+                    .registers = registers,
+                });
+            t.Equals(executor.lastCompletedFieldSequence(), 7ull,
+                     "a completed field should publish its presentation identity");
+
+            (void)executor.submit(GsResetCommand{});
+            t.Equals(executor.lastCompletedFieldSequence(), 0ull,
+                     "reset should invalidate the preceding generation's presentation identity");
+
+            (void)executor.submit(
+                GsFieldMarkerCommand{
+                    .fieldSequence = 8u,
+                    .registers = registers,
+                });
+            t.Equals(executor.lastCompletedFieldSequence(), 8ull,
+                     "the new generation should publish its next completed field normally");
+        });
+
         tc.Run("threaded GS queue applies slot backpressure without loss or lost wakeup", [](TestCase &t)
         {
             GsFixture fixture;
@@ -578,6 +704,59 @@ void register_ps2_gs_command_stream_tests()
                      "observing after the barrier should include the later ordered mutation");
             t.Equals(executor.statistics().barriersCompleted, 1ull,
                      "the owner should count the explicit barrier exactly once");
+        });
+
+        tc.Run("GS command results retain ordered privileged side effects without mutating the EE mirror", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters registers{};
+            registers.csr.store(0u, std::memory_order_relaxed);
+            registers.siglblid = 0x1122334455667788ull;
+            GS gs;
+            gs.init(
+                vram.data(),
+                static_cast<uint32_t>(vram.size()),
+                &registers);
+            GsCommandProcessor processor(gs, true);
+            InlineGsExecutor executor(processor);
+
+            const GsCommandResult result =
+                executor.submit(makePrivilegedEffectBatch());
+            t.Equals(result.privilegedEffects.size(),
+                     static_cast<size_t>(3u),
+                     "one batch should return every privileged effect in GIF order");
+            const auto *signal = std::get_if<GsSignalEffect>(
+                &result.privilegedEffects[0]);
+            const auto *finish = std::get_if<GsFinishEffect>(
+                &result.privilegedEffects[1]);
+            const auto *label = std::get_if<GsLabelEffect>(
+                &result.privilegedEffects[2]);
+            t.IsTrue(signal != nullptr &&
+                         signal->id == 0x00FF00AAu &&
+                         signal->mask == 0x0FFF0FFFu,
+                     "SIGNAL should retain its exact ID and mask");
+            t.IsTrue(finish != nullptr,
+                     "FINISH should retain its exact stream position");
+            t.IsTrue(label != nullptr &&
+                         label->id == 0xA5005A00u &&
+                         label->mask == 0xFF00FFF0u,
+                     "LABEL should retain its exact ID and mask");
+            t.Equals(registers.csr.load(std::memory_order_relaxed),
+                     0ull,
+                     "the GS command processor must not publish EE CSR state");
+            t.Equals(registers.siglblid,
+                     0x1122334455667788ull,
+                     "the GS command processor must not mutate EE SIGLBLID state");
+
+            gs.writeRegister(
+                GS_REG_SIGNAL,
+                0x0000000Full | (0x0000000Full << 32u));
+            t.Equals(registers.csr.load(std::memory_order_relaxed),
+                     1ull,
+                     "legacy direct GS use should retain its immediate mirror behavior");
+            t.Equals(registers.siglblid,
+                     0x112233445566778Full,
+                     "direct GS SIGNAL should still apply masked low bits");
         });
 
         tc.Run("threaded GS cancellation rejects stale queued generations and admits reset", [](TestCase &t)
@@ -969,6 +1148,471 @@ void register_ps2_gs_command_stream_tests()
                     .state;
             t.Equals(state.scanMask, static_cast<uint8_t>(2u),
                      "runtime-selected threaded mode should consume the same semantic command stream");
+        });
+
+        tc.Run("asynchronous GS batches return before processing and privileged reads publish their effects", [](TestCase &t)
+        {
+            const auto gate = std::make_shared<WorkerGate>();
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.gsExecutionMode =
+                GsExecutionMode::ThreadedAsync;
+            configuration.gsCommandQueueCapacity = 1u;
+            configuration.gsCommandPayloadCapacityBytes = 4096u;
+            configuration.gsBeforeProcess =
+                [gate](const GsCommand &command, uint64_t ticket)
+                {
+                    gate->beforeProcess(command, ticket);
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize() &&
+                         runtime.syncCoreSubsystems(),
+                     "the asynchronous runtime should bind before its lazy owner starts");
+
+            constexpr uint32_t kSignalId = 0x12345678u;
+            constexpr uint32_t kSignalMask = 0x00FF00FFu;
+            const std::vector<uint8_t> packet =
+                makePrivilegedRegisterPacket(
+                    GS_REG_SIGNAL,
+                    static_cast<uint64_t>(kSignalId) |
+                        (static_cast<uint64_t>(kSignalMask) << 32u));
+            runtime.memory().processGIFPacket(
+                packet.data(),
+                static_cast<uint32_t>(packet.size()));
+            t.IsTrue(gate->waitUntilEntered(),
+                     "the owner should be held after the ordinary GIF submission already returned");
+            t.Equals(runtime.memory().gs().csr.load(
+                         std::memory_order_relaxed) & 1u,
+                     0ull,
+                     "an unretired SIGNAL must remain private to the GS result journal");
+
+            std::atomic<bool> observerReturned{false};
+            uint64_t observedCsr = 0u;
+            std::thread observer([&]()
+            {
+                observedCsr = runtime.memory().read64(0x12001000u);
+                observerReturned.store(
+                    true, std::memory_order_release);
+            });
+            std::this_thread::sleep_for(10ms);
+            t.IsFalse(observerReturned.load(
+                          std::memory_order_acquire),
+                      "a CSR observation should wait at the earliest guest-visible boundary");
+            gate->release();
+            observer.join();
+
+            t.Equals(observedCsr & 1u, 1ull,
+                     "the resumed CSR read should include the ordered SIGNAL bit");
+            t.Equals(
+                static_cast<uint32_t>(
+                    runtime.memory().gs().siglblid),
+                kSignalId & kSignalMask,
+                "EE publication should apply the exact SIGNAL mask");
+            const GsAsyncRuntimeStatistics statistics =
+                runtime.gsAsyncStatistics();
+            t.IsTrue(statistics.enabled,
+                     "the runtime should report asynchronous policy selection");
+            t.Equals(statistics.pendingCompletions,
+                     static_cast<size_t>(0u),
+                     "the architectural read should retire the complete pending journal");
+            t.IsTrue(statistics.pendingHighWater >= 1u,
+                     "the returned ordinary batch should be visible in bounded journal metrics");
+        });
+
+        tc.Run("asynchronous GS publication precedes CSR write-one-to-clear acknowledgement", [](TestCase &t)
+        {
+            const auto gate = std::make_shared<WorkerGate>();
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.gsExecutionMode =
+                GsExecutionMode::ThreadedAsync;
+            configuration.gsCommandQueueCapacity = 1u;
+            configuration.gsCommandPayloadCapacityBytes = 4096u;
+            configuration.gsBeforePublish =
+                [gate](const GsCommandResult &result, uint64_t ticket)
+                {
+                    gate->beforePublish(result, ticket);
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize() &&
+                         runtime.syncCoreSubsystems(),
+                     "the result-publication fixture should initialize");
+
+            const std::vector<uint8_t> packet =
+                makePrivilegedRegisterPacket(
+                    GS_REG_SIGNAL,
+                    0x5Au | (0xFFull << 32u));
+            runtime.memory().processGIFPacket(
+                packet.data(),
+                static_cast<uint32_t>(packet.size()));
+            t.IsTrue(gate->waitUntilEntered(),
+                     "the owner should process SIGNAL before the held result becomes ready");
+            t.Equals(runtime.memory().gs().csr.load(
+                         std::memory_order_relaxed) & 1u,
+                     0ull,
+                     "processed effects should remain unpublished until result retirement");
+
+            std::atomic<bool> writerReturned{false};
+            std::thread writer([&]()
+            {
+                runtime.memory().write64(
+                    0x12001000u, 1u);
+                writerReturned.store(
+                    true, std::memory_order_release);
+            });
+            std::this_thread::sleep_for(10ms);
+            t.IsFalse(writerReturned.load(
+                          std::memory_order_acquire),
+                      "CSR acknowledgement should wait for prior result publication");
+            gate->release();
+            writer.join();
+
+            t.Equals(runtime.memory().gs().csr.load(
+                         std::memory_order_relaxed) & 1u,
+                     0ull,
+                     "write-one-to-clear should acknowledge the newly published SIGNAL, not be overwritten by it");
+            t.Equals(
+                static_cast<uint32_t>(
+                    runtime.memory().gs().siglblid),
+                0x5Au,
+                "acknowledgement should not discard the associated SIGNAL ID");
+        });
+
+        tc.Run("asynchronous GS VRAM observation waits for queued image writes", [](TestCase &t)
+        {
+            const auto gate = std::make_shared<WorkerGate>();
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.gsExecutionMode =
+                GsExecutionMode::ThreadedAsync;
+            configuration.gsCommandQueueCapacity = 1u;
+            configuration.gsCommandPayloadCapacityBytes = 4096u;
+            configuration.gsBeforePublish =
+                [gate](const GsCommandResult &result, uint64_t ticket)
+                {
+                    gate->beforePublish(result, ticket);
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize() &&
+                         runtime.syncCoreSubsystems(),
+                     "the asynchronous VRAM fixture should initialize");
+
+            const std::vector<uint8_t> packet =
+                makeTwoByTwoImageUploadPacket();
+            runtime.memory().processGIFPacket(
+                packet.data(),
+                static_cast<uint32_t>(packet.size()));
+            t.IsTrue(gate->waitUntilEntered(),
+                     "the image upload should reach the held publication boundary");
+
+            std::atomic<bool> observerReturned{false};
+            GsVramSnapshotResult snapshot{};
+            std::thread observer([&]()
+            {
+                snapshot =
+                    takeGsCommandResult<GsVramSnapshotResult>(
+                        runtime.submitGsCommand(
+                            GsCopyVramCommand{}));
+                observerReturned.store(
+                    true, std::memory_order_release);
+            });
+            std::this_thread::sleep_for(10ms);
+            t.IsFalse(observerReturned.load(
+                          std::memory_order_acquire),
+                      "VRAM readback must not overtake an unpublished queued image upload");
+            gate->release();
+            observer.join();
+
+            bool containsUploadedByte = false;
+            for (uint8_t value : snapshot.bytes)
+            {
+                containsUploadedByte =
+                    containsUploadedByte || value != 0u;
+            }
+            t.IsTrue(snapshot.available &&
+                         snapshot.bytes.size() == PS2_GS_VRAM_SIZE &&
+                         containsUploadedByte,
+                     "the synchronized owner snapshot should contain the completed image write");
+        });
+
+        tc.Run("asynchronous GS save load reset renderer and producer ownership remain ordered", [](TestCase &t)
+        {
+            const auto gate = std::make_shared<WorkerGate>();
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.gsExecutionMode =
+                GsExecutionMode::ThreadedAsync;
+            configuration.gsCommandQueueCapacity = 1u;
+            configuration.gsCommandPayloadCapacityBytes = 4096u;
+            configuration.gsBeforeProcess =
+                [gate](const GsCommand &command, uint64_t ticket)
+                {
+                    gate->beforeProcess(command, ticket);
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize() &&
+                         runtime.syncCoreSubsystems(),
+                     "the asynchronous lifecycle fixture should initialize");
+
+            const GsDrainBatchCommand first =
+                makeScanMaskBatch(2u);
+            const std::vector<uint8_t> &firstPacket =
+                first.batch.storage[2];
+            runtime.memory().processGIFPacket(
+                firstPacket.data(),
+                static_cast<uint32_t>(firstPacket.size()));
+            t.IsTrue(gate->waitUntilEntered(),
+                     "save should be issued while older GS work is still queued");
+            std::thread releaser([gate]()
+            {
+                std::this_thread::sleep_for(10ms);
+                gate->release();
+            });
+            const GsReplayState saved =
+                takeGsCommandResult<GsReplayStateResult>(
+                    runtime.submitGsCommand(
+                        GsCaptureReplayStateCommand{}))
+                    .state;
+            releaser.join();
+            t.Equals(saved.scanMask, static_cast<uint8_t>(2u),
+                     "save should capture all older queued GS mutations");
+
+            const GsDrainBatchCommand second =
+                makeScanMaskBatch(1u);
+            const std::vector<uint8_t> &secondPacket =
+                second.batch.storage[2];
+            runtime.memory().processGIFPacket(
+                secondPacket.data(),
+                static_cast<uint32_t>(secondPacket.size()));
+            const bool rendererSelected =
+                takeGsCommandResult<GsBooleanResult>(
+                    runtime.submitGsCommand(
+                        GsSetRendererModeCommand{
+                            .mode = GsRendererMode::Software}))
+                    .value;
+            const GsReplayState afterRenderer =
+                takeGsCommandResult<GsReplayStateResult>(
+                    runtime.submitGsCommand(
+                        GsCaptureReplayStateCommand{}))
+                    .state;
+            t.IsTrue(rendererSelected && afterRenderer.scanMask == 1u,
+                     "renderer control should execute after every older queued mutation");
+
+            (void)runtime.submitEeGsCommand(
+                GsRestoreReplayStateCommand{.state = saved});
+            const GsReplayState restored =
+                takeGsCommandResult<GsReplayStateResult>(
+                    runtime.submitGsCommand(
+                        GsCaptureReplayStateCommand{}))
+                    .state;
+            t.Equals(restored.scanMask, static_cast<uint8_t>(2u),
+                     "load should retire the EE journal before restoring the saved owner state");
+
+            (void)runtime.submitEeGsCommand(GsResetCommand{});
+            const std::string wrongProducer =
+                captureException([&]()
+                {
+                    (void)runtime.submitGsCommand(
+                        GsWriteRegisterCommand{
+                            .address = GS_REG_SCANMSK,
+                            .value = 3u,
+                        });
+                });
+            const GsReplayState reset =
+                takeGsCommandResult<GsReplayStateResult>(
+                    runtime.submitGsCommand(
+                        GsCaptureReplayStateCommand{}))
+                    .state;
+            t.IsFalse(wrongProducer.empty(),
+                      "generic host submission should reject EE-owned hot traffic before mutation");
+            t.Equals(reset.scanMask, static_cast<uint8_t>(0u),
+                     "reset and rejected producer traffic should leave the owner in reset state");
+        });
+
+        tc.Run("asynchronous runtime shutdown drains queued journal work", [](TestCase &t)
+        {
+            const auto gate = std::make_shared<WorkerGate>();
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.gsExecutionMode =
+                GsExecutionMode::ThreadedAsync;
+            configuration.gsCommandQueueCapacity = 1u;
+            configuration.gsCommandPayloadCapacityBytes = 4096u;
+            configuration.gsBeforePublish =
+                [gate](const GsCommandResult &result, uint64_t ticket)
+                {
+                    gate->beforePublish(result, ticket);
+                };
+            auto runtime =
+                std::make_unique<PS2Runtime>(configuration);
+            t.IsTrue(runtime->memory().initialize() &&
+                         runtime->syncCoreSubsystems(),
+                     "the asynchronous shutdown fixture should initialize");
+            const GsDrainBatchCommand command =
+                makeScanMaskBatch(3u);
+            const std::vector<uint8_t> &packet =
+                command.batch.storage[2];
+            runtime->memory().processGIFPacket(
+                packet.data(),
+                static_cast<uint32_t>(packet.size()));
+            t.IsTrue(gate->waitUntilEntered(),
+                     "shutdown should begin with one unpublished journal entry");
+
+            std::atomic<bool> releaseStarted{false};
+            std::thread releaser([&]()
+            {
+                releaseStarted.store(
+                    true, std::memory_order_release);
+                std::this_thread::sleep_for(10ms);
+                gate->release();
+            });
+            runtime.reset();
+            releaser.join();
+            t.IsTrue(releaseStarted.load(
+                         std::memory_order_acquire),
+                     "runtime destruction should wait until accepted GS work can drain");
+        });
+
+        tc.Run("asynchronous GS zero field lead waits for publication and exposes completed presentation identity", [](TestCase &t)
+        {
+            constexpr uint32_t kRenderCycles = 4'498'396u;
+            constexpr uint32_t kGsBlankCycles = 65'601u;
+            const auto gate = std::make_shared<WorkerGate>();
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.gsExecutionMode =
+                GsExecutionMode::ThreadedAsync;
+            configuration.gsCommandQueueCapacity = 1u;
+            configuration.gsCommandPayloadCapacityBytes = 4096u;
+            configuration.gsMaximumFieldLead = 0u;
+            configuration.gsBeforePublish =
+                [gate](const GsCommandResult &result, uint64_t ticket)
+                {
+                    gate->beforePublish(result, ticket);
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize() &&
+                         runtime.syncCoreSubsystems(),
+                     "the zero-lead field fixture should initialize");
+            runtime.configureEeVSyncVideoMode(0x02u, true);
+            runtime.ensureEeVSyncScheduled();
+            R5900Context context{};
+            advanceEeCycles(runtime, context, kRenderCycles);
+            context.advanceEeCycleTicks(kGsBlankCycles * 8u);
+
+            std::atomic<bool> fieldReturned{false};
+            std::atomic<bool> observedBlocked{false};
+            std::thread releaser([&]()
+            {
+                if (gate->waitUntilEntered())
+                {
+                    std::this_thread::sleep_for(10ms);
+                    observedBlocked.store(
+                        !fieldReturned.load(
+                            std::memory_order_acquire),
+                        std::memory_order_release);
+                }
+                gate->release();
+            });
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            fieldReturned.store(true, std::memory_order_release);
+            releaser.join();
+            t.IsTrue(observedBlocked.load(
+                         std::memory_order_acquire),
+                     "lead zero should hold EE at the field boundary until publication");
+
+            const GsAsyncRuntimeStatistics statistics =
+                runtime.gsAsyncStatistics();
+            t.Equals(statistics.fieldsSubmitted, 1ull,
+                     "one GS-blank boundary should enqueue one field marker");
+            t.Equals(statistics.fieldsCompleted, 1ull,
+                     "lead zero should consume that field result before returning");
+            t.Equals(statistics.fieldLeadHighWater, 1ull,
+                     "lead zero should transiently own exactly one marker while waiting");
+            const GsPresentationResult presentation =
+                takeGsCommandResult<GsPresentationResult>(
+                    runtime.submitGsCommand(
+                        GsCopyPresentationCommand{}));
+            t.Equals(presentation.completedFieldSequence, 1ull,
+                     "presentation copy should identify the exact completed field even without a configured display");
+        });
+
+        tc.Run("asynchronous GS one field lead backpressures the next marker with a one-slot queue", [](TestCase &t)
+        {
+            constexpr uint32_t kRenderCycles = 4'498'396u;
+            constexpr uint32_t kGsBlankCycles = 65'601u;
+            constexpr uint32_t kBlankCycles = 421'724u;
+            constexpr uint32_t kPeriodCycles = 4'920'120u;
+            const auto gate = std::make_shared<WorkerGate>();
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.gsExecutionMode =
+                GsExecutionMode::ThreadedAsync;
+            configuration.gsCommandQueueCapacity = 1u;
+            configuration.gsCommandPayloadCapacityBytes = 4096u;
+            configuration.gsMaximumFieldLead = 1u;
+            configuration.gsBeforePublish =
+                [gate](const GsCommandResult &result, uint64_t ticket)
+                {
+                    gate->beforePublish(result, ticket);
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize() &&
+                         runtime.syncCoreSubsystems(),
+                     "the one-lead field fixture should initialize");
+            runtime.configureEeVSyncVideoMode(0x02u, true);
+            runtime.ensureEeVSyncScheduled();
+            R5900Context context{};
+            advanceEeCycles(runtime, context, kRenderCycles);
+            advanceEeCycles(runtime, context, kGsBlankCycles);
+            t.IsTrue(gate->waitUntilEntered(),
+                     "the first field should remain private behind the publication gate");
+            t.Equals(runtime.gsAsyncStatistics().fieldsSubmitted,
+                     1ull,
+                     "lead one should let EE continue with one incomplete field");
+
+            advanceEeCycles(
+                runtime, context,
+                kBlankCycles - kGsBlankCycles);
+            advanceEeCycles(
+                runtime, context,
+                kPeriodCycles - kBlankCycles);
+            context.advanceEeCycleTicks(kGsBlankCycles * 8u);
+            std::atomic<bool> observedLeadBlock{false};
+            std::thread releaser([&]()
+            {
+                const bool blocked = waitUntil([&]()
+                {
+                    return runtime.gsAsyncStatistics()
+                               .fieldLeadBlockCount >= 1u;
+                });
+                observedLeadBlock.store(
+                    blocked, std::memory_order_release);
+                gate->release();
+            });
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            releaser.join();
+            t.IsTrue(observedLeadBlock.load(
+                         std::memory_order_acquire),
+                     "the second field should reach explicit field-lead backpressure");
+
+            (void)runtime.submitEeGsCommand(
+                GsBarrierCommand{});
+            const GsAsyncRuntimeStatistics statistics =
+                runtime.gsAsyncStatistics();
+            t.Equals(statistics.fieldsSubmitted, 2ull,
+                     "two GS-blank boundaries should enqueue two markers");
+            t.Equals(statistics.fieldsCompleted, 2ull,
+                     "the explicit barrier should retire both field results");
+            t.Equals(statistics.fieldLeadHighWater, 1ull,
+                     "field lead must never exceed its configured bound");
+            t.IsTrue(statistics.fieldLeadBlockCount >= 1u &&
+                         statistics.fieldLeadBlockedNanoseconds > 0u,
+                     "field backpressure should retain count and duration evidence");
+            t.IsTrue(statistics.owner.queueHighWater <= 1u,
+                     "the tiny owner ring must respect its one-slot bound");
         });
 
 #if PS2X_ENABLE_RUNTIME_DIAGNOSTICS

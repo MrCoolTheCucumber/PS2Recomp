@@ -1,7 +1,8 @@
 # Threaded VU1 and GS ownership contract
 
 Status: Milestone 1 contract, audited against PS2Recomp revision
-`588d9a68d69b8a87a8cd755618502278a10b4ec3` on 2026-08-13.
+`588d9a68d69b8a87a8cd755618502278a10b4ec3` on 2026-08-13 and reconciled
+with the implemented GS owner through Milestone 4 on 2026-08-14.
 
 This document is the source inventory and publication contract for moving GS
 and VU1 work off the EE executor. It describes current behavior first and the
@@ -285,7 +286,8 @@ DmacGif service, if one was already due
 VifVu1Finish service
 ```
 
-Within the current `VifVu1Finish` handler the order is:
+In inline and threaded-synchronous GS policy, the current
+`VifVu1Finish` handler has this host execution order:
 
 ```text
 VuUnit::advance
@@ -300,9 +302,13 @@ VuUnit::advance returns
   -> clear VIF1 VEW and resume deferred VIF1 parsing/DMA
 ```
 
-Thus every normal runtime XGKICK side effect is synchronous inside
-`serviceVU1AtEvent`, and it precedes VIF1 wake. The only direct-GS XGKICK path
-is the null-memory fixture fallback. The focused regression
+The asynchronous GS policy preserves the same EE arbitration and submission
+order but does not wait for ordinary drain completion. XGKICK bytes still
+enter the EE-owned arbiter inside `serviceVU1AtEvent` before VIF1 wake; any
+SIGNAL/FINISH/LABEL effect stays private in the ordered EE completion journal
+until the first guest observation of the control-register bank, a lifecycle
+barrier, or journal backpressure retires it. The only direct-GS XGKICK path is
+the null-memory fixture fallback. The focused regression
 `event VU1 publishes XGKICK before waking stalled VIF1` proves the normal
 ordering, while `equal-tick VIF1 completion publishes before VU1 service`
 proves the scheduler priority and same-tick rescan.
@@ -396,11 +402,70 @@ Generation zero is reserved as invalid.
 | VU1 micro/data write followed by MSCAL | `EE VU1 micro and data writes are ordered before MSCAL` |
 | VIF1 UNPACK followed by VU1 execution | `VIF1 UNPACK data is visible to the following VU1 execution` |
 | VU completion resumes stalled VIF1 DMA | Existing `event VIF1 VU wait removes DMAC_VIF1 until VU wake` |
-| Reset/load versus in-flight generation | Existing scheduler/VU reset-generation tests and synchronized GS replay restore cover the pre-queue behavior. Actual stale queued-command/result rejection is a Milestone 2/3 gate once `WorkIdentity` exists; it cannot be truthfully exercised before an in-flight command generation exists |
+| Reset/load versus in-flight generation | `threaded GS cancellation rejects stale queued generations and admits reset`, plus `asynchronous GS save load reset renderer and producer ownership remain ordered` |
 
-The last row is a deliberate staged obligation, not a waiver. No asynchronous
-GS worker may be introduced until a command-generation cancellation test
-exists. The equivalent VU test is required before asynchronous VU ownership.
+The equivalent VU generation test remains required before asynchronous VU
+ownership.
+
+## Milestone 4 implemented GS publication contract
+
+`threaded-async` uses the same `GsCommandProcessor` and bounded
+`ThreadedGsExecutor` as the inline oracle and correctness-first synchronous
+mode. The only policy difference is completion retention:
+
+```text
+EE-owned GifArbiter drain
+  -> move one owned GsDrainBatch into the bounded owner queue
+  -> retain its move-only completion in FIFO order
+  -> continue EE execution while within queue/journal/field bounds
+
+GS owner
+  -> process commands in sequence/generation order
+  -> return drained storage plus ordered privileged side effects
+
+EE publication boundary
+  -> retire journal entries only from the front
+  -> apply SIGNAL/FINISH/LABEL in result-vector order
+  -> recycle the moved GifArbiter storage
+```
+
+The EE journal is bounded to the configured command capacity plus two entries.
+The owner ring and payload budgets remain the primary admission bounds; a full
+bound blocks the producer and never drops work. The public host-control path
+may submit only synchronous observation/control commands in asynchronous
+mode. Hot drain/register/upload/clear/field commands are rejected there so the
+runtime keeps exactly one hot producer.
+
+The earliest guest-visible effect boundary is the privileged GS control bank
+(`CSR`, `IMR`, `BUSDIR`, and `SIGLBLID`). `PS2Memory` invokes the runtime
+observation hook before each such read or write, and the runtime retires all
+older journal entries before the access proceeds. Display-register accesses
+remain EE-owned and do not drain the journal; their values are copied by value
+into the next ordered field marker. FIFO reads, CPU/debug VRAM copies,
+snapshots, renderer changes, restore/reset, and shutdown are synchronous owner
+commands or lifecycle quiesce points ordered behind all older owner work.
+
+At GS blank, EE first updates its `CSR.FIELD` mirror and then enqueues a field
+marker containing the field sequence and an immutable display-register
+snapshot. The owner latches presentation from fully completed GS state and
+publishes that identity only after the latch is complete. Host presentation
+uses the owner's completed identity and copied pixels; it never reads live GS
+state. Reset/restore starts a new processor generation and invalidates the
+owner's completed presentation identity until a new marker completes.
+
+The runtime accepts a maximum field lead of zero or one. Lead zero waits for
+the marker at the same field boundary; lead one permits one incomplete marker
+and blocks before a second. Counts are based on ordered EE publication, while
+presentation intentionally uses the owner-completed identity, which may be one
+journal entry newer without exposing partially mutated state.
+
+Owner metrics distinguish explicit `GsBarrierCommand` retirements from
+synchronous wait operations. `barriers_completed` counts only typed barriers;
+`barrier_wait_count` and `barrier_wait_ns` count every `submit()` rendezvous
+used for an observation or control operation. Queue/payload high-water,
+producer blocking, owner active/idle time, field-marker completion, and the EE
+journal/lead counters are exposed through `system.status.gs_async`. Those
+statistics are observational and do not participate in guest scheduling.
 
 ## Audit maintenance
 

@@ -557,11 +557,9 @@ struct GSRegisters
     uint64_t extdata;  // External data
     uint64_t extwrite; // External write
     uint64_t bgcolor;  // Background color
-    // Status. Concurrency contract: the vsync worker thread toggles the FIELD bit
-    // (bit 13) once per tick; guest threads issue write-one-to-clear writes against
-    // the SIGNAL/FINISH status bits (0..1) via the MMIO path; the GIF sets SIGNAL
-    // and FINISH from yet another thread. All three interleave, so this register
-    // must be updated with atomic RMWs only (no load-then-store pairs anywhere).
+    // EE-owned status mirror. EE VSync updates FIELD, guest MMIO performs
+    // write-one-to-clear, and ordered GS results publish SIGNAL/FINISH. Keep
+    // atomic RMWs so low-frequency host observation remains race-free too.
     std::atomic<uint64_t> csr;
     uint64_t imr;      // Interrupt mask
     uint64_t busdir;   // Bus direction
@@ -569,8 +567,7 @@ struct GSRegisters
 };
 static_assert(sizeof(GSRegisters) == (19u * sizeof(uint64_t)), "GSRegisters layout changed unexpectedly");
 static_assert(alignof(GSRegisters) == alignof(uint64_t), "GSRegisters alignment must remain 64-bit");
-// CSR is written by the vsync worker while guest threads concurrently read/write it
-// (MMIO) and the GIF sets SIGNAL/FINISH; a lock-free atomic keeps that path wait-free.
+// CSR can also be observed from host diagnostics while the EE updates it.
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be lock-free on all supported targets");
 
 // PS2 VIF (VPU Interface) registers
@@ -1480,6 +1477,14 @@ public:
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
+    using GsPrivilegedObservationCallback =
+        std::function<void(uint32_t address, bool write)>;
+    void setGsPrivilegedObservationCallback(
+        GsPrivilegedObservationCallback callback)
+    {
+        m_gsPrivilegedObservationCallback =
+            std::move(callback);
+    }
 
     using Vu0MscalCallback =
         std::function<void(uint32_t startPC, uint32_t itop)>;
@@ -1860,6 +1865,8 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
+    GsPrivilegedObservationCallback
+        m_gsPrivilegedObservationCallback;
     Vu0MscalCallback m_vu0MscalCallback;
     Vu0MscntCallback m_vu0MscntCallback;
     Vu0BusyCallback m_vu0BusyCallback;

@@ -1,4 +1,5 @@
 #include "runtime/ps2_gs_vulkan.h"
+#include "ThreadNaming.h"
 #include "runtime/ps2_gs_common.h"
 #include "runtime/ps2_gs_memory.h"
 
@@ -8497,6 +8498,7 @@ struct GsVulkanService::Impl final
 
     void threadMain()
     {
+        ThreadNaming::SetCurrentThreadName("PS2GsVulkan");
         try
         {
             threadMainImpl();

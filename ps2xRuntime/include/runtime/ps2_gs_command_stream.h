@@ -70,6 +70,7 @@ enum class GsCommandType : uint8_t
     DrawStatus,
     Barrier,
     CopyVram,
+    FieldMarker,
 };
 
 [[nodiscard]] const char *gsCommandTypeName(
@@ -180,10 +181,17 @@ struct GsSetProgressTrackingCommand
 
 struct GsLatchPresentationCommand
 {
+    GsPrivilegedRegisterSnapshot registers{};
 };
 
 struct GsCopyPresentationCommand
 {
+};
+
+struct GsFieldMarkerCommand
+{
+    uint64_t fieldSequence = 0u;
+    GsPrivilegedRegisterSnapshot registers{};
 };
 
 struct GsConfigureVulkanCommand
@@ -264,7 +272,8 @@ using GsCommandPayload = std::variant<
     GsSetDrawCommandLimitCommand,
     GsClearDrawCommandLimitCommand,
     GsDrawStatusCommand,
-    GsBarrierCommand>;
+    GsBarrierCommand,
+    GsFieldMarkerCommand>;
 
 struct GsCommand
 {
@@ -352,6 +361,12 @@ struct GsPresentationResult
     uint32_t sourceFbp = 0u;
     bool usedPreferred = false;
     bool available = false;
+    uint64_t completedFieldSequence = 0u;
+};
+
+struct GsFieldMarkerResult
+{
+    uint64_t fieldSequence = 0u;
 };
 
 struct GsRendererStatusResult
@@ -374,25 +389,6 @@ struct GsDrawStatusResult
     uint64_t submittedCommands = 0u;
 };
 
-struct GsSignalEffect
-{
-    uint32_t id = 0u;
-    uint32_t mask = 0u;
-};
-
-struct GsFinishEffect
-{
-};
-
-struct GsLabelEffect
-{
-    uint32_t id = 0u;
-    uint32_t mask = 0u;
-};
-
-using GsPrivilegedSideEffect = std::variant<
-    GsSignalEffect, GsFinishEffect, GsLabelEffect>;
-
 using GsCommandResultPayload = std::variant<
     GsNoResult,
     GsDrainBatchResult,
@@ -407,7 +403,8 @@ using GsCommandResultPayload = std::variant<
     GsPresentationResult,
     GsRendererStatusResult,
     GsBackendCountersResult,
-    GsDrawStatusResult>;
+    GsDrawStatusResult,
+    GsFieldMarkerResult>;
 
 enum class GsCommandDisposition : uint8_t
 {
@@ -491,12 +488,14 @@ private:
     uint64_t m_generation = 1u;
     uint64_t m_completedSequence = 0u;
     uint64_t m_currentDebugVsyncTick = 0u;
+    uint64_t m_completedFieldSequence = 0u;
 };
 
 enum class GsExecutionMode : uint8_t
 {
     Inline,
     ThreadedSynchronous,
+    ThreadedAsync,
 };
 
 [[nodiscard]] constexpr const char *gsExecutionModeName(
@@ -508,6 +507,8 @@ enum class GsExecutionMode : uint8_t
         return "inline";
     case GsExecutionMode::ThreadedSynchronous:
         return "threaded-sync";
+    case GsExecutionMode::ThreadedAsync:
+        return "threaded-async";
     }
     return "unknown";
 }
@@ -579,6 +580,10 @@ struct ThreadedGsExecutorOptions
     // A deterministic owner-thread hook for focused delay/failure tests. The
     // production runtime leaves it empty.
     std::function<void(const GsCommand &, uint64_t)> beforeProcess;
+    // Runs after semantic processing but before the future becomes ready.
+    // It makes result-publication races deterministic without changing the
+    // command processor or production scheduling.
+    std::function<void(const GsCommandResult &, uint64_t)> beforePublish;
 };
 
 struct ThreadedGsExecutorStatistics
@@ -591,11 +596,21 @@ struct ThreadedGsExecutorStatistics
     uint64_t payloadHighWaterBytes = 0u;
     uint64_t submittedTickets = 0u;
     uint64_t completedTickets = 0u;
+    uint64_t submittedGeneration = 0u;
+    uint64_t submittedSequence = 0u;
+    uint64_t completedGeneration = 0u;
+    uint64_t completedSequence = 0u;
     uint64_t producerBlockCount = 0u;
     uint64_t producerBlockedNanoseconds = 0u;
     uint64_t workerActiveNanoseconds = 0u;
     uint64_t workerIdleNanoseconds = 0u;
     uint64_t barriersCompleted = 0u;
+    uint64_t barrierWaitCount = 0u;
+    uint64_t barrierWaitNanoseconds = 0u;
+    uint64_t fieldMarkersSubmitted = 0u;
+    uint64_t fieldMarkersCompleted = 0u;
+    uint64_t lastSubmittedFieldSequence = 0u;
+    uint64_t lastCompletedFieldSequence = 0u;
     bool started = false;
     bool running = false;
     bool accepting = false;
@@ -654,9 +669,9 @@ public:
         uint64_t publicationToken = 0u,
         uint64_t debugVsyncTick = 0u) override;
 
-    // The runtime's Milestone 3 mode calls submit() and therefore waits after
-    // every command. This move-only completion is exposed so queue, lifecycle,
-    // and later asynchronous policies can exercise the exact same transport.
+    // Synchronous policy calls submit() and waits after every command. The
+    // asynchronous runtime retains this move-only completion in its ordered
+    // EE publication journal while using the exact same transport.
     [[nodiscard]] GsCommandSubmission submitAsync(
         GsCommandPayload payload,
         uint64_t guestTick = 0u,
@@ -667,6 +682,7 @@ public:
     [[nodiscard]] uint64_t lastSubmittedSequence() const override;
     [[nodiscard]] uint64_t lastSubmittedTicket() const noexcept;
     [[nodiscard]] uint64_t lastCompletedTicket() const noexcept;
+    [[nodiscard]] uint64_t lastCompletedFieldSequence() const noexcept;
 
     // Commands below this generation complete as typed stale results without
     // reaching GS state. Lifecycle code must enqueue the corresponding reset
@@ -735,11 +751,21 @@ private:
     std::atomic<uint64_t> m_payloadHighWaterBytes{0u};
     std::atomic<uint64_t> m_submittedTickets{0u};
     std::atomic<uint64_t> m_completedTickets{0u};
+    std::atomic<uint64_t> m_submittedGeneration{0u};
+    std::atomic<uint64_t> m_submittedSequence{0u};
+    std::atomic<uint64_t> m_completedGeneration{0u};
+    std::atomic<uint64_t> m_completedSequence{0u};
     std::atomic<uint64_t> m_producerBlockCount{0u};
     std::atomic<uint64_t> m_producerBlockedNanoseconds{0u};
     std::atomic<uint64_t> m_workerActiveNanoseconds{0u};
     std::atomic<uint64_t> m_workerIdleNanoseconds{0u};
     std::atomic<uint64_t> m_barriersCompleted{0u};
+    std::atomic<uint64_t> m_barrierWaitCount{0u};
+    std::atomic<uint64_t> m_barrierWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_fieldMarkersSubmitted{0u};
+    std::atomic<uint64_t> m_fieldMarkersCompleted{0u};
+    std::atomic<uint64_t> m_lastSubmittedFieldSequence{0u};
+    std::atomic<uint64_t> m_lastCompletedFieldSequence{0u};
 };
 
 #endif

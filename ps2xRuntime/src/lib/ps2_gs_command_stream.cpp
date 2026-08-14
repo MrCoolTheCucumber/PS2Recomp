@@ -1,5 +1,7 @@
 #include "runtime/ps2_gs_command_stream.h"
 
+#include "ThreadNaming.h"
+
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -102,7 +104,8 @@ namespace
             std::holds_alternative<GsWriteRegisterCommand>(payload) ||
             std::holds_alternative<GsNativePackedGifCommand>(payload) ||
             std::holds_alternative<GsNativeImageUploadCommand>(payload) ||
-            std::holds_alternative<GsClearFramebufferCommand>(payload);
+            std::holds_alternative<GsClearFramebufferCommand>(payload) ||
+            std::holds_alternative<GsFieldMarkerCommand>(payload);
     }
 
     bool isValidDrainBatch(
@@ -162,6 +165,12 @@ namespace
                     std::vector<uint8_t> encoded;
                     return encodeGsReplayState(
                         value.state, encoded);
+                }
+                else if constexpr (
+                    std::is_same_v<T, GsFieldMarkerCommand>)
+                {
+                    return value.fieldSequence != 0u &&
+                           value.registers.valid;
                 }
                 else
                 {
@@ -242,6 +251,8 @@ const char *gsCommandTypeName(GsCommandType type) noexcept
         return "barrier";
     case GsCommandType::CopyVram:
         return "copy-vram";
+    case GsCommandType::FieldMarker:
+        return "field-marker";
     }
     return "unknown";
 }
@@ -317,6 +328,8 @@ GsCommandType gsCommandType(
                 return GsCommandType::ClearDrawCommandLimit;
             else if constexpr (std::is_same_v<T, GsDrawStatusCommand>)
                 return GsCommandType::DrawStatus;
+            else if constexpr (std::is_same_v<T, GsFieldMarkerCommand>)
+                return GsCommandType::FieldMarker;
             else
                 return GsCommandType::Barrier;
         },
@@ -375,6 +388,11 @@ uint64_t gsCommandPayloadSize(
             }
             else if constexpr (std::is_same_v<T, GsRecentGifPacketsCommand>)
                 return sizeof(uint64_t);
+            else if constexpr (std::is_same_v<T, GsLatchPresentationCommand>)
+                return sizeof(bool) + 7u * sizeof(uint64_t);
+            else if constexpr (std::is_same_v<T, GsFieldMarkerCommand>)
+                return sizeof(value.fieldSequence) + sizeof(bool) +
+                       7u * sizeof(uint64_t);
             else if constexpr (
                 std::is_same_v<T, GsSetDebugHistoryPausedCommand> ||
                 std::is_same_v<T, GsSetProgressTrackingCommand> ||
@@ -468,6 +486,29 @@ uint64_t gsCommandPayloadHash(
                 hashScalar(hash, value.paused);
             else if constexpr (std::is_same_v<T, GsSetProgressTrackingCommand>)
                 hashScalar(hash, value.enabled);
+            else if constexpr (std::is_same_v<T, GsLatchPresentationCommand>)
+            {
+                hashScalar(hash, value.registers.valid);
+                hashScalar(hash, value.registers.pmode);
+                hashScalar(hash, value.registers.smode2);
+                hashScalar(hash, value.registers.dispfb1);
+                hashScalar(hash, value.registers.display1);
+                hashScalar(hash, value.registers.dispfb2);
+                hashScalar(hash, value.registers.display2);
+                hashScalar(hash, value.registers.bgcolor);
+            }
+            else if constexpr (std::is_same_v<T, GsFieldMarkerCommand>)
+            {
+                hashScalar(hash, value.fieldSequence);
+                hashScalar(hash, value.registers.valid);
+                hashScalar(hash, value.registers.pmode);
+                hashScalar(hash, value.registers.smode2);
+                hashScalar(hash, value.registers.dispfb1);
+                hashScalar(hash, value.registers.display1);
+                hashScalar(hash, value.registers.dispfb2);
+                hashScalar(hash, value.registers.display2);
+                hashScalar(hash, value.registers.bgcolor);
+            }
             else if constexpr (std::is_same_v<T, GsConfigureVulkanCommand>)
             {
                 hashScalar(hash, value.service.probe.enableValidation);
@@ -619,6 +660,7 @@ GsCommandResult GsCommandProcessor::process(
         }
         m_generation = command.identity.generation;
         m_completedSequence = 0u;
+        m_completedFieldSequence = 0u;
     }
 
     if (!beginsNewGeneration &&
@@ -633,6 +675,19 @@ GsCommandResult GsCommandProcessor::process(
     }
 
     m_currentDebugVsyncTick = command.debugVsyncTick;
+    struct PrivilegedEffectScope
+    {
+        GS &gs;
+        std::vector<GsPrivilegedSideEffect> *previous = nullptr;
+        ~PrivilegedEffectScope()
+        {
+            gs.exchangePrivilegedSideEffectSink(previous);
+        }
+    } effectScope{
+        .gs = m_gs,
+        .previous = m_gs.exchangePrivilegedSideEffectSink(
+            &result.privilegedEffects),
+    };
     result.payload = std::visit(
         [&](auto &value) -> GsCommandResultPayload
         {
@@ -784,7 +839,10 @@ GsCommandResult GsCommandProcessor::process(
             }
             else if constexpr (std::is_same_v<T, GsLatchPresentationCommand>)
             {
-                m_gs.latchHostPresentationFrame();
+                if (value.registers.valid)
+                    m_gs.latchHostPresentationFrame(value.registers);
+                else
+                    m_gs.latchHostPresentationFrame();
                 return GsNoResult{};
             }
             else if constexpr (std::is_same_v<T, GsCopyPresentationCommand>)
@@ -795,6 +853,8 @@ GsCommandResult GsCommandProcessor::process(
                         frame.pixels, frame.width, frame.height,
                         &frame.displayFbp, &frame.sourceFbp,
                         &frame.usedPreferred);
+                frame.completedFieldSequence =
+                    m_completedFieldSequence;
                 return frame;
             }
             else if constexpr (std::is_same_v<T, GsConfigureVulkanCommand>)
@@ -845,6 +905,19 @@ GsCommandResult GsCommandProcessor::process(
                     .limitReached = m_gs.drawCommandLimitReached(),
                     .submittedCommands =
                         m_gs.submittedDrawCommandCount(),
+                };
+            }
+            else if constexpr (std::is_same_v<T, GsFieldMarkerCommand>)
+            {
+                if (value.fieldSequence <= m_completedFieldSequence)
+                {
+                    throw std::logic_error(
+                        "GS field markers must advance monotonically");
+                }
+                m_gs.latchHostPresentationFrame(value.registers);
+                m_completedFieldSequence = value.fieldSequence;
+                return GsFieldMarkerResult{
+                    .fieldSequence = value.fieldSequence,
                 };
             }
             else
@@ -1212,6 +1285,10 @@ GsCommandSubmission ThreadedGsExecutor::submitAsync(
         m_nextTicket, "transport ticket");
     const uint64_t payloadBytes =
         gsCommandPayloadSize(payload);
+    const uint64_t fieldSequence =
+        std::holds_alternative<GsFieldMarkerCommand>(payload)
+            ? std::get<GsFieldMarkerCommand>(payload).fieldSequence
+            : 0u;
     if (payloadBytes > m_options.payloadCapacityBytes)
     {
         throw std::length_error(
@@ -1246,9 +1323,10 @@ GsCommandSubmission ThreadedGsExecutor::submitAsync(
         bool accepting = false;
         bool enqueued = false;
         {
-            // M3 deliberately keeps a conservative admission lock. Closing
-            // the executor takes the same lock, so no producer can publish a
-            // command after fatal/cancel/drain has begun.
+            // The correctness-first transport keeps a conservative admission
+            // lock. Closing the executor takes the same lock, so no producer
+            // can publish after fatal/cancel/drain has begun. M5 profiles and
+            // narrows this lock without weakening that lifecycle guarantee.
             std::lock_guard<std::mutex> stateLock(
                 m_stateMutex);
             accepting = m_accepting.load(
@@ -1308,6 +1386,17 @@ GsCommandSubmission ThreadedGsExecutor::submitAsync(
     m_lastGuestTick = guestTick;
     m_submittedTickets.store(
         ticket, std::memory_order_release);
+    m_submittedGeneration.store(
+        generation, std::memory_order_release);
+    m_submittedSequence.store(
+        sequence, std::memory_order_release);
+    if (fieldSequence != 0u)
+    {
+        m_fieldMarkersSubmitted.fetch_add(
+            1u, std::memory_order_relaxed);
+        m_lastSubmittedFieldSequence.store(
+            fieldSequence, std::memory_order_release);
+    }
     submitLock.unlock();
     m_workCv.notify_one();
 
@@ -1321,10 +1410,19 @@ GsCommandResult ThreadedGsExecutor::submit(
     uint64_t publicationToken,
     uint64_t debugVsyncTick)
 {
+    const auto waitAt = std::chrono::steady_clock::now();
     GsCommandSubmission submission = submitAsync(
         std::move(payload), guestTick,
         publicationToken, debugVsyncTick);
     GsCommandResult result = submission.wait();
+    m_barrierWaitCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_barrierWaitNanoseconds.fetch_add(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - waitAt)
+                .count()),
+        std::memory_order_relaxed);
     if (!result.completed())
     {
         throw std::logic_error(
@@ -1355,6 +1453,12 @@ uint64_t ThreadedGsExecutor::lastSubmittedTicket() const noexcept
 uint64_t ThreadedGsExecutor::lastCompletedTicket() const noexcept
 {
     return m_completedTickets.load(
+        std::memory_order_acquire);
+}
+
+uint64_t ThreadedGsExecutor::lastCompletedFieldSequence() const noexcept
+{
+    return m_lastCompletedFieldSequence.load(
         std::memory_order_acquire);
 }
 
@@ -1428,6 +1532,7 @@ void ThreadedGsExecutor::cancelQueued(
 
 void ThreadedGsExecutor::workerMain() noexcept
 {
+    ThreadNaming::SetCurrentThreadName("PS2GsOwner");
     {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_ownerThreadId = std::this_thread::get_id();
@@ -1533,15 +1638,51 @@ void ThreadedGsExecutor::workerMain() noexcept
             const bool barrier =
                 result.digest.type ==
                 GsCommandType::Barrier;
-            item->completion.set_value(std::move(result));
-            releasePayload(item->payloadBytes);
+            const uint64_t completedGeneration =
+                result.identity.generation;
+            const uint64_t completedSequence =
+                result.identity.sequence;
+            const auto *field =
+                std::get_if<GsFieldMarkerResult>(&result.payload);
+            const uint64_t completedFieldSequence =
+                field ? field->fieldSequence : 0u;
+            const bool resetsFieldIdentity =
+                result.digest.type == GsCommandType::Reset ||
+                result.digest.type ==
+                    GsCommandType::RestoreReplayState;
+            if (m_options.beforePublish)
+            {
+                m_options.beforePublish(result, item->ticket);
+            }
             m_completedTickets.store(
                 item->ticket, std::memory_order_release);
+            m_completedGeneration.store(
+                completedGeneration, std::memory_order_release);
+            m_completedSequence.store(
+                completedSequence, std::memory_order_release);
             if (barrier)
             {
                 m_barriersCompleted.fetch_add(
                     1u, std::memory_order_relaxed);
             }
+            if (completedFieldSequence != 0u)
+            {
+                m_fieldMarkersCompleted.fetch_add(
+                    1u, std::memory_order_relaxed);
+                m_lastCompletedFieldSequence.store(
+                    completedFieldSequence,
+                    std::memory_order_release);
+            }
+            else if (resetsFieldIdentity)
+            {
+                // The processor clears its latched presentation identity when
+                // a new generation begins. Publish the same transition so the
+                // UI cannot mistake an old frame for the reset generation.
+                m_lastCompletedFieldSequence.store(
+                    0u, std::memory_order_release);
+            }
+            item->completion.set_value(std::move(result));
+            releasePayload(item->payloadBytes);
         }
         catch (...)
         {
@@ -1656,6 +1797,18 @@ ThreadedGsExecutor::statistics() const
         .completedTickets =
             m_completedTickets.load(
                 std::memory_order_acquire),
+        .submittedGeneration =
+            m_submittedGeneration.load(
+                std::memory_order_acquire),
+        .submittedSequence =
+            m_submittedSequence.load(
+                std::memory_order_acquire),
+        .completedGeneration =
+            m_completedGeneration.load(
+                std::memory_order_acquire),
+        .completedSequence =
+            m_completedSequence.load(
+                std::memory_order_acquire),
         .producerBlockCount =
             m_producerBlockCount.load(
                 std::memory_order_acquire),
@@ -1670,6 +1823,24 @@ ThreadedGsExecutor::statistics() const
                 std::memory_order_acquire),
         .barriersCompleted =
             m_barriersCompleted.load(
+                std::memory_order_acquire),
+        .barrierWaitCount =
+            m_barrierWaitCount.load(
+                std::memory_order_acquire),
+        .barrierWaitNanoseconds =
+            m_barrierWaitNanoseconds.load(
+                std::memory_order_acquire),
+        .fieldMarkersSubmitted =
+            m_fieldMarkersSubmitted.load(
+                std::memory_order_acquire),
+        .fieldMarkersCompleted =
+            m_fieldMarkersCompleted.load(
+                std::memory_order_acquire),
+        .lastSubmittedFieldSequence =
+            m_lastSubmittedFieldSequence.load(
+                std::memory_order_acquire),
+        .lastCompletedFieldSequence =
+            m_lastCompletedFieldSequence.load(
                 std::memory_order_acquire),
         .accepting = m_accepting.load(
             std::memory_order_acquire),
