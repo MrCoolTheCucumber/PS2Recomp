@@ -128,11 +128,25 @@ namespace
         return true;
     }
 
+    bool parseGsExecutionMode(
+        const std::string &text,
+        GsExecutionMode &mode)
+    {
+        if (text == "inline")
+            mode = GsExecutionMode::Inline;
+        else if (text == "threaded-sync")
+            mode = GsExecutionMode::ThreadedSynchronous;
+        else
+            return false;
+        return true;
+    }
+
     void printUsage(const char *program)
     {
         std::cout
             << "Usage: " << program
             << " [--renderer software|hybrid|verify|gpu-strict]"
+               " [--gs-execution inline|threaded-sync]"
                " [ELF [CD_IMAGE]]\n";
     }
 
@@ -140,6 +154,7 @@ namespace
     {
         bool showHelp = false;
         GsRendererMode rendererMode = GsRendererMode::Software;
+        GsExecutionMode gsExecutionMode = GsExecutionMode::Inline;
         std::vector<std::filesystem::path> positionalPaths;
     };
 
@@ -167,6 +182,17 @@ namespace
                 {
                     throw std::invalid_argument(
                         "--renderer requires software, hybrid, verify, or gpu-strict");
+                }
+                continue;
+            }
+            if (!optionsEnded && argument == "--gs-execution")
+            {
+                if (++i >= argc || !argv[i] ||
+                    !parseGsExecutionMode(
+                        argv[i], options.gsExecutionMode))
+                {
+                    throw std::invalid_argument(
+                        "--gs-execution requires inline or threaded-sync");
                 }
                 continue;
             }
@@ -260,7 +286,11 @@ int main(int argc, char *argv[])
             windowTitle += elfName;
         }
 
-        PS2Runtime runtime;
+        PS2RuntimeConfiguration runtimeConfiguration =
+            defaultPs2RuntimeConfiguration();
+        runtimeConfiguration.gsExecutionMode =
+            options.gsExecutionMode;
+        PS2Runtime runtime(runtimeConfiguration);
         configureOptionalCdImage(runtime, options);
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
         // This hook is to prevent leak rlimgui deps to recompiler etc
@@ -308,6 +338,10 @@ int main(int argc, char *argv[])
         std::cout
             << "GS renderer: "
             << gsRendererModeName(rendererStatus.mode)
+            << std::endl;
+        std::cout
+            << "GS execution: "
+            << gsExecutionModeName(options.gsExecutionMode)
             << std::endl;
 
         if (!runtime.loadELF(filePathStr))

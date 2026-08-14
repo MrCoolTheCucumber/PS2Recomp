@@ -163,6 +163,8 @@ public:
     [[nodiscard]] GsReplayState captureReplayState() const;
     [[nodiscard]] bool restoreReplayState(
         const GsReplayState &state);
+    [[nodiscard]] bool copyVram(
+        std::vector<uint8_t> &outVram) const;
     void clearDebugHistory();
     bool isDebugHistoryPaused() const;
     void setDebugHistoryPaused(bool paused);

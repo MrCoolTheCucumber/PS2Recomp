@@ -240,6 +240,8 @@ const char *gsCommandTypeName(GsCommandType type) noexcept
         return "draw-status";
     case GsCommandType::Barrier:
         return "barrier";
+    case GsCommandType::CopyVram:
+        return "copy-vram";
     }
     return "unknown";
 }
@@ -273,6 +275,8 @@ GsCommandType gsCommandType(
                 return GsCommandType::ReadFifo;
             else if constexpr (std::is_same_v<T, GsCaptureReplayStateCommand>)
                 return GsCommandType::CaptureReplayState;
+            else if constexpr (std::is_same_v<T, GsCopyVramCommand>)
+                return GsCommandType::CopyVram;
             else if constexpr (std::is_same_v<T, GsRestoreReplayStateCommand>)
                 return GsCommandType::RestoreReplayState;
             else if constexpr (std::is_same_v<T, GsDebugSnapshotCommand>)
@@ -736,6 +740,12 @@ GsCommandResult GsCommandProcessor::process(
             }
             else if constexpr (std::is_same_v<T, GsCaptureReplayStateCommand>)
                 return GsReplayStateResult{m_gs.captureReplayState()};
+            else if constexpr (std::is_same_v<T, GsCopyVramCommand>)
+            {
+                GsVramSnapshotResult snapshot{};
+                snapshot.available = m_gs.copyVram(snapshot.bytes);
+                return snapshot;
+            }
             else if constexpr (std::is_same_v<T, GsRestoreReplayStateCommand>)
                 return GsBooleanResult{m_gs.restoreReplayState(value.state)};
             else if constexpr (std::is_same_v<T, GsDebugSnapshotCommand>)
@@ -942,4 +952,741 @@ GsCommandResult InlineGsExecutor::submit(
     m_nextSequence = sequence;
     m_lastGuestTick = guestTick;
     return result;
+}
+
+GsCommandSubmission::GsCommandSubmission(
+    uint64_t ticket,
+    GsWorkIdentity identity,
+    std::future<GsCommandResult> completion)
+    : m_ticket(ticket),
+      m_identity(identity),
+      m_completion(std::move(completion))
+{
+}
+
+bool GsCommandSubmission::valid() const noexcept
+{
+    return m_completion.valid();
+}
+
+bool GsCommandSubmission::ready() const
+{
+    if (!m_completion.valid())
+        return false;
+    return m_completion.wait_for(
+               std::chrono::seconds(0)) ==
+           std::future_status::ready;
+}
+
+GsCommandResult GsCommandSubmission::wait()
+{
+    if (!m_completion.valid())
+    {
+        throw std::logic_error(
+            "GS command submission has no completion");
+    }
+    return m_completion.get();
+}
+
+namespace
+{
+    std::exception_ptr makeGsExecutorCancellation()
+    {
+        return std::make_exception_ptr(
+            std::runtime_error(
+                "threaded GS executor cancelled queued work"));
+    }
+
+    GsCommandResult makeStaleQueuedGsResult(
+        GsCommand &command,
+        uint64_t completedSequence)
+    {
+        GsCommandResult result{};
+        result.identity = command.identity;
+        result.disposition =
+            GsCommandDisposition::StaleGeneration;
+        result.completedSequence = completedSequence;
+        result.digest = {
+            .sequence = command.identity.sequence,
+            .generation = command.identity.generation,
+            .guestTick = command.identity.guestTick,
+            .type = command.type,
+            .payloadSize = command.payloadSize,
+            .payloadHash = 0u,
+        };
+        if (auto *batch =
+                std::get_if<GsDrainBatchCommand>(
+                    &command.payload))
+        {
+            result.payload = GsDrainBatchResult{
+                .batch = std::move(batch->batch),
+            };
+        }
+        return result;
+    }
+
+    template <typename T>
+    void updateAtomicMaximum(
+        std::atomic<T> &destination,
+        T candidate) noexcept
+    {
+        T current = destination.load(
+            std::memory_order_relaxed);
+        while (current < candidate &&
+               !destination.compare_exchange_weak(
+                   current, candidate,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed))
+        {
+        }
+    }
+}
+
+ThreadedGsExecutor::ThreadedGsExecutor(
+    GsCommandProcessor &processor,
+    ThreadedGsExecutorOptions options)
+    : m_processor(processor),
+      m_options(std::move(options)),
+      m_queue(m_options.queueCapacity),
+      m_generation(processor.generation()),
+      m_nextSequence(processor.completedSequence()),
+      m_minimumAcceptedGeneration(processor.generation())
+{
+    if (m_options.payloadCapacityBytes == 0u)
+    {
+        throw std::invalid_argument(
+            "threaded GS payload capacity must be non-zero");
+    }
+}
+
+ThreadedGsExecutor::~ThreadedGsExecutor()
+{
+    shutdown(GsExecutorShutdownMode::Drain);
+}
+
+bool ThreadedGsExecutor::startsGeneration(
+    const GsCommandPayload &payload) noexcept
+{
+    return std::holds_alternative<GsResetCommand>(payload) ||
+           std::holds_alternative<GsRestoreReplayStateCommand>(payload);
+}
+
+void ThreadedGsExecutor::assertHotProducerThread(
+    const GsCommandPayload &payload)
+{
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    if (!isHotCommand(payload))
+        return;
+    const std::thread::id current =
+        std::this_thread::get_id();
+    if (!m_hotProducerThread.has_value())
+    {
+        m_hotProducerThread = current;
+        return;
+    }
+    if (*m_hotProducerThread != current)
+    {
+        throw std::logic_error(
+            "GS hot command submitted from multiple producer threads");
+    }
+#else
+    (void)payload;
+#endif
+}
+
+void ThreadedGsExecutor::ensureStarted()
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    if (m_started)
+        return;
+    if (!m_accepting.load(std::memory_order_acquire))
+    {
+        throw std::runtime_error(
+            "threaded GS executor is not accepting work");
+    }
+
+    try
+    {
+        m_worker = std::thread(
+            [this]()
+            {
+                workerMain();
+            });
+        m_started = true;
+    }
+    catch (...)
+    {
+        m_fatalFailure = std::current_exception();
+        m_accepting.store(false, std::memory_order_release);
+        throw;
+    }
+}
+
+void ThreadedGsExecutor::updateQueueHighWater(
+    size_t depth) noexcept
+{
+    updateAtomicMaximum(m_queueHighWater, depth);
+}
+
+void ThreadedGsExecutor::updatePayloadHighWater(
+    uint64_t bytes) noexcept
+{
+    updateAtomicMaximum(m_payloadHighWaterBytes, bytes);
+}
+
+bool ThreadedGsExecutor::tryEnqueue(WorkItem &item)
+{
+    if (m_queue.full())
+        return false;
+
+    const uint64_t currentPayload =
+        m_queuedPayloadBytes.load(std::memory_order_acquire);
+    if (item.payloadBytes >
+        m_options.payloadCapacityBytes -
+            std::min(
+                currentPayload,
+                m_options.payloadCapacityBytes))
+    {
+        return false;
+    }
+
+    const size_t reservedDepth = m_queue.size() + 1u;
+    const uint64_t reserved =
+        m_queuedPayloadBytes.fetch_add(
+            item.payloadBytes,
+            std::memory_order_acq_rel) +
+        item.payloadBytes;
+    if (!m_queue.tryEmplace(std::move(item)))
+    {
+        m_queuedPayloadBytes.fetch_sub(
+            item.payloadBytes,
+            std::memory_order_acq_rel);
+        return false;
+    }
+
+    updateQueueHighWater(reservedDepth);
+    updatePayloadHighWater(reserved);
+    return true;
+}
+
+[[noreturn]] void
+ThreadedGsExecutor::throwSubmissionUnavailable() const
+{
+    std::exception_ptr failure;
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        failure = m_fatalFailure;
+    }
+    if (failure)
+        std::rethrow_exception(failure);
+    throw std::runtime_error(
+        "threaded GS executor is not accepting work");
+}
+
+GsCommandSubmission ThreadedGsExecutor::submitAsync(
+    GsCommandPayload payload,
+    uint64_t guestTick,
+    uint64_t publicationToken,
+    uint64_t debugVsyncTick)
+{
+    std::unique_lock<std::mutex> submitLock(
+        m_submitMutex);
+    if (!m_accepting.load(std::memory_order_acquire))
+        throwSubmissionUnavailable();
+
+    assertHotProducerThread(payload);
+    ensureStarted();
+    guestTick = std::max(guestTick, m_lastGuestTick);
+
+    uint64_t generation = m_generation;
+    uint64_t sequenceBase = m_nextSequence;
+    if (startsGeneration(payload))
+    {
+        generation = checkedIncrement(
+            generation, "generation");
+        sequenceBase = 0u;
+    }
+    const uint64_t sequence = checkedIncrement(
+        sequenceBase, "sequence");
+    const uint64_t ticket = checkedIncrement(
+        m_nextTicket, "transport ticket");
+    const uint64_t payloadBytes =
+        gsCommandPayloadSize(payload);
+    if (payloadBytes > m_options.payloadCapacityBytes)
+    {
+        throw std::length_error(
+            "GS command exceeds the bounded payload capacity");
+    }
+
+    GsCommand command{
+        .identity = {
+            .sequence = sequence,
+            .generation = generation,
+            .guestTick = guestTick,
+            .publicationToken = publicationToken,
+        },
+        .type = gsCommandType(payload),
+        .payloadSize = payloadBytes,
+        .debugVsyncTick = debugVsyncTick,
+        .payload = std::move(payload),
+    };
+    const GsWorkIdentity identity = command.identity;
+    WorkItem item{
+        .ticket = ticket,
+        .payloadBytes = payloadBytes,
+        .command = std::move(command),
+    };
+    std::future<GsCommandResult> completion =
+        item.completion.get_future();
+
+    bool countedBlock = false;
+    std::chrono::steady_clock::time_point blockedAt{};
+    for (;;)
+    {
+        bool accepting = false;
+        bool enqueued = false;
+        {
+            // M3 deliberately keeps a conservative admission lock. Closing
+            // the executor takes the same lock, so no producer can publish a
+            // command after fatal/cancel/drain has begun.
+            std::lock_guard<std::mutex> stateLock(
+                m_stateMutex);
+            accepting = m_accepting.load(
+                std::memory_order_acquire);
+            if (accepting && !m_fatalFailure)
+                enqueued = tryEnqueue(item);
+        }
+        if (enqueued)
+            break;
+        if (!accepting)
+            throwSubmissionUnavailable();
+        if (!countedBlock)
+        {
+            countedBlock = true;
+            blockedAt = std::chrono::steady_clock::now();
+            m_producerBlockCount.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+
+        std::unique_lock<std::mutex> stateLock(
+            m_stateMutex);
+        m_spaceCv.wait(
+            stateLock,
+            [this, payloadBytes]()
+            {
+                if (!m_accepting.load(
+                        std::memory_order_acquire) ||
+                    m_fatalFailure)
+                {
+                    return true;
+                }
+                const uint64_t queued =
+                    m_queuedPayloadBytes.load(
+                        std::memory_order_acquire);
+                return !m_queue.full() &&
+                       queued <=
+                           m_options.payloadCapacityBytes &&
+                       payloadBytes <=
+                           m_options.payloadCapacityBytes - queued;
+            });
+    }
+    if (countedBlock)
+    {
+        const uint64_t nanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - blockedAt)
+                    .count());
+        m_producerBlockedNanoseconds.fetch_add(
+            nanoseconds, std::memory_order_relaxed);
+    }
+
+    m_generation = generation;
+    m_nextSequence = sequence;
+    m_nextTicket = ticket;
+    m_lastGuestTick = guestTick;
+    m_submittedTickets.store(
+        ticket, std::memory_order_release);
+    submitLock.unlock();
+    m_workCv.notify_one();
+
+    return GsCommandSubmission(
+        ticket, identity, std::move(completion));
+}
+
+GsCommandResult ThreadedGsExecutor::submit(
+    GsCommandPayload payload,
+    uint64_t guestTick,
+    uint64_t publicationToken,
+    uint64_t debugVsyncTick)
+{
+    GsCommandSubmission submission = submitAsync(
+        std::move(payload), guestTick,
+        publicationToken, debugVsyncTick);
+    GsCommandResult result = submission.wait();
+    if (!result.completed())
+    {
+        throw std::logic_error(
+            std::string("threaded GS command rejected: ") +
+            gsCommandTypeName(result.digest.type));
+    }
+    return result;
+}
+
+uint64_t ThreadedGsExecutor::generation() const
+{
+    std::lock_guard<std::mutex> lock(m_submitMutex);
+    return m_generation;
+}
+
+uint64_t ThreadedGsExecutor::lastSubmittedSequence() const
+{
+    std::lock_guard<std::mutex> lock(m_submitMutex);
+    return m_nextSequence;
+}
+
+uint64_t ThreadedGsExecutor::lastSubmittedTicket() const noexcept
+{
+    return m_submittedTickets.load(
+        std::memory_order_acquire);
+}
+
+uint64_t ThreadedGsExecutor::lastCompletedTicket() const noexcept
+{
+    return m_completedTickets.load(
+        std::memory_order_acquire);
+}
+
+void ThreadedGsExecutor::cancelPendingBeforeGeneration(
+    uint64_t generation)
+{
+    if (generation == 0u)
+    {
+        throw std::invalid_argument(
+            "GS cancellation generation must be non-zero");
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_submitMutex);
+        if (generation > m_generation)
+        {
+            throw std::invalid_argument(
+                "GS cancellation generation has not been submitted");
+        }
+    }
+
+    updateAtomicMaximum(
+        m_minimumAcceptedGeneration,
+        generation);
+    m_workCv.notify_one();
+}
+
+void ThreadedGsExecutor::releasePayload(
+    uint64_t bytes) noexcept
+{
+    const uint64_t prior =
+        m_queuedPayloadBytes.fetch_sub(
+            bytes, std::memory_order_acq_rel);
+    if (prior < bytes)
+        std::terminate();
+    m_spaceCv.notify_all();
+}
+
+void ThreadedGsExecutor::recordFatalFailure(
+    std::exception_ptr failure) noexcept
+{
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        if (!m_fatalFailure)
+            m_fatalFailure = std::move(failure);
+        m_accepting.store(false, std::memory_order_release);
+    }
+    m_cancelRequested.store(true, std::memory_order_release);
+    m_workCv.notify_all();
+    m_spaceCv.notify_all();
+}
+
+void ThreadedGsExecutor::cancelQueued(
+    const std::exception_ptr &reason) noexcept
+{
+    while (std::optional<WorkItem> item =
+               m_queue.tryPop())
+    {
+        try
+        {
+            item->completion.set_exception(reason);
+        }
+        catch (...)
+        {
+        }
+        releasePayload(item->payloadBytes);
+        m_completedTickets.store(
+            item->ticket, std::memory_order_release);
+    }
+    m_spaceCv.notify_all();
+}
+
+void ThreadedGsExecutor::workerMain() noexcept
+{
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_ownerThreadId = std::this_thread::get_id();
+    }
+
+    for (;;)
+    {
+        std::optional<WorkItem> item =
+            m_queue.tryPop();
+        if (!item)
+        {
+            const auto idleAt =
+                std::chrono::steady_clock::now();
+            std::unique_lock<std::mutex> lock(
+                m_stateMutex);
+            m_workCv.wait(
+                lock,
+                [this]()
+                {
+                    return !m_queue.empty() ||
+                           m_cancelRequested.load(
+                               std::memory_order_acquire) ||
+                           m_drainRequested.load(
+                               std::memory_order_acquire) ||
+                           m_fatalFailure;
+                });
+            const uint64_t idleNanoseconds =
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - idleAt)
+                        .count());
+            m_workerIdleNanoseconds.fetch_add(
+                idleNanoseconds, std::memory_order_relaxed);
+
+            if (m_cancelRequested.load(
+                    std::memory_order_acquire) ||
+                m_fatalFailure)
+            {
+                const std::exception_ptr reason =
+                    m_fatalFailure
+                        ? m_fatalFailure
+                        : makeGsExecutorCancellation();
+                lock.unlock();
+                cancelQueued(reason);
+                break;
+            }
+            if (m_drainRequested.load(
+                    std::memory_order_acquire) &&
+                m_queue.empty())
+            {
+                break;
+            }
+            continue;
+        }
+
+        m_spaceCv.notify_all();
+        const auto activeAt =
+            std::chrono::steady_clock::now();
+        try
+        {
+            if (m_options.beforeProcess)
+            {
+                m_options.beforeProcess(
+                    item->command, item->ticket);
+            }
+
+            if (m_cancelRequested.load(
+                    std::memory_order_acquire))
+            {
+                const std::exception_ptr reason =
+                    makeGsExecutorCancellation();
+                item->completion.set_exception(reason);
+                releasePayload(item->payloadBytes);
+                m_completedTickets.store(
+                    item->ticket, std::memory_order_release);
+                cancelQueued(reason);
+                break;
+            }
+
+            GsCommandResult result{};
+            if (item->command.identity.generation <
+                m_minimumAcceptedGeneration.load(
+                    std::memory_order_acquire))
+            {
+                result = makeStaleQueuedGsResult(
+                    item->command,
+                    m_processor.completedSequence());
+            }
+            else
+            {
+                result = m_processor.process(
+                    std::move(item->command));
+                if (!result.completed())
+                {
+                    throw std::logic_error(
+                        std::string(
+                            "GS owner rejected queued command: ") +
+                        gsCommandTypeName(result.digest.type));
+                }
+            }
+
+            const bool barrier =
+                result.digest.type ==
+                GsCommandType::Barrier;
+            item->completion.set_value(std::move(result));
+            releasePayload(item->payloadBytes);
+            m_completedTickets.store(
+                item->ticket, std::memory_order_release);
+            if (barrier)
+            {
+                m_barriersCompleted.fetch_add(
+                    1u, std::memory_order_relaxed);
+            }
+        }
+        catch (...)
+        {
+            const std::exception_ptr failure =
+                std::current_exception();
+            try
+            {
+                item->completion.set_exception(failure);
+            }
+            catch (...)
+            {
+            }
+            releasePayload(item->payloadBytes);
+            m_completedTickets.store(
+                item->ticket, std::memory_order_release);
+            recordFatalFailure(failure);
+            cancelQueued(failure);
+            const uint64_t activeNanoseconds =
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - activeAt)
+                        .count());
+            m_workerActiveNanoseconds.fetch_add(
+                activeNanoseconds, std::memory_order_relaxed);
+            break;
+        }
+
+        const uint64_t activeNanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - activeAt)
+                    .count());
+        m_workerActiveNanoseconds.fetch_add(
+            activeNanoseconds, std::memory_order_relaxed);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_workerExited = true;
+    }
+    m_spaceCv.notify_all();
+    m_workCv.notify_all();
+}
+
+void ThreadedGsExecutor::shutdown(
+    GsExecutorShutdownMode mode) noexcept
+{
+    std::lock_guard<std::mutex> shutdownLock(
+        m_shutdownMutex);
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_accepting.store(false, std::memory_order_release);
+        if (mode == GsExecutorShutdownMode::Cancel)
+        {
+            m_cancelRequested.store(
+                true, std::memory_order_release);
+        }
+        else
+        {
+            m_drainRequested.store(
+                true, std::memory_order_release);
+        }
+        if (!m_started)
+            m_workerExited = true;
+    }
+    m_workCv.notify_all();
+    m_spaceCv.notify_all();
+
+    if (m_worker.joinable())
+    {
+        if (m_worker.get_id() ==
+            std::this_thread::get_id())
+        {
+            std::terminate();
+        }
+        m_worker.join();
+    }
+}
+
+void ThreadedGsExecutor::rethrowFailure() const
+{
+    std::exception_ptr failure;
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        failure = m_fatalFailure;
+    }
+    if (failure)
+        std::rethrow_exception(failure);
+}
+
+ThreadedGsExecutorStatistics
+ThreadedGsExecutor::statistics() const
+{
+    ThreadedGsExecutorStatistics result{
+        .queueCapacity = m_queue.capacity(),
+        .payloadCapacityBytes =
+            m_options.payloadCapacityBytes,
+        .queueDepth = m_queue.size(),
+        .queueHighWater = m_queueHighWater.load(
+            std::memory_order_acquire),
+        .queuedPayloadBytes =
+            m_queuedPayloadBytes.load(
+                std::memory_order_acquire),
+        .payloadHighWaterBytes =
+            m_payloadHighWaterBytes.load(
+                std::memory_order_acquire),
+        .submittedTickets =
+            m_submittedTickets.load(
+                std::memory_order_acquire),
+        .completedTickets =
+            m_completedTickets.load(
+                std::memory_order_acquire),
+        .producerBlockCount =
+            m_producerBlockCount.load(
+                std::memory_order_acquire),
+        .producerBlockedNanoseconds =
+            m_producerBlockedNanoseconds.load(
+                std::memory_order_acquire),
+        .workerActiveNanoseconds =
+            m_workerActiveNanoseconds.load(
+                std::memory_order_acquire),
+        .workerIdleNanoseconds =
+            m_workerIdleNanoseconds.load(
+                std::memory_order_acquire),
+        .barriersCompleted =
+            m_barriersCompleted.load(
+                std::memory_order_acquire),
+        .accepting = m_accepting.load(
+            std::memory_order_acquire),
+    };
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        result.started = m_started;
+        result.running =
+            m_started && !m_workerExited;
+        result.failed =
+            static_cast<bool>(m_fatalFailure);
+    }
+    return result;
+}
+
+std::thread::id ThreadedGsExecutor::ownerThreadId() const
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    return m_ownerThreadId;
 }

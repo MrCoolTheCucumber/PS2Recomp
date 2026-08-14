@@ -80,6 +80,9 @@ namespace ps2_stubs
 struct PS2RuntimeConfiguration
 {
     GsExecutionMode gsExecutionMode = GsExecutionMode::Inline;
+    size_t gsCommandQueueCapacity = 64u;
+    uint64_t gsCommandPayloadCapacityBytes =
+        64u * 1024u * 1024u;
     EeExecutionBackendKind eeExecutionBackend =
         EeExecutionBackendKind::LegacyHostThread;
     bool useEeExecutionBackendEnvironment = true;
@@ -93,6 +96,9 @@ struct PS2RuntimeConfiguration
     bool eeTlbTranslationCacheDiagnostics = false;
     bool useEeTlbTranslationCacheDiagnosticsEnvironment = true;
 };
+
+[[nodiscard]] PS2RuntimeConfiguration
+defaultPs2RuntimeConfiguration() noexcept;
 
 enum PS2Exception
 {

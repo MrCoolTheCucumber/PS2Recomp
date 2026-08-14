@@ -4,9 +4,17 @@
 #include "runtime/ps2_build_config.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_spsc_queue.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <exception>
+#include <functional>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -61,6 +69,7 @@ enum class GsCommandType : uint8_t
     ClearDrawCommandLimit,
     DrawStatus,
     Barrier,
+    CopyVram,
 };
 
 [[nodiscard]] const char *gsCommandTypeName(
@@ -122,6 +131,10 @@ struct GsReadFifoCommand
 };
 
 struct GsCaptureReplayStateCommand
+{
+};
+
+struct GsCopyVramCommand
 {
 };
 
@@ -230,6 +243,7 @@ using GsCommandPayload = std::variant<
     GsClearFramebufferCommand,
     GsReadFifoCommand,
     GsCaptureReplayStateCommand,
+    GsCopyVramCommand,
     GsRestoreReplayStateCommand,
     GsDebugSnapshotCommand,
     GsProgressSnapshotCommand,
@@ -298,6 +312,12 @@ struct GsFifoReadResult
 struct GsReplayStateResult
 {
     GsReplayState state{};
+};
+
+struct GsVramSnapshotResult
+{
+    std::vector<uint8_t> bytes;
+    bool available = false;
 };
 
 struct GsDebugSnapshotResult
@@ -379,6 +399,7 @@ using GsCommandResultPayload = std::variant<
     GsBooleanResult,
     GsFifoReadResult,
     GsReplayStateResult,
+    GsVramSnapshotResult,
     GsDebugSnapshotResult,
     GsProgressSnapshotResult,
     GsDebugHistoryResult,
@@ -475,6 +496,7 @@ private:
 enum class GsExecutionMode : uint8_t
 {
     Inline,
+    ThreadedSynchronous,
 };
 
 [[nodiscard]] constexpr const char *gsExecutionModeName(
@@ -484,6 +506,8 @@ enum class GsExecutionMode : uint8_t
     {
     case GsExecutionMode::Inline:
         return "inline";
+    case GsExecutionMode::ThreadedSynchronous:
+        return "threaded-sync";
     }
     return "unknown";
 }
@@ -540,6 +564,182 @@ private:
 #if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
     std::optional<std::thread::id> m_hotProducerThread;
 #endif
+};
+
+enum class GsExecutorShutdownMode : uint8_t
+{
+    Drain,
+    Cancel,
+};
+
+struct ThreadedGsExecutorOptions
+{
+    size_t queueCapacity = 64u;
+    uint64_t payloadCapacityBytes = 64u * 1024u * 1024u;
+    // A deterministic owner-thread hook for focused delay/failure tests. The
+    // production runtime leaves it empty.
+    std::function<void(const GsCommand &, uint64_t)> beforeProcess;
+};
+
+struct ThreadedGsExecutorStatistics
+{
+    size_t queueCapacity = 0u;
+    uint64_t payloadCapacityBytes = 0u;
+    size_t queueDepth = 0u;
+    size_t queueHighWater = 0u;
+    uint64_t queuedPayloadBytes = 0u;
+    uint64_t payloadHighWaterBytes = 0u;
+    uint64_t submittedTickets = 0u;
+    uint64_t completedTickets = 0u;
+    uint64_t producerBlockCount = 0u;
+    uint64_t producerBlockedNanoseconds = 0u;
+    uint64_t workerActiveNanoseconds = 0u;
+    uint64_t workerIdleNanoseconds = 0u;
+    uint64_t barriersCompleted = 0u;
+    bool started = false;
+    bool running = false;
+    bool accepting = false;
+    bool failed = false;
+};
+
+class GsCommandSubmission
+{
+public:
+    GsCommandSubmission() = default;
+    GsCommandSubmission(GsCommandSubmission &&) noexcept = default;
+    GsCommandSubmission &operator=(GsCommandSubmission &&) noexcept = default;
+
+    GsCommandSubmission(const GsCommandSubmission &) = delete;
+    GsCommandSubmission &operator=(const GsCommandSubmission &) = delete;
+
+    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] bool ready() const;
+    [[nodiscard]] uint64_t ticket() const noexcept
+    {
+        return m_ticket;
+    }
+    [[nodiscard]] GsWorkIdentity identity() const noexcept
+    {
+        return m_identity;
+    }
+    [[nodiscard]] GsCommandResult wait();
+
+private:
+    friend class ThreadedGsExecutor;
+
+    GsCommandSubmission(
+        uint64_t ticket,
+        GsWorkIdentity identity,
+        std::future<GsCommandResult> completion);
+
+    uint64_t m_ticket = 0u;
+    GsWorkIdentity m_identity{};
+    std::future<GsCommandResult> m_completion;
+};
+
+class ThreadedGsExecutor final : public GsCommandExecutor
+{
+public:
+    explicit ThreadedGsExecutor(
+        GsCommandProcessor &processor,
+        ThreadedGsExecutorOptions options = {});
+    ~ThreadedGsExecutor() override;
+
+    ThreadedGsExecutor(const ThreadedGsExecutor &) = delete;
+    ThreadedGsExecutor &operator=(const ThreadedGsExecutor &) = delete;
+
+    [[nodiscard]] GsCommandResult submit(
+        GsCommandPayload payload,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u,
+        uint64_t debugVsyncTick = 0u) override;
+
+    // The runtime's Milestone 3 mode calls submit() and therefore waits after
+    // every command. This move-only completion is exposed so queue, lifecycle,
+    // and later asynchronous policies can exercise the exact same transport.
+    [[nodiscard]] GsCommandSubmission submitAsync(
+        GsCommandPayload payload,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u,
+        uint64_t debugVsyncTick = 0u);
+
+    [[nodiscard]] uint64_t generation() const override;
+    [[nodiscard]] uint64_t lastSubmittedSequence() const override;
+    [[nodiscard]] uint64_t lastSubmittedTicket() const noexcept;
+    [[nodiscard]] uint64_t lastCompletedTicket() const noexcept;
+
+    // Commands below this generation complete as typed stale results without
+    // reaching GS state. Lifecycle code must enqueue the corresponding reset
+    // or restore command at the new generation before relying on this floor.
+    void cancelPendingBeforeGeneration(uint64_t generation);
+
+    void shutdown(
+        GsExecutorShutdownMode mode =
+            GsExecutorShutdownMode::Drain) noexcept;
+    void rethrowFailure() const;
+    [[nodiscard]] ThreadedGsExecutorStatistics statistics() const;
+    [[nodiscard]] std::thread::id ownerThreadId() const;
+
+private:
+    struct WorkItem
+    {
+        uint64_t ticket = 0u;
+        uint64_t payloadBytes = 0u;
+        GsCommand command{};
+        std::promise<GsCommandResult> completion;
+    };
+
+    [[nodiscard]] static bool startsGeneration(
+        const GsCommandPayload &payload) noexcept;
+    void assertHotProducerThread(
+        const GsCommandPayload &payload);
+    void ensureStarted();
+    [[nodiscard]] bool tryEnqueue(WorkItem &item);
+    [[noreturn]] void throwSubmissionUnavailable() const;
+    void workerMain() noexcept;
+    void cancelQueued(const std::exception_ptr &reason) noexcept;
+    void recordFatalFailure(std::exception_ptr failure) noexcept;
+    void releasePayload(uint64_t bytes) noexcept;
+    void updateQueueHighWater(size_t depth) noexcept;
+    void updatePayloadHighWater(uint64_t bytes) noexcept;
+
+    GsCommandProcessor &m_processor;
+    ThreadedGsExecutorOptions m_options;
+    BoundedSpscQueue<WorkItem> m_queue;
+
+    mutable std::mutex m_submitMutex;
+    uint64_t m_generation = 1u;
+    uint64_t m_nextSequence = 0u;
+    uint64_t m_nextTicket = 0u;
+    uint64_t m_lastGuestTick = 0u;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    std::optional<std::thread::id> m_hotProducerThread;
+#endif
+
+    mutable std::mutex m_stateMutex;
+    std::condition_variable m_workCv;
+    std::condition_variable m_spaceCv;
+    std::thread m_worker;
+    std::thread::id m_ownerThreadId{};
+    std::exception_ptr m_fatalFailure;
+    bool m_started = false;
+    bool m_workerExited = false;
+
+    mutable std::mutex m_shutdownMutex;
+    std::atomic<bool> m_accepting{true};
+    std::atomic<bool> m_drainRequested{false};
+    std::atomic<bool> m_cancelRequested{false};
+    std::atomic<uint64_t> m_minimumAcceptedGeneration{1u};
+    std::atomic<uint64_t> m_queuedPayloadBytes{0u};
+    std::atomic<size_t> m_queueHighWater{0u};
+    std::atomic<uint64_t> m_payloadHighWaterBytes{0u};
+    std::atomic<uint64_t> m_submittedTickets{0u};
+    std::atomic<uint64_t> m_completedTickets{0u};
+    std::atomic<uint64_t> m_producerBlockCount{0u};
+    std::atomic<uint64_t> m_producerBlockedNanoseconds{0u};
+    std::atomic<uint64_t> m_workerActiveNanoseconds{0u};
+    std::atomic<uint64_t> m_workerIdleNanoseconds{0u};
+    std::atomic<uint64_t> m_barriersCompleted{0u};
 };
 
 #endif

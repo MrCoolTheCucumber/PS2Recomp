@@ -890,6 +890,19 @@ GsReplayState GS::captureReplayState() const
     return captureReplayStateUnlocked();
 }
 
+bool GS::copyVram(std::vector<uint8_t> &outVram) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (!m_vram || m_vramSize == 0u)
+    {
+        outVram.clear();
+        return false;
+    }
+    flushForObservation(GsFlushReason::DebuggerObservation);
+    outVram.assign(m_vram, m_vram + m_vramSize);
+    return true;
+}
+
 bool GS::restoreReplayState(const GsReplayState &state)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);

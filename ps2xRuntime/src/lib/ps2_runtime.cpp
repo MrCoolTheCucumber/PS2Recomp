@@ -103,7 +103,7 @@ static uint64_t debugFnv1a64(const uint8_t *data, size_t size) noexcept
                    section(".text.unlikely.ee_observation")))
 #endif
 
-static PS2RuntimeConfiguration
+PS2RuntimeConfiguration
 defaultPs2RuntimeConfiguration() noexcept
 {
     PS2RuntimeConfiguration configuration{};
@@ -1369,6 +1369,18 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     case GsExecutionMode::Inline:
         m_gsExecutor = std::make_unique<InlineGsExecutor>(
             m_gsCommandProcessor);
+        break;
+    case GsExecutionMode::ThreadedSynchronous:
+        m_gsExecutor =
+            std::make_unique<ThreadedGsExecutor>(
+                m_gsCommandProcessor,
+                ThreadedGsExecutorOptions{
+                    .queueCapacity =
+                        configuration.gsCommandQueueCapacity,
+                    .payloadCapacityBytes =
+                        configuration.
+                            gsCommandPayloadCapacityBytes,
+                });
         break;
     default:
         throw std::invalid_argument(
@@ -12016,15 +12028,11 @@ bool PS2Runtime::debugCopyGsVram(std::vector<uint8_t> &output)
     const auto capture =
         [this, &output, &copied]()
         {
-            if (!m_boundGSVram)
-            {
-                return;
-            }
-            output.assign(
-                m_boundGSVram,
-                m_boundGSVram +
-                    PS2_GS_VRAM_SIZE);
-            copied = true;
+            GsVramSnapshotResult snapshot =
+                takeGsCommandResult<GsVramSnapshotResult>(
+                    submitGsCommand(GsCopyVramCommand{}));
+            copied = snapshot.available;
+            output = std::move(snapshot.bytes);
         };
     if (invokeEeExecutorTaskAtBoundary(capture))
     {

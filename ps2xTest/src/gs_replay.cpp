@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -67,6 +68,7 @@ namespace
                "[--state-in FILE] "
                "[--packet-sizes FILE] [--hash-trace FILE] "
                "[--renderer software|hybrid|verify|gpu-strict] "
+               "[--gs-execution inline|threaded-sync] "
                "[--verify-dump-dir DIRECTORY] "
                "[--vulkan-max-resident-batch COUNT] "
                "[--vulkan-min-hybrid-pixels COUNT] "
@@ -117,6 +119,19 @@ namespace
             mode = GsRendererMode::Verify;
         else if (text == "gpu-strict")
             mode = GsRendererMode::GpuStrict;
+        else
+            return false;
+        return true;
+    }
+
+    bool parseGsExecutionMode(
+        const std::string &text,
+        GsExecutionMode &mode)
+    {
+        if (text == "inline")
+            mode = GsExecutionMode::Inline;
+        else if (text == "threaded-sync")
+            mode = GsExecutionMode::ThreadedSynchronous;
         else
             return false;
         return true;
@@ -886,6 +901,7 @@ int main(int argc, char **argv)
     uint64_t commandLimit = 0u;
     uint64_t packetLimit = 0u;
     GsRendererMode rendererMode = GsRendererMode::Software;
+    GsExecutionMode executionMode = GsExecutionMode::Inline;
     std::vector<std::pair<uint8_t, uint64_t>> fileRegisters;
     std::vector<std::pair<uint8_t, uint64_t>> overrideRegisters;
     std::vector<std::string> packetPaths;
@@ -945,6 +961,7 @@ int main(int argc, char **argv)
             argument == "--packet-sizes" ||
             argument == "--hash-trace" ||
             argument == "--renderer" ||
+            argument == "--gs-execution" ||
             argument == "--stop-after-command" ||
             argument == "--stop-after-packet" ||
             argument == "--compare-vram" ||
@@ -1270,6 +1287,18 @@ int main(int argc, char **argv)
                     return 2;
                 }
             }
+            else if (argument == "--gs-execution")
+            {
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+                if (!parseGsExecutionMode(
+                        argv[index], executionMode))
+                {
+                    std::cerr << "invalid GS execution mode: "
+                              << argv[index] << '\n';
+                    return 2;
+                }
+            }
             else if (argument == "--stop-after-command")
             {
                 replayOptionUsed = true;
@@ -1538,13 +1567,24 @@ int main(int argc, char **argv)
     gs.init(memory.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
             &memory.gs());
     GsCommandProcessor gsProcessor(gs, true);
-    InlineGsExecutor gsExecutor(gsProcessor);
+    std::unique_ptr<GsCommandExecutor> gsExecutor;
+    switch (executionMode)
+    {
+    case GsExecutionMode::Inline:
+        gsExecutor = std::make_unique<InlineGsExecutor>(
+            gsProcessor);
+        break;
+    case GsExecutionMode::ThreadedSynchronous:
+        gsExecutor = std::make_unique<ThreadedGsExecutor>(
+            gsProcessor);
+        break;
+    }
     uint64_t commandDigest = 14695981039346656037ull;
     uint64_t gsCommands = 0u;
     auto submitGs = [&](GsCommandPayload payload)
     {
         GsCommandResult result =
-            gsExecutor.submit(std::move(payload));
+            gsExecutor->submit(std::move(payload));
         appendU64ToFnv(
             commandDigest,
             gsCommandDigestHash(result.digest));
@@ -1716,7 +1756,7 @@ int main(int argc, char **argv)
     if (batchStream)
     {
         (void)submitGs(GsBeginRenderBatchCommand{});
-        renderBatchScope.executor = &gsExecutor;
+        renderBatchScope.executor = gsExecutor.get();
     }
     if (commandLimitSet &&
         takeGsCommandResult<GsDrawStatusResult>(
@@ -1875,6 +1915,8 @@ int main(int argc, char **argv)
 
     std::cout << "{\"schema_version\":1,\"renderer\":\""
               << gsRendererModeName(rendererStatus.mode)
+              << "\",\"gs_execution\":\""
+              << gsExecutionModeName(executionMode)
               << "\",\"packets\":" << packetIndex
               << ",\"bytes\":" << totalBytes
               << ",\"commands\":" << drawStatus.submittedCommands
