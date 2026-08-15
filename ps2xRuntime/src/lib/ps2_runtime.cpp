@@ -362,6 +362,21 @@ namespace
         return hash;
     }
 
+    uint64_t debugVu1TimingPacketDigest(
+        const uint8_t *data, size_t size) noexcept
+    {
+        constexpr uint64_t kOffsetBasis =
+            14695981039346656037ull;
+        constexpr uint64_t kPrime = 1099511628211ull;
+        uint64_t hash = kOffsetBasis;
+        for (size_t index = 0u; index < size; ++index)
+        {
+            hash ^= data[index];
+            hash *= kPrime;
+        }
+        return hash;
+    }
+
     template <typename T>
     void updateAtomicMaximum(
         std::atomic<T> &destination,
@@ -5527,8 +5542,23 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setVu1BusyCallback(
         [this]()
         {
-            return m_publishedVu1Active.load(
+            const bool busy =
+                m_publishedVu1Active.load(
                 std::memory_order_acquire);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+            if (m_debugVu1TimingTraceEnabled.load(
+                    std::memory_order_relaxed))
+            {
+                DebugVu1TimingEntry entry =
+                    debugVu1TimingEntry(
+                        DebugVu1TimingEventKind::
+                            VifBusyObservation,
+                        m_boundEeContext);
+                entry.observedValue = busy;
+                debugRecordVu1Timing(std::move(entry));
+            }
+#endif
+            return busy;
         });
     m_memory.setVu1MemoryObservationCallback(
         [this]()
@@ -5581,8 +5611,21 @@ void PS2Runtime::setVU1BusyFlag(
 bool PS2Runtime::readCop2Condition(
     const R5900Context *ctx) const noexcept
 {
-    return ctx != nullptr &&
-           (ctx->vu0_vpu_stat & kVu1BusyMask) != 0u;
+    const bool busy = ctx != nullptr &&
+        (ctx->vu0_vpu_stat & kVu1BusyMask) != 0u;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    if (m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed))
+    {
+        DebugVu1TimingEntry entry = debugVu1TimingEntry(
+            DebugVu1TimingEventKind::
+                Cop2ConditionObservation,
+            ctx);
+        entry.observedValue = busy;
+        debugRecordVu1Timing(std::move(entry));
+    }
+#endif
+    return busy;
 }
 
 void PS2Runtime::startVU0FromVif(
@@ -6602,6 +6645,21 @@ PS2Runtime::beginVu1SynchronousCommandBarrier()
     {
         if (m_pendingVu1CoarseInvocation)
         {
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+            if (m_debugVu1TimingTraceEnabled.load(
+                    std::memory_order_relaxed))
+            {
+                DebugVu1TimingEntry entry =
+                    debugVu1TimingEntry(
+                        DebugVu1TimingEventKind::ForcedBarrier,
+                        m_boundEeContext);
+                entry.observedValue = true;
+                entry.ownerReady =
+                    m_pendingVu1CoarseInvocation->
+                        submission.ready();
+                debugRecordVu1Timing(std::move(entry));
+            }
+#endif
             completeVu1CoarseInvocation(
                 currentEeTick(), false);
             barrier.coarseInvocationCompleted = true;
@@ -6717,7 +6775,7 @@ void PS2Runtime::finishVu1SynchronousCommandBarrier(
     }
     if (barrier.coarseInvocationCompleted)
     {
-        (void)m_memory.resumeVIF1AfterVu();
+        (void)resumeVif1AfterVuWithTimingTrace();
         if (!m_publishedVu1Active.load(
                 std::memory_order_acquire) &&
             !m_memory.vif1DmaSnapshot().active)
@@ -7884,6 +7942,23 @@ void PS2Runtime::completeVu1CoarseInvocation(
     m_vu1ExecutionTiming.totalAdvancedCycles += actual;
     m_vu1ExecutionTiming.lastAdvancedTick = publicationTick;
     setVU1BusyFlag(nullptr, false);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    if (m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed))
+    {
+        DebugVu1TimingEntry entry = debugVu1TimingEntry(
+            DebugVu1TimingEventKind::InvocationComplete,
+            m_boundEeContext);
+        entry.executedCycles = actual;
+        entry.architecturalStateHash =
+            invocation->architecturalStateHash;
+        entry.exitReason = invocation->run.reason;
+        entry.hasExitReason = true;
+        entry.schedulerEvent = schedulerEvent;
+        entry.ownerReady = ready;
+        debugRecordVu1Timing(std::move(entry));
+    }
+#endif
     m_vu1CoarseInvocationsCompleted.fetch_add(
         1u, std::memory_order_relaxed);
     m_vu1CoarseInvocationsPublished.fetch_add(
@@ -8589,6 +8664,10 @@ void PS2Runtime::publishVu1SliceEffects(
     {
         if (packet.bytes.empty())
             continue;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+        debugRecordVu1Path1Packet(
+            packet, slice.run.executedCycles);
+#endif
         m_memory.submitGifPacket(
             GifPathId::Path1,
             packet.bytes.data(),
@@ -8613,20 +8692,30 @@ void PS2Runtime::startVU1FromVif(
         ++m_vu1ExecutionTiming.generation;
     m_vu1ExecutionTiming.lastAdvancedTick = startTick;
     m_vu1ExecutionTiming.totalAdvancedCycles = 0u;
+    const Vu1InvocationKind invocationKind = flushBeforeStart
+        ? Vu1InvocationKind::Mscalf
+        : Vu1InvocationKind::Mscal;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    debugBeginVu1TimingInvocation(
+        invocationKind, startPC, top, itop, startTick);
+#endif
     if (m_vu1ExecutionMode ==
         Vu1ExecutionMode::ThreadedCoarse)
     {
         submitVu1CoarseInvocation(
             Vu1InvocationCommand{
-                .kind = flushBeforeStart
-                    ? Vu1InvocationKind::Mscalf
-                    : Vu1InvocationKind::Mscal,
+                .kind = invocationKind,
                 .startPc = startPC,
                 .top = top,
                 .itop = itop,
             },
             startTick);
         setVU1BusyFlag(nullptr, true);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+        debugPublishVu1TimingInvocationStart(
+            m_pendingVu1CoarseInvocation->deadline,
+            m_pendingVu1CoarseInvocation->estimatedCycles);
+#endif
         return;
     }
     if (flushBeforeStart)
@@ -8650,6 +8739,10 @@ void PS2Runtime::startVU1FromVif(
             ps2x::timing::vuCyclesToEeTicks(
                 kVu1StartupEventCycles));
     scheduleVU1Event(deadline);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    debugPublishVu1TimingInvocationStart(
+        deadline, kVu1StartupEventCycles);
+#endif
     if (m_vu1ExecutionMode ==
         Vu1ExecutionMode::ThreadedAsync)
     {
@@ -8682,6 +8775,13 @@ void PS2Runtime::resumeVU1FromVif(
         ++m_vu1ExecutionTiming.generation;
     m_vu1ExecutionTiming.lastAdvancedTick = startTick;
     m_vu1ExecutionTiming.totalAdvancedCycles = 0u;
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    debugBeginVu1TimingInvocation(
+        Vu1InvocationKind::Mscnt,
+        m_publishedVu1ProgramCounter.load(
+            std::memory_order_acquire),
+        top, itop, startTick);
+#endif
     if (m_vu1ExecutionMode ==
         Vu1ExecutionMode::ThreadedCoarse)
     {
@@ -8693,6 +8793,11 @@ void PS2Runtime::resumeVU1FromVif(
             },
             startTick);
         setVU1BusyFlag(nullptr, true);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+        debugPublishVu1TimingInvocationStart(
+            m_pendingVu1CoarseInvocation->deadline,
+            m_pendingVu1CoarseInvocation->estimatedCycles);
+#endif
         return;
     }
     (void)submitVu1Command(
@@ -8706,6 +8811,10 @@ void PS2Runtime::resumeVU1FromVif(
             ps2x::timing::vuCyclesToEeTicks(
                 kVu1StartupEventCycles));
     scheduleVU1Event(deadline);
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    debugPublishVu1TimingInvocationStart(
+        deadline, kVu1StartupEventCycles);
+#endif
     if (m_vu1ExecutionMode ==
         Vu1ExecutionMode::ThreadedAsync)
     {
@@ -8750,7 +8859,7 @@ void PS2Runtime::serviceVU1AtEvent(
         setVU1BusyFlag(ctx, true);
         completeVu1CoarseInvocation(
             service.serviceTick, true);
-        (void)m_memory.resumeVIF1AfterVu();
+        (void)resumeVif1AfterVuWithTimingTrace();
         if (!m_publishedVu1Active.load(
                 std::memory_order_acquire) &&
             !m_memory.vif1DmaSnapshot().active)
@@ -8772,7 +8881,24 @@ void PS2Runtime::serviceVU1AtEvent(
                 "active VU1 speculation has no published busy state");
         }
         setVU1BusyFlag(ctx, false);
-        (void)m_memory.resumeVIF1AfterVu();
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+        if (m_debugVu1TimingTraceEnabled.load(
+                std::memory_order_relaxed))
+        {
+            DebugVu1TimingEntry entry =
+                debugVu1TimingEntry(
+                    DebugVu1TimingEventKind::
+                        InvocationComplete,
+                    ctx);
+            entry.executedCycles = static_cast<uint32_t>(
+                std::min<uint64_t>(
+                    m_vu1ExecutionTiming.totalAdvancedCycles,
+                    UINT32_MAX));
+            entry.schedulerEvent = true;
+            debugRecordVu1Timing(std::move(entry));
+        }
+#endif
+        (void)resumeVif1AfterVuWithTimingTrace();
         if (!m_publishedVu1Active.load(
                 std::memory_order_acquire) &&
             !m_memory.vif1DmaSnapshot().active)
@@ -8948,7 +9074,26 @@ void PS2Runtime::serviceVU1AtEvent(
     m_vu1ExecutionTiming.lastAdvancedTick =
         service.serviceTick;
     setVU1BusyFlag(ctx, false);
-    (void)m_memory.resumeVIF1AfterVu();
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    if (m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed))
+    {
+        DebugVu1TimingEntry entry = debugVu1TimingEntry(
+            DebugVu1TimingEventKind::InvocationComplete,
+            ctx);
+        entry.executedCycles = static_cast<uint32_t>(
+            std::min<uint64_t>(
+                m_vu1ExecutionTiming.totalAdvancedCycles,
+                UINT32_MAX));
+        entry.architecturalStateHash =
+            slice->architecturalStateHash;
+        entry.exitReason = advance.reason;
+        entry.hasExitReason = true;
+        entry.schedulerEvent = true;
+        debugRecordVu1Timing(std::move(entry));
+    }
+#endif
+    (void)resumeVif1AfterVuWithTimingTrace();
     if (!m_publishedVu1Active.load(
             std::memory_order_acquire) &&
         !m_memory.vif1DmaSnapshot().active)
@@ -15812,6 +15957,264 @@ PS2Runtime::debugEeEventTraceSnapshot(bool stop)
                 m_debugEeEventTrace.size()]);
     }
     return snapshot;
+}
+
+void PS2Runtime::debugStartVu1TimingTrace(
+    size_t maximumEntries,
+    bool stopOnFull)
+{
+    maximumEntries =
+        std::clamp<size_t>(maximumEntries, 1u, 16384u);
+    std::lock_guard<std::mutex> lock(
+        m_debugVu1TimingTraceMutex);
+    m_debugVu1TimingTraceEnabled.store(
+        false, std::memory_order_release);
+    m_debugVu1TimingTrace.clear();
+    m_debugVu1TimingTrace.reserve(maximumEntries);
+    m_debugVu1TimingTraceCapacity = maximumEntries;
+    m_debugVu1TimingTraceNext = 0u;
+    m_debugVu1TimingTraceTotal = 0u;
+    m_debugVu1TimingTraceStopOnFull = stopOnFull;
+    m_debugVu1TimingTraceEnabled.store(
+        true, std::memory_order_release);
+}
+
+void PS2Runtime::debugBeginVu1TimingInvocation(
+    Vu1InvocationKind kind,
+    uint32_t startPc,
+    uint32_t top,
+    uint32_t itop,
+    ps2x::timing::EeTick startTick) noexcept
+{
+    if (!m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed))
+    {
+        return;
+    }
+    ++m_debugVu1TimingNextInvocation;
+    if (m_debugVu1TimingNextInvocation == 0u)
+        ++m_debugVu1TimingNextInvocation;
+    m_debugVu1TimingInvocation = {
+        .sequence = m_debugVu1TimingNextInvocation,
+        .kind = kind,
+        .startPc = startPc,
+        .top = top,
+        .itop = itop,
+        .startTick = startTick,
+    };
+    m_debugVu1TimingNextPath1Packet = 0u;
+}
+
+void PS2Runtime::debugPublishVu1TimingInvocationStart(
+    ps2x::timing::EeTick deadline,
+    uint32_t estimatedCycles)
+{
+    if (!m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed))
+    {
+        return;
+    }
+    m_debugVu1TimingInvocation.deadline = deadline;
+    m_debugVu1TimingInvocation.estimatedCycles =
+        estimatedCycles;
+    m_debugVu1TimingInvocation.eventGeneration =
+        m_vu1ExecutionTiming.eventToken.generation;
+    DebugVu1TimingEntry entry = debugVu1TimingEntry(
+        DebugVu1TimingEventKind::InvocationStart,
+        m_boundEeContext);
+    debugRecordVu1Timing(std::move(entry));
+}
+
+PS2Runtime::DebugVu1TimingEntry
+PS2Runtime::debugVu1TimingEntry(
+    DebugVu1TimingEventKind kind,
+    const R5900Context *ctx) const noexcept
+{
+    const R5900Context *const context = ctx
+        ? ctx
+        : (m_boundEeContext
+               ? m_boundEeContext
+               : &m_cpuContext);
+    const bool waiting = m_memory.vif1WaitingForVu();
+    DebugVu1TimingEntry entry{};
+    entry.kind = kind;
+    entry.mode = m_vu1ExecutionMode;
+    entry.invocationKind =
+        m_debugVu1TimingInvocation.kind;
+    entry.invocation =
+        m_debugVu1TimingInvocation.sequence;
+    entry.eeTick = currentEeTick().raw();
+    entry.eeInstructions = m_debugEeInstructions.load(
+        std::memory_order_relaxed);
+    entry.vsyncField = m_debugVSyncFields.load(
+        std::memory_order_relaxed);
+    entry.executionGeneration =
+        m_vu1ExecutionTiming.generation;
+    entry.eventGeneration =
+        m_debugVu1TimingInvocation.eventGeneration;
+    entry.startTick =
+        m_debugVu1TimingInvocation.startTick.raw();
+    entry.deadlineTick =
+        m_debugVu1TimingInvocation.deadline.raw();
+    entry.totalAdvancedCycles =
+        m_vu1ExecutionTiming.totalAdvancedCycles;
+    entry.dmaStarts = m_memory.dmaStartCount();
+    entry.gsCsr = m_memory.gs().csr.load(
+        std::memory_order_relaxed);
+    entry.estimatedCycles =
+        m_debugVu1TimingInvocation.estimatedCycles;
+    entry.startPc = m_debugVu1TimingInvocation.startPc;
+    entry.top = m_debugVu1TimingInvocation.top;
+    entry.itop = m_debugVu1TimingInvocation.itop;
+    entry.eePc = context ? context->pc : 0u;
+    entry.vuPc = m_publishedVu1ProgramCounter.load(
+        std::memory_order_acquire);
+    entry.vifStat = m_memory.vif1_regs.stat;
+    entry.vifCode = m_memory.vif1_regs.code;
+    entry.intcStatus = m_memory.intcStatus();
+    entry.intcMask = m_memory.intcMask();
+    entry.vif1Dma = debugEeEventDeviceState(
+        ps2x::timing::EeEventSource::DmacVif1);
+    entry.active = m_publishedVu1Active.load(
+        std::memory_order_acquire);
+    entry.busy = context != nullptr &&
+        (context->vu0_vpu_stat & kVu1BusyMask) != 0u;
+    entry.vifWaitingBefore = waiting;
+    entry.vifWaitingAfter = waiting;
+    return entry;
+}
+
+void PS2Runtime::debugRecordVu1Timing(
+    DebugVu1TimingEntry entry) const
+{
+    if (!m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed))
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        m_debugVu1TimingTraceMutex);
+    if (!m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed) ||
+        m_debugVu1TimingTraceCapacity == 0u)
+    {
+        return;
+    }
+
+    entry.sequence = ++m_debugVu1TimingTraceTotal;
+    if (m_debugVu1TimingTrace.size() <
+        m_debugVu1TimingTraceCapacity)
+    {
+        m_debugVu1TimingTrace.push_back(std::move(entry));
+        if (m_debugVu1TimingTraceStopOnFull &&
+            m_debugVu1TimingTrace.size() ==
+                m_debugVu1TimingTraceCapacity)
+        {
+            m_debugVu1TimingTraceEnabled.store(
+                false, std::memory_order_release);
+        }
+        return;
+    }
+
+    m_debugVu1TimingTrace[m_debugVu1TimingTraceNext] =
+        std::move(entry);
+    m_debugVu1TimingTraceNext =
+        (m_debugVu1TimingTraceNext + 1u) %
+        m_debugVu1TimingTraceCapacity;
+}
+
+PS2Runtime::DebugVu1TimingTrace
+PS2Runtime::debugVu1TimingTraceSnapshot(bool stop)
+{
+    if (stop)
+    {
+        m_debugVu1TimingTraceEnabled.store(
+            false, std::memory_order_release);
+    }
+
+    std::lock_guard<std::mutex> lock(
+        m_debugVu1TimingTraceMutex);
+    DebugVu1TimingTrace snapshot{};
+    snapshot.enabled = m_debugVu1TimingTraceEnabled.load(
+        std::memory_order_acquire);
+    snapshot.stopOnFull =
+        m_debugVu1TimingTraceStopOnFull;
+    snapshot.totalEntries =
+        m_debugVu1TimingTraceTotal;
+    snapshot.droppedEntries =
+        m_debugVu1TimingTraceTotal >
+                m_debugVu1TimingTrace.size()
+            ? m_debugVu1TimingTraceTotal -
+                  m_debugVu1TimingTrace.size()
+            : 0u;
+    snapshot.entries.reserve(
+        m_debugVu1TimingTrace.size());
+    if (m_debugVu1TimingTrace.size() <
+            m_debugVu1TimingTraceCapacity ||
+        m_debugVu1TimingTrace.empty())
+    {
+        snapshot.entries = m_debugVu1TimingTrace;
+        return snapshot;
+    }
+
+    for (size_t offset = 0u;
+         offset < m_debugVu1TimingTrace.size(); ++offset)
+    {
+        snapshot.entries.push_back(
+            m_debugVu1TimingTrace[
+                (m_debugVu1TimingTraceNext + offset) %
+                m_debugVu1TimingTrace.size()]);
+    }
+    return snapshot;
+}
+
+void PS2Runtime::debugRecordVu1Path1Packet(
+    const Vu1Path1Packet &packet,
+    uint32_t defaultCycleOffset)
+{
+    if (!m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed) ||
+        packet.bytes.empty())
+    {
+        return;
+    }
+
+    DebugVu1TimingEntry entry = debugVu1TimingEntry(
+        DebugVu1TimingEventKind::Path1Packet,
+        m_boundEeContext);
+    entry.path1Packet =
+        ++m_debugVu1TimingNextPath1Packet;
+    entry.path1CycleOffset =
+        m_vu1ExecutionTiming.totalAdvancedCycles +
+        packet.cycleOffset.value_or(defaultCycleOffset);
+    entry.path1Bytes = static_cast<uint32_t>(
+        std::min<size_t>(
+            packet.bytes.size(),
+            static_cast<size_t>(UINT32_MAX)));
+    entry.path1Digest = debugVu1TimingPacketDigest(
+        packet.bytes.data(), packet.bytes.size());
+    debugRecordVu1Timing(std::move(entry));
+}
+
+bool PS2Runtime::resumeVif1AfterVuWithTimingTrace()
+{
+    const bool waitingBefore =
+        m_memory.vif1WaitingForVu();
+    const bool resumed = m_memory.resumeVIF1AfterVu();
+    if (m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed))
+    {
+        DebugVu1TimingEntry entry = debugVu1TimingEntry(
+            DebugVu1TimingEventKind::VifResume,
+            m_boundEeContext);
+        entry.observedValue = resumed;
+        entry.vifWaitingBefore = waitingBefore;
+        entry.vifWaitingAfter =
+            m_memory.vif1WaitingForVu();
+        debugRecordVu1Timing(std::move(entry));
+    }
+    return resumed;
 }
 
 void PS2Runtime::debugStartVu0InstructionTrace(

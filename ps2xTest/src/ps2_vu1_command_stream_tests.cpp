@@ -4,6 +4,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1_command_stream.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -4276,6 +4278,269 @@ void register_ps2_vu1_command_stream_tests()
                          second.estimatorOutputDigest != 0u &&
                          second.estimatorResultDigest != 0u,
                      "all estimator input output and result streams should be digested");
+        });
+
+        tc.Run("runtime VU1 timing trace retains bounded observation order", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "timing-trace runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "timing-trace runtime subsystems should bind");
+            R5900Context &context = runtime.cpu();
+
+            runtime.debugStartVu1TimingTrace(3u);
+            for (uint32_t observation = 0u;
+                 observation < 5u; ++observation)
+            {
+                context.pc = 0x1000u + observation * 4u;
+                if ((observation & 1u) != 0u)
+                    context.vu0_vpu_stat |= 1u << 8u;
+                else
+                    context.vu0_vpu_stat &= ~(1u << 8u);
+                (void)runtime.readCop2Condition(&context);
+            }
+            const PS2Runtime::DebugVu1TimingTrace rolling =
+                runtime.debugVu1TimingTraceSnapshot(true);
+            t.Equals(rolling.totalEntries, 5ull,
+                     "every armed BC2 observation should enter the trace");
+            t.Equals(rolling.droppedEntries, 2ull,
+                     "a rolling trace should report overwritten entries");
+            t.Equals(rolling.entries.size(), size_t{3u},
+                     "the rolling trace must retain its configured bound");
+            if (rolling.entries.size() == 3u)
+            {
+                t.Equals(rolling.entries[0].sequence, 3ull,
+                         "the rolling window should remain chronological");
+                t.Equals(rolling.entries[2].sequence, 5ull,
+                         "the rolling window should retain the newest entry");
+                t.IsTrue(
+                    rolling.entries[0].kind ==
+                        PS2Runtime::DebugVu1TimingEventKind::
+                            Cop2ConditionObservation,
+                    "the bounded window should retain typed observations");
+                t.Equals(rolling.entries[2].eePc, uint32_t{0x1010u},
+                         "each observation should retain its guest PC");
+            }
+
+            runtime.debugStartVu1TimingTrace(2u, true);
+            for (uint32_t observation = 0u;
+                 observation < 3u; ++observation)
+            {
+                context.pc = 0x2000u + observation * 4u;
+                (void)runtime.readCop2Condition(&context);
+            }
+            const PS2Runtime::DebugVu1TimingTrace firstWindow =
+                runtime.debugVu1TimingTraceSnapshot(false);
+            t.IsFalse(firstWindow.enabled,
+                      "stop-on-full should disarm collection at the bound");
+            t.Equals(firstWindow.totalEntries, 2ull,
+                     "a disarmed first window must not count later probes");
+            t.Equals(firstWindow.droppedEntries, 0ull,
+                     "stop-on-full should preserve rather than overwrite");
+        });
+
+        tc.Run("runtime VU1 timing trace pairs exact and coarse invocation semantics", [](TestCase &t)
+        {
+            struct Run
+            {
+                PS2Runtime::DebugVu1TimingTrace trace;
+                std::vector<std::vector<uint8_t>> packets;
+            };
+            const auto run =
+                [&](Vu1ExecutionMode mode) -> Run
+                {
+                    PS2RuntimeConfiguration configuration =
+                        defaultPs2RuntimeConfiguration();
+                    configuration.vu1ExecutionMode = mode;
+                    configuration.vu1CommandQueueCapacity = 4u;
+                    configuration.vu1CommandPayloadCapacityBytes =
+                        1024u * 1024u;
+                    configuration.captureVu1ArchitecturalStateHashes =
+                        true;
+                    PS2Runtime runtime(configuration);
+                    if (!runtime.memory().initialize() ||
+                        !runtime.syncCoreSubsystems())
+                    {
+                        t.Fail("paired timing-trace runtime should initialize");
+                        return {};
+                    }
+
+                    Run result{};
+                    runtime.gifArbiter().setProcessPacketFn(
+                        [&](const uint8_t *data, uint32_t sizeBytes)
+                        {
+                            result.packets.emplace_back(
+                                data, data + sizeBytes);
+                        });
+                    std::array<uint8_t, 16u> packet{};
+                    const uint64_t tag =
+                        (1ull << 15u) | (2ull << 58u);
+                    const uint64_t marker =
+                        0x8877665544332211ull;
+                    std::memcpy(
+                        packet.data(), &tag, sizeof(tag));
+                    std::memcpy(
+                        packet.data() + 8u,
+                        &marker, sizeof(marker));
+                    writeRuntimeVu1Qword(runtime, 0u, packet);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 0u,
+                        makeVuLowerSpecial(0x6cu, 0u),
+                        kVuUpperEnd);
+                    writeRuntimeVu1InstructionPair(
+                        runtime, 8u, 0u, kVuUpperNop);
+
+                    runtime.debugStartVu1TimingTrace(64u, true);
+                    const std::array<uint32_t, 2u> commands{
+                        makeVifCommand(0x14u, 0u, 0u),
+                        makeVifCommand(0x11u, 0u, 0u),
+                    };
+                    runtime.memory().processVIF1Data(
+                        reinterpret_cast<const uint8_t *>(
+                            commands.data()),
+                        static_cast<uint32_t>(sizeof(commands)));
+                    t.IsTrue(runtime.memory().vif1WaitingForVu(),
+                             "FLUSH should expose the Busy wait in both modes");
+
+                    if (mode == Vu1ExecutionMode::ThreadedCoarse)
+                    {
+                        t.IsTrue(
+                            waitUntil(
+                                [&runtime]()
+                                {
+                                    const auto statistics =
+                                        runtime.vu1CoarseStatistics();
+                                    return statistics.owner.commandTypes[
+                                        vu1CommandTypeIndex(
+                                            Vu1CommandType::Invocation)]
+                                        .completed == 1u;
+                                }),
+                            "coarse owner work should finish privately");
+                        const auto privateTrace =
+                            runtime.debugVu1TimingTraceSnapshot(false);
+                        const bool published = std::any_of(
+                            privateTrace.entries.begin(),
+                            privateTrace.entries.end(),
+                            [](const auto &entry)
+                            {
+                                return entry.kind ==
+                                    PS2Runtime::
+                                        DebugVu1TimingEventKind::
+                                            InvocationComplete;
+                            });
+                        t.IsFalse(published,
+                                  "passive trace status must not publish private work");
+                        t.IsTrue(
+                            runtime.debugVu1TimingSnapshot().active,
+                            "passive trace status must retain published Busy");
+                        t.IsTrue(result.packets.empty(),
+                                 "passive trace status must not publish PATH1");
+                    }
+
+                    R5900Context &context = runtime.cpu();
+                    const PS2Runtime::DebugVu1Timing timing =
+                        runtime.debugVu1TimingSnapshot();
+                    context.advanceEeCycleTicks(
+                        timing.eventDeadlineTick -
+                        timing.currentTick);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    t.IsFalse(runtime.memory().vif1WaitingForVu(),
+                              "completion should resume the waiting FLUSH");
+                    result.trace =
+                        runtime.debugVu1TimingTraceSnapshot(true);
+                    return result;
+                };
+
+            const Run exact = run(Vu1ExecutionMode::ThreadedAsync);
+            const Run coarse = run(Vu1ExecutionMode::ThreadedCoarse);
+            t.Equals(exact.packets.size(), size_t{1u},
+                     "exact publication should emit one packet");
+            t.Equals(coarse.packets, exact.packets,
+                     "coarse publication should retain exact packet bytes");
+
+            const auto semanticEntries =
+                [](const PS2Runtime::DebugVu1TimingTrace &trace)
+                {
+                    std::vector<PS2Runtime::DebugVu1TimingEntry>
+                        entries;
+                    std::copy_if(
+                        trace.entries.begin(), trace.entries.end(),
+                        std::back_inserter(entries),
+                        [](const auto &entry)
+                        {
+                            return entry.kind !=
+                                PS2Runtime::
+                                    DebugVu1TimingEventKind::
+                                        ForcedBarrier;
+                        });
+                    return entries;
+                };
+            const auto exactEntries = semanticEntries(exact.trace);
+            const auto coarseEntries = semanticEntries(coarse.trace);
+            t.Equals(coarseEntries.size(), exactEntries.size(),
+                     "paired modes should expose the same semantic trace shape");
+            const size_t common = std::min(
+                exactEntries.size(), coarseEntries.size());
+            for (size_t index = 0u; index < common; ++index)
+            {
+                t.IsTrue(
+                    exactEntries[index].kind ==
+                        coarseEntries[index].kind,
+                    "paired trace events should retain semantic order");
+                t.Equals(
+                    exactEntries[index].observedValue,
+                    coarseEntries[index].observedValue,
+                    "paired Busy and resume observations should agree");
+                t.Equals(
+                    exactEntries[index].path1Digest,
+                    coarseEntries[index].path1Digest,
+                    "paired PATH1 content digests should agree");
+                t.Equals(
+                    exactEntries[index].path1CycleOffset,
+                    coarseEntries[index].path1CycleOffset,
+                    "paired PATH1 cycle offsets should agree");
+            }
+
+            const auto completion =
+                [](const auto &entries)
+                    -> const PS2Runtime::DebugVu1TimingEntry *
+                {
+                    const auto found = std::find_if(
+                        entries.begin(), entries.end(),
+                        [](const auto &entry)
+                        {
+                            return entry.kind ==
+                                PS2Runtime::
+                                    DebugVu1TimingEventKind::
+                                        InvocationComplete;
+                        });
+                    return found == entries.end()
+                        ? nullptr
+                        : &*found;
+                };
+            const auto *const exactCompletion =
+                completion(exactEntries);
+            const auto *const coarseCompletion =
+                completion(coarseEntries);
+            t.IsTrue(exactCompletion != nullptr &&
+                         coarseCompletion != nullptr,
+                     "both modes should report invocation completion");
+            if (exactCompletion && coarseCompletion)
+            {
+                t.Equals(coarseCompletion->executedCycles,
+                         exactCompletion->executedCycles,
+                         "paired completion should retain actual VU cycles");
+                t.Equals(
+                    coarseCompletion->architecturalStateHash,
+                    exactCompletion->architecturalStateHash,
+                    "paired completion should retain final VU state");
+                t.IsFalse(exactCompletion->busy,
+                          "exact completion should publish Busy clear");
+                t.IsFalse(coarseCompletion->busy,
+                          "coarse completion should publish Busy clear");
+            }
         });
 
         tc.Run("runtime coarse estimator isolates bounded invocation identities", [](TestCase &t)

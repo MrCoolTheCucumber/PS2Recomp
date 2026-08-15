@@ -211,6 +211,21 @@ enum class Vu1InvocationKind : uint8_t
     Mscnt,
 };
 
+[[nodiscard]] constexpr const char *vu1InvocationKindName(
+    Vu1InvocationKind kind) noexcept
+{
+    switch (kind)
+    {
+    case Vu1InvocationKind::Mscal:
+        return "mscal";
+    case Vu1InvocationKind::Mscalf:
+        return "mscalf";
+    case Vu1InvocationKind::Mscnt:
+        return "mscnt";
+    }
+    return "unknown";
+}
+
 // Coarse scheduling keeps one complete VU activation private to the owner.
 // The cycle and PATH1 limits make the relaxed work item explicitly bounded;
 // exact slice commands remain available as the architectural oracle.

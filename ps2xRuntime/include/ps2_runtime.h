@@ -1321,6 +1321,97 @@ public:
         std::vector<DebugEeEventEntry> entries;
     };
 
+    enum class DebugVu1TimingEventKind : uint8_t
+    {
+        InvocationStart = 0u,
+        InvocationComplete,
+        Cop2ConditionObservation,
+        VifBusyObservation,
+        ForcedBarrier,
+        Path1Packet,
+        VifResume,
+    };
+
+    [[nodiscard]] static constexpr const char *
+    debugVu1TimingEventKindName(
+        DebugVu1TimingEventKind kind) noexcept
+    {
+        switch (kind)
+        {
+        case DebugVu1TimingEventKind::InvocationStart:
+            return "invocation_start";
+        case DebugVu1TimingEventKind::InvocationComplete:
+            return "invocation_complete";
+        case DebugVu1TimingEventKind::Cop2ConditionObservation:
+            return "cop2_condition_observation";
+        case DebugVu1TimingEventKind::VifBusyObservation:
+            return "vif_busy_observation";
+        case DebugVu1TimingEventKind::ForcedBarrier:
+            return "forced_barrier";
+        case DebugVu1TimingEventKind::Path1Packet:
+            return "path1_packet";
+        case DebugVu1TimingEventKind::VifResume:
+            return "vif_resume";
+        }
+        return "unknown";
+    }
+
+    struct DebugVu1TimingEntry
+    {
+        uint64_t sequence = 0u;
+        DebugVu1TimingEventKind kind =
+            DebugVu1TimingEventKind::InvocationStart;
+        Vu1ExecutionMode mode = Vu1ExecutionMode::Inline;
+        Vu1InvocationKind invocationKind =
+            Vu1InvocationKind::Mscal;
+        uint64_t invocation = 0u;
+        uint64_t eeTick = 0u;
+        uint64_t eeInstructions = 0u;
+        uint64_t vsyncField = 0u;
+        uint64_t executionGeneration = 0u;
+        uint64_t eventGeneration = 0u;
+        uint64_t startTick = 0u;
+        uint64_t deadlineTick = 0u;
+        uint64_t totalAdvancedCycles = 0u;
+        uint64_t dmaStarts = 0u;
+        uint64_t gsCsr = 0u;
+        uint64_t path1Packet = 0u;
+        uint64_t path1CycleOffset = 0u;
+        uint64_t path1Digest = 0u;
+        uint64_t architecturalStateHash = 0u;
+        uint32_t estimatedCycles = 0u;
+        uint32_t executedCycles = 0u;
+        uint32_t startPc = 0u;
+        uint32_t top = 0u;
+        uint32_t itop = 0u;
+        uint32_t eePc = 0u;
+        uint32_t vuPc = 0u;
+        uint32_t path1Bytes = 0u;
+        uint32_t vifStat = 0u;
+        uint32_t vifCode = 0u;
+        uint32_t intcStatus = 0u;
+        uint32_t intcMask = 0u;
+        VuExitReason exitReason = VuExitReason::Inactive;
+        DebugEeEventDeviceState vif1Dma{};
+        bool hasExitReason = false;
+        bool active = false;
+        bool busy = false;
+        bool observedValue = false;
+        bool schedulerEvent = false;
+        bool ownerReady = false;
+        bool vifWaitingBefore = false;
+        bool vifWaitingAfter = false;
+    };
+
+    struct DebugVu1TimingTrace
+    {
+        bool enabled = false;
+        bool stopOnFull = false;
+        uint64_t totalEntries = 0u;
+        uint64_t droppedEntries = 0u;
+        std::vector<DebugVu1TimingEntry> entries;
+    };
+
     struct DebugBranchEntry
     {
         uint64_t sequence = 0u;
@@ -2059,6 +2150,10 @@ public:
         std::optional<uint32_t> triggerEePc = std::nullopt,
         bool stopOnFull = false);
     DebugEeEventTrace debugEeEventTraceSnapshot(bool stop);
+    void debugStartVu1TimingTrace(
+        size_t maximumEntries,
+        bool stopOnFull = false);
+    DebugVu1TimingTrace debugVu1TimingTraceSnapshot(bool stop);
 
     std::vector<uint32_t> debugBreakpoints() const;
     void debugAddBreakpoint(uint32_t address);
@@ -2441,6 +2536,25 @@ private:
     void debugRecordVu0Sync(DebugVu0SyncEntry entry);
     void debugRecordVu0Instruction(DebugVu0InstructionEntry entry);
     void debugRecordEeEvent(DebugEeEventEntry entry);
+    void debugBeginVu1TimingInvocation(
+        Vu1InvocationKind kind,
+        uint32_t startPc,
+        uint32_t top,
+        uint32_t itop,
+        ps2x::timing::EeTick startTick) noexcept;
+    void debugPublishVu1TimingInvocationStart(
+        ps2x::timing::EeTick deadline,
+        uint32_t estimatedCycles);
+    void debugRecordVu1Timing(
+        DebugVu1TimingEntry entry) const;
+    [[nodiscard]] DebugVu1TimingEntry
+    debugVu1TimingEntry(
+        DebugVu1TimingEventKind kind,
+        const R5900Context *ctx = nullptr) const noexcept;
+    void debugRecordVu1Path1Packet(
+        const Vu1Path1Packet &packet,
+        uint32_t defaultCycleOffset);
+    bool resumeVif1AfterVuWithTimingTrace();
     [[nodiscard]] DebugEeEventDeviceState
     debugEeEventDeviceState(
         ps2x::timing::EeEventSource source) const noexcept;
@@ -3297,6 +3411,30 @@ private:
     size_t m_debugEeEventTraceNext = 0u;
     uint64_t m_debugEeEventTraceTotal = 0u;
     bool m_debugEeEventTraceStopOnFull = false;
+    struct DebugVu1TimingInvocation
+    {
+        uint64_t sequence = 0u;
+        Vu1InvocationKind kind = Vu1InvocationKind::Mscal;
+        uint32_t startPc = 0u;
+        uint32_t top = 0u;
+        uint32_t itop = 0u;
+        uint32_t estimatedCycles = 0u;
+        ps2x::timing::EeTick startTick{};
+        ps2x::timing::EeTick deadline{};
+        uint64_t eventGeneration = 0u;
+    };
+    DebugVu1TimingInvocation m_debugVu1TimingInvocation{};
+    uint64_t m_debugVu1TimingNextInvocation = 0u;
+    uint64_t m_debugVu1TimingNextPath1Packet = 0u;
+    mutable std::atomic<bool>
+        m_debugVu1TimingTraceEnabled{false};
+    mutable std::mutex m_debugVu1TimingTraceMutex;
+    mutable std::vector<DebugVu1TimingEntry>
+        m_debugVu1TimingTrace;
+    mutable size_t m_debugVu1TimingTraceCapacity = 0u;
+    mutable size_t m_debugVu1TimingTraceNext = 0u;
+    mutable uint64_t m_debugVu1TimingTraceTotal = 0u;
+    mutable bool m_debugVu1TimingTraceStopOnFull = false;
     mutable std::mutex m_debugControlMutex;
     mutable std::condition_variable m_debugControlCv;
     uint64_t m_debugStopSequence = 0u;

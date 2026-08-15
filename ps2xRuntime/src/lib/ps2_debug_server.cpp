@@ -2298,7 +2298,7 @@ struct PS2DebugServer::Impl
                  "breakpoint:ee", "watchpoint:ee", "capture",
                  "trace.vif1-dma",
                  "trace.vu0-sync", "trace.vu0-instruction",
-                 "trace.ee-events",
+                 "trace.ee-events", "trace.vu1-timing",
                  "diagnostics.status", "watchdog.status",
                  "input.pad.status", "input.pad.override",
                  "vu.backend.set", "vu.block-profile"})
@@ -3765,6 +3765,177 @@ struct PS2DebugServer::Impl
             static_cast<size_t>(maximumEntries),
             triggerEePc, stopOnFull);
         return eeEventTraceValue(false, allocator);
+    }
+
+    Value vu1TimingTraceValue(
+        bool stop, Allocator &allocator)
+    {
+        const PS2Runtime::DebugVu1TimingTrace trace =
+            runtime.debugVu1TimingTraceSnapshot(stop);
+        Value result(rapidjson::kObjectType);
+        result.AddMember("enabled", trace.enabled, allocator);
+        result.AddMember(
+            "stop_on_full", trace.stopOnFull, allocator);
+        result.AddMember(
+            "total_entries", trace.totalEntries, allocator);
+        result.AddMember(
+            "dropped_entries", trace.droppedEntries, allocator);
+        Value entries(rapidjson::kArrayType);
+        for (const PS2Runtime::DebugVu1TimingEntry &source :
+             trace.entries)
+        {
+            Value entry(rapidjson::kObjectType);
+            entry.AddMember(
+                "sequence", source.sequence, allocator);
+            addString(
+                entry, "event",
+                PS2Runtime::debugVu1TimingEventKindName(
+                    source.kind),
+                allocator);
+            addString(
+                entry, "mode",
+                vu1ExecutionModeName(source.mode), allocator);
+            addString(
+                entry, "invocation_kind",
+                vu1InvocationKindName(source.invocationKind),
+                allocator);
+            entry.AddMember(
+                "invocation", source.invocation, allocator);
+            entry.AddMember("ee_tick", source.eeTick, allocator);
+            entry.AddMember(
+                "ee_instructions",
+                source.eeInstructions, allocator);
+            entry.AddMember(
+                "vsync_field", source.vsyncField, allocator);
+            entry.AddMember(
+                "execution_generation",
+                source.executionGeneration, allocator);
+            entry.AddMember(
+                "event_generation",
+                source.eventGeneration, allocator);
+            entry.AddMember(
+                "start_tick", source.startTick, allocator);
+            entry.AddMember(
+                "deadline_tick", source.deadlineTick, allocator);
+            entry.AddMember(
+                "total_advanced_cycles",
+                source.totalAdvancedCycles, allocator);
+            entry.AddMember(
+                "estimated_cycles",
+                source.estimatedCycles, allocator);
+            entry.AddMember(
+                "executed_cycles",
+                source.executedCycles, allocator);
+            entry.AddMember(
+                "dma_starts", source.dmaStarts, allocator);
+            addString(
+                entry, "gs_csr",
+                hostAddressString(source.gsCsr), allocator);
+            addString(
+                entry, "start_pc",
+                addressString(source.startPc), allocator);
+            entry.AddMember("top", source.top, allocator);
+            entry.AddMember("itop", source.itop, allocator);
+            addString(
+                entry, "ee_pc",
+                addressString(source.eePc), allocator);
+            addString(
+                entry, "vu_pc",
+                addressString(source.vuPc), allocator);
+            entry.AddMember(
+                "path1_packet", source.path1Packet, allocator);
+            entry.AddMember(
+                "path1_cycle_offset",
+                source.path1CycleOffset, allocator);
+            entry.AddMember(
+                "path1_bytes", source.path1Bytes, allocator);
+            addString(
+                entry, "path1_digest_fnv1a64",
+                hostAddressString(source.path1Digest), allocator);
+            addString(
+                entry, "architectural_state_hash_fnv1a64",
+                hostAddressString(
+                    source.architecturalStateHash),
+                allocator);
+            entry.AddMember(
+                "vif_stat", source.vifStat, allocator);
+            entry.AddMember(
+                "vif_code", source.vifCode, allocator);
+            entry.AddMember(
+                "intc_status", source.intcStatus, allocator);
+            entry.AddMember(
+                "intc_mask", source.intcMask, allocator);
+            entry.AddMember(
+                "vif1_dma",
+                eeEventDeviceStateValue(
+                    source.vif1Dma, allocator),
+                allocator);
+            if (source.hasExitReason)
+            {
+                addString(
+                    entry, "exit_reason",
+                    vuExitReasonName(source.exitReason),
+                    allocator);
+            }
+            else
+            {
+                entry.AddMember(
+                    "exit_reason",
+                    Value(rapidjson::kNullType), allocator);
+            }
+            entry.AddMember("active", source.active, allocator);
+            entry.AddMember("busy", source.busy, allocator);
+            entry.AddMember(
+                "observed_value",
+                source.observedValue, allocator);
+            entry.AddMember(
+                "scheduler_event",
+                source.schedulerEvent, allocator);
+            entry.AddMember(
+                "owner_ready", source.ownerReady, allocator);
+            entry.AddMember(
+                "vif_waiting_before",
+                source.vifWaitingBefore, allocator);
+            entry.AddMember(
+                "vif_waiting_after",
+                source.vifWaitingAfter, allocator);
+            entries.PushBack(entry, allocator);
+        }
+        result.AddMember("entries", entries, allocator);
+        return result;
+    }
+
+    Value vu1TimingTraceStart(
+        const Value *params, Allocator &allocator)
+    {
+        const uint64_t maximumEntries =
+            requiredUnsigned(params, "maximum_entries");
+        if (maximumEntries == 0u || maximumEntries > 16384u)
+        {
+            throw RequestError(
+                -32602,
+                "maximum_entries must be between 1 and 16384");
+        }
+
+        bool stopOnFull = false;
+        if (params)
+        {
+            const auto stop =
+                params->FindMember("stop_on_full");
+            if (stop != params->MemberEnd())
+            {
+                if (!stop->value.IsBool())
+                {
+                    throw RequestError(
+                        -32602,
+                        "stop_on_full must be a boolean");
+                }
+                stopOnFull = stop->value.GetBool();
+            }
+        }
+        runtime.debugStartVu1TimingTrace(
+            static_cast<size_t>(maximumEntries), stopOnFull);
+        return vu1TimingTraceValue(false, allocator);
     }
 
     Value memory(const Value *params, bool hashOnly, Allocator &allocator)
@@ -5345,6 +5516,18 @@ struct PS2DebugServer::Impl
         if (method == "trace.ee-events.stop")
         {
             return eeEventTraceValue(true, allocator);
+        }
+        if (method == "trace.vu1-timing.start")
+        {
+            return vu1TimingTraceStart(params, allocator);
+        }
+        if (method == "trace.vu1-timing.status")
+        {
+            return vu1TimingTraceValue(false, allocator);
+        }
+        if (method == "trace.vu1-timing.stop")
+        {
+            return vu1TimingTraceValue(true, allocator);
         }
         if (method == "memory.read")
         {
