@@ -2598,7 +2598,24 @@ private:
     debugEeEventDeviceState(
         ps2x::timing::EeEventSource source) const noexcept;
 #if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
-    void debugArmVu0Traces(const R5900Context *ctx);
+    PS2X_EE_OBSERVATION_POLICY_INLINE
+    void debugArmVu0Traces(const R5900Context *ctx)
+    {
+        // PC-triggered traces are unusual, while this hook runs at every
+        // generated EE block boundary.  Keep the large snapshot-capable
+        // implementation out of that dormant path.  This is deliberately a
+        // one-way latch: clearing it would require coordinating independent
+        // debug-server trace reconfiguration and is unnecessary for
+        // correctness.
+        if (!m_debugEePcTraceTriggerEverConfigured.load(
+                std::memory_order_acquire)) [[likely]]
+        {
+            return;
+        }
+        debugArmVu0TracesSlow(ctx);
+    }
+    PS2X_EE_RUNTIME_NOINLINE
+    void debugArmVu0TracesSlow(const R5900Context *ctx);
     void beginVu0Invocation();
 #else
     void debugArmVu0Traces(const R5900Context *ctx)
@@ -3451,6 +3468,8 @@ private:
     mutable std::mutex m_debugFaultMutex;
     DebugFaultInfo m_debugFault{};
     std::atomic<uint64_t> m_debugFaultSequence{0u};
+    std::atomic<bool>
+        m_debugEePcTraceTriggerEverConfigured{false};
     std::atomic<bool> m_debugVu0SyncTraceEnabled{false};
     std::atomic<bool> m_debugVu0SyncTraceTriggered{false};
     std::atomic<bool> m_debugVu0SyncTraceHasTrigger{false};

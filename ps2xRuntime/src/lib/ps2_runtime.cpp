@@ -11758,7 +11758,7 @@ void PS2Runtime::SignalBusError(R5900Context *ctx,
 }
 
 #if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
-void PS2Runtime::debugArmVu0Traces(const R5900Context *ctx)
+void PS2Runtime::debugArmVu0TracesSlow(const R5900Context *ctx)
 {
     if (!ctx)
     {
@@ -16290,6 +16290,11 @@ void PS2Runtime::debugStartVu0SyncTrace(
     m_debugVu0SyncTraceTriggered.store(
         !triggerEePc.has_value() && !triggerInvocation.has_value(),
         std::memory_order_release);
+    if (triggerEePc.has_value())
+    {
+        m_debugEePcTraceTriggerEverConfigured.store(
+            true, std::memory_order_release);
+    }
     m_debugVu0SyncTraceEnabled.store(true, std::memory_order_release);
     m_vu0.setInstructionObserverEnabled(true);
 }
@@ -16407,6 +16412,11 @@ void PS2Runtime::debugStartEeEventTrace(
         triggerEePc.has_value(), std::memory_order_relaxed);
     m_debugEeEventTraceTriggered.store(
         !triggerEePc.has_value(), std::memory_order_release);
+    if (triggerEePc.has_value())
+    {
+        m_debugEePcTraceTriggerEverConfigured.store(
+            true, std::memory_order_release);
+    }
     m_debugEeEventTraceEnabled.store(
         true, std::memory_order_release);
 }
@@ -16825,6 +16835,11 @@ void PS2Runtime::debugStartVu0InstructionTrace(
     m_debugVu0InstructionTraceTriggered.store(
         !triggerEePc.has_value() && !triggerInvocation.has_value(),
         std::memory_order_release);
+    if (triggerEePc.has_value())
+    {
+        m_debugEePcTraceTriggerEverConfigured.store(
+            true, std::memory_order_release);
+    }
     m_debugVu0InstructionTraceEnabled.store(
         true, std::memory_order_release);
     m_vu0.setInstructionObserverEnabled(true);
