@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #ifndef PS2X_HAS_GS_VULKAN
@@ -1454,6 +1455,23 @@ public:
                 triangles),
             std::span<const GsVulkanT8Palette>(palettes), error);
     }
+    // Generic executors may preserve the two synchronous operations. The
+    // production owner overrides this seam so an exact CPU-newer page upload
+    // and its immediately following resident batch share one ordered Vulkan
+    // command buffer and fence.
+    [[nodiscard]] virtual bool
+    uploadVramPagesAndExecutePreparedResidentT8GouraudDepthCt32Triangles(
+        std::span<const uint8_t> source,
+        const GsVramPageMask &pages,
+        std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
+        std::vector<GsVulkanT8Palette> palettes,
+        std::string *error = nullptr)
+    {
+        if (!uploadVramPages(source, pages, error))
+            return false;
+        return executePreparedResidentT8GouraudDepthCt32Triangles(
+            std::move(triangles), std::move(palettes), error);
+    }
     virtual void shutdown() noexcept = 0;
     [[nodiscard]] virtual GsVulkanCapabilityReport
     capabilities() const = 0;
@@ -1673,6 +1691,13 @@ public:
         std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
         std::vector<GsVulkanT8Palette> palettes,
         std::string *error = nullptr) override;
+    [[nodiscard]] bool
+    uploadVramPagesAndExecutePreparedResidentT8GouraudDepthCt32Triangles(
+        std::span<const uint8_t> source,
+        const GsVramPageMask &pages,
+        std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
+        std::vector<GsVulkanT8Palette> palettes,
+        std::string *error = nullptr) override;
 
     // Idempotently drains accepted work and destroys every Vulkan object on
     // the owning worker before returning. The diagnostic snapshots remain
@@ -1688,6 +1713,8 @@ private:
         std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
         std::vector<GsVulkanT8Palette> palettes,
         bool validateResourceViews,
+        std::span<const uint8_t> pageUploadSource,
+        const GsVramPageMask &pageUploadPages,
         std::string *error);
     struct Impl;
     explicit GsVulkanService(std::unique_ptr<Impl> impl);

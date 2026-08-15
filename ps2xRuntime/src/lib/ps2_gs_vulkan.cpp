@@ -4157,6 +4157,8 @@ namespace
         bool executeResidentT8GouraudDepthCt32Triangles(
             std::span<const GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
             std::span<const GsVulkanT8Palette> palettes,
+            std::span<const uint8_t> pageUploadSource,
+            const GsVramPageMask &pageUploadPages,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
@@ -7552,6 +7554,8 @@ namespace
             std::span<
                 const GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
             std::span<const GsVulkanT8Palette> palettes,
+            std::span<const uint8_t> pageUploadSource,
+            const GsVramPageMask &pageUploadPages,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error)
@@ -7566,6 +7570,17 @@ namespace
         {
             error =
                 "Vulkan device does not support exact T8 Gouraud depth CT32 triangles";
+            return false;
+        }
+        const PageCopyPlan pageUploadPlan =
+            buildPageCopyPlan(pageUploadPages, true);
+        const bool uploadsPages = pageUploadPlan.pageCount != 0u;
+        if (uploadsPages != !pageUploadSource.empty() ||
+            (uploadsPages &&
+             pageUploadSource.size() != GS_VULKAN_VRAM_SIZE))
+        {
+            error =
+                "Vulkan resident T8 page fusion received an invalid upload";
             return false;
         }
         GsVulkanTriangleTileWorkPlan tileWork;
@@ -7604,6 +7619,26 @@ namespace
                 palette.begin(), palette.end());
         }
 
+        if (uploadsPages)
+        {
+            for (uint32_t index = 0u;
+                 index < pageUploadPlan.regionCount; ++index)
+            {
+                const VkBufferCopy &region =
+                    pageUploadPlan.regions[index];
+                std::memcpy(
+                    static_cast<uint8_t *>(m_stagingMap) +
+                        region.srcOffset,
+                    pageUploadSource.data() + region.dstOffset,
+                    static_cast<size_t>(region.size));
+            }
+            if (!flushMappedAllocation(
+                    m_staging, "fused T8 page upload", report, error))
+            {
+                return false;
+            }
+        }
+
         const VkDeviceSize recordBytes =
             sizeof(GsVulkanResidentT8GouraudDepthCt32Triangle) *
             triangles.size();
@@ -7632,6 +7667,78 @@ namespace
             m_validation.errors.load(std::memory_order_relaxed);
         if (!beginCommands(report, error))
             return false;
+
+        size_t fusedUploadBarrierCount = 0u;
+        if (uploadsPages)
+        {
+            VkBufferMemoryBarrier stagingBarrier{};
+            stagingBarrier.sType =
+                VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            stagingBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            stagingBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            stagingBarrier.srcQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            stagingBarrier.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            stagingBarrier.buffer = m_staging.buffer;
+            stagingBarrier.offset = 0u;
+            stagingBarrier.size = pageUploadPlan.byteCount;
+            m_functions.cmdPipelineBarrier(
+                m_commandBuffer,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u, 0u, nullptr, 1u, &stagingBarrier, 0u, nullptr);
+
+            VkBufferMemoryBarrier vramUploadPrepareBarrier{};
+            vramUploadPrepareBarrier.sType =
+                VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            vramUploadPrepareBarrier.srcAccessMask =
+                VK_ACCESS_MEMORY_READ_BIT |
+                VK_ACCESS_MEMORY_WRITE_BIT;
+            vramUploadPrepareBarrier.dstAccessMask =
+                VK_ACCESS_TRANSFER_WRITE_BIT;
+            vramUploadPrepareBarrier.srcQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            vramUploadPrepareBarrier.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            vramUploadPrepareBarrier.buffer = m_vram.buffer;
+            vramUploadPrepareBarrier.offset = 0u;
+            vramUploadPrepareBarrier.size = GS_VULKAN_VRAM_SIZE;
+            m_functions.cmdPipelineBarrier(
+                m_commandBuffer,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u, 0u, nullptr, 1u, &vramUploadPrepareBarrier,
+                0u, nullptr);
+
+            m_functions.cmdCopyBuffer(
+                m_commandBuffer, m_staging.buffer, m_vram.buffer,
+                pageUploadPlan.regionCount,
+                pageUploadPlan.regions.data());
+
+            VkBufferMemoryBarrier vramUploadCompleteBarrier{};
+            vramUploadCompleteBarrier.sType =
+                VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            vramUploadCompleteBarrier.srcAccessMask =
+                VK_ACCESS_TRANSFER_WRITE_BIT;
+            vramUploadCompleteBarrier.dstAccessMask =
+                VK_ACCESS_MEMORY_READ_BIT |
+                VK_ACCESS_MEMORY_WRITE_BIT;
+            vramUploadCompleteBarrier.srcQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            vramUploadCompleteBarrier.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            vramUploadCompleteBarrier.buffer = m_vram.buffer;
+            vramUploadCompleteBarrier.offset = 0u;
+            vramUploadCompleteBarrier.size = GS_VULKAN_VRAM_SIZE;
+            m_functions.cmdPipelineBarrier(
+                m_commandBuffer,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                0u, 0u, nullptr, 1u, &vramUploadCompleteBarrier,
+                0u, nullptr);
+            fusedUploadBarrierCount = 3u;
+        }
 
         std::array<VkBufferMemoryBarrier, 2> hostUploadBarriers{};
         VkBufferMemoryBarrier &recordUploadBarrier =
@@ -7697,7 +7804,7 @@ namespace
             m_pipelineLayout, 0u, 1u, &m_descriptorSet,
             0u, nullptr);
         size_t dispatchCount = 0u;
-        size_t pipelineBarrierCount = 3u;
+        size_t pipelineBarrierCount = 3u + fusedUploadBarrierCount;
         if (tiled)
         {
             const GsVulkanT8TriangleParameters parameters{
@@ -7758,7 +7865,10 @@ namespace
             ++dispatchCount;
         }
         if (!tiled)
-            pipelineBarrierCount = triangles.size() + 2u;
+        {
+            pipelineBarrierCount =
+                triangles.size() + 2u + fusedUploadBarrierCount;
+        }
 
         VkBufferMemoryBarrier completeBarrier{};
         completeBarrier.sType =
@@ -7787,6 +7897,12 @@ namespace
                 report, statistics, error))
         {
             return false;
+        }
+        if (uploadsPages)
+        {
+            statistics.bytesUploaded += pageUploadPlan.byteCount;
+            statistics.pagesUploaded += pageUploadPlan.pageCount;
+            statistics.pageUploadRegions += pageUploadPlan.regionCount;
         }
         error.clear();
         return true;
@@ -8618,6 +8734,8 @@ struct GsVulkanService::Impl final
                         activeRequestT8TriangleCount;
                     ++statistics
                           .residentT8GouraudDepthCt32TriangleBatchesFailed;
+                    if (activeRequestHasPageUpload)
+                        ++statistics.pageUploadOperationsFailed;
                 }
                 else if (activeRequestKind ==
                          GsVulkanRequestKind::
@@ -8766,6 +8884,8 @@ struct GsVulkanService::Impl final
                 pages = requestPages;
                 kind = requestKind;
                 activeRequestKind = kind;
+                activeRequestHasPageUpload =
+                    !pageUploadSource.empty();
                 activeRequestSpriteCount = sprites.size();
                 activeRequestDepthCt32SpriteCount =
                     depthCt32Sprites.size();
@@ -8931,6 +9051,7 @@ struct GsVulkanService::Impl final
                     executeResidentT8GouraudDepthCt32Triangles(
                         residentT8GouraudDepthCt32Triangles,
                         t8Palettes,
+                        pageUploadSource, pages,
                         localCapabilities, localStatistics,
                         operationError);
             }
@@ -9470,6 +9591,16 @@ struct GsVulkanService::Impl final
             {
                 ++localStatistics.roundTripsFailed;
             }
+            if (kind ==
+                    GsVulkanRequestKind::
+                        ResidentT8GouraudDepthCt32Triangles &&
+                !pageUploadSource.empty())
+            {
+                if (succeeded)
+                    ++localStatistics.pageUploadOperationsCompleted;
+                else
+                    ++localStatistics.pageUploadOperationsFailed;
+            }
             GsVulkanRequestStatistics &requestStatistics =
                 localStatistics.requestsByKind[
                     gsVulkanRequestKindIndex(kind)];
@@ -9587,25 +9718,39 @@ struct GsVulkanService::Impl final
     {
         bool pageTransferValid =
             pageUploadSource.empty() &&
-            pageDownloadDestination.empty();
+            pageDownloadDestination.empty() &&
+            !pages.any();
         if (kind == GsVulkanRequestKind::UploadPages)
         {
             pageTransferValid =
                 pageUploadSource.size() == GS_VULKAN_VRAM_SIZE &&
-                pageDownloadDestination.empty();
+                pageDownloadDestination.empty() &&
+                pages.any();
+        }
+        else if (kind ==
+                     GsVulkanRequestKind::
+                         ResidentT8GouraudDepthCt32Triangles &&
+                 !pageUploadSource.empty())
+        {
+            pageTransferValid =
+                pageUploadSource.size() == GS_VULKAN_VRAM_SIZE &&
+                pageDownloadDestination.empty() &&
+                pages.any();
         }
         else if (kind == GsVulkanRequestKind::DownloadPages)
         {
             pageTransferValid =
                 pageUploadSource.empty() &&
-                pageDownloadDestination.size() == GS_VULKAN_VRAM_SIZE;
+                pageDownloadDestination.size() == GS_VULKAN_VRAM_SIZE &&
+                pages.any();
         }
         else if (kind ==
                  GsVulkanRequestKind::DownloadFeedbackSnapshot)
         {
             pageTransferValid =
                 pageUploadSource.empty() &&
-                pageDownloadDestination.size() == GS_VULKAN_VRAM_SIZE;
+                pageDownloadDestination.size() == GS_VULKAN_VRAM_SIZE &&
+                !pages.any();
         }
         if (!pageTransferValid)
         {
@@ -9792,6 +9937,7 @@ struct GsVulkanService::Impl final
     size_t activeRequestGouraudTriangleCount = 0u;
     size_t activeRequestT8TriangleCount = 0u;
     size_t activeRequestFeedbackNearestTriangleCount = 0u;
+    bool activeRequestHasPageUpload = false;
     bool initialized = false;
     bool healthy = false;
     bool stopping = false;
@@ -11034,7 +11180,7 @@ bool GsVulkanService::executeResidentT8GouraudDepthCt32Triangles(
             triangles.begin(), triangles.end()),
         std::vector<GsVulkanT8Palette>(
             palettes.begin(), palettes.end()),
-        true, error);
+        true, {}, {}, error);
 }
 
 bool GsVulkanService::
@@ -11044,19 +11190,46 @@ bool GsVulkanService::
         std::string *error)
 {
     return executeResidentT8GouraudDepthCt32TrianglesImpl(
-        std::move(triangles), std::move(palettes), false, error);
+        std::move(triangles), std::move(palettes), false,
+        {}, {}, error);
+}
+
+bool GsVulkanService::
+    uploadVramPagesAndExecutePreparedResidentT8GouraudDepthCt32Triangles(
+        std::span<const uint8_t> source,
+        const GsVramPageMask &pages,
+        std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
+        std::vector<GsVulkanT8Palette> palettes,
+        std::string *error)
+{
+    if (source.size() != GS_VULKAN_VRAM_SIZE || !pages.any())
+    {
+        if (error)
+        {
+            *error =
+                "invalid Vulkan GS resident T8 fused page upload";
+        }
+        return false;
+    }
+    return executeResidentT8GouraudDepthCt32TrianglesImpl(
+        std::move(triangles), std::move(palettes), false,
+        source, pages, error);
 }
 
 bool GsVulkanService::executeResidentT8GouraudDepthCt32TrianglesImpl(
     std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
     std::vector<GsVulkanT8Palette> palettes,
     bool validateResourceViews,
+    std::span<const uint8_t> pageUploadSource,
+    const GsVramPageMask &pageUploadPages,
     std::string *error)
 {
 #if !PS2X_HAS_GS_VULKAN
     (void)triangles;
     (void)palettes;
     (void)validateResourceViews;
+    (void)pageUploadSource;
+    (void)pageUploadPages;
     if (error)
         *error = "Vulkan GS support was compiled out";
     return false;
@@ -11091,8 +11264,9 @@ bool GsVulkanService::executeResidentT8GouraudDepthCt32TrianglesImpl(
     return m_impl->executeRequest(
         GsVulkanRequestKind::ResidentT8GouraudDepthCt32Triangles,
         {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-        {}, {}, unusedOutput, nullptr, error,
-        std::move(triangles), std::move(palettes));
+        {}, pageUploadPages, unusedOutput, nullptr, error,
+        std::move(triangles), std::move(palettes),
+        pageUploadSource);
 #endif
 }
 

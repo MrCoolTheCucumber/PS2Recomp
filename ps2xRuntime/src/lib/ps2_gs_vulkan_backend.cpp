@@ -1031,18 +1031,30 @@ struct GsVulkanRasterBackend::Impl final
         }
         GsVramPageMask accessPages = pendingResidentReadPages;
         accessPages.unionWith(pendingResidentWritePages);
-
-        try
+        const bool canFusePageUpload =
+            pipeline ==
+            ResidentPipeline::T8GouraudDepthCt32Triangle;
+        GsVramPageMask fusedPageUploadPages;
+        if (canFusePageUpload)
         {
-            uploadCpuNewer(
-                accessPages,
-                "page upload for " + std::string(batchName) + " at " +
-                    std::string(gsFlushReasonName(reason)));
+            fusedPageUploadPages =
+                coherency.cpuNewerPages(accessPages);
         }
-        catch (...)
+
+        if (!fusedPageUploadPages.any())
         {
-            clearPendingResidentCommands();
-            throw;
+            try
+            {
+                uploadCpuNewer(
+                    accessPages,
+                    "page upload for " + std::string(batchName) + " at " +
+                        std::string(gsFlushReasonName(reason)));
+            }
+            catch (...)
+            {
+                clearPendingResidentCommands();
+                throw;
+            }
         }
 
         std::string executionError;
@@ -1060,11 +1072,24 @@ struct GsVulkanRasterBackend::Impl final
         else if (pipeline ==
                  ResidentPipeline::T8GouraudDepthCt32Triangle)
         {
-            executed = executor
-                ->executePreparedResidentT8GouraudDepthCt32Triangles(
-                    std::move(pendingT8GouraudDepthTriangles),
-                    std::move(pendingT8Palettes),
-                    &executionError);
+            if (fusedPageUploadPages.any())
+            {
+                executed = executor
+                    ->uploadVramPagesAndExecutePreparedResidentT8GouraudDepthCt32Triangles(
+                        canonicalVram,
+                        fusedPageUploadPages,
+                        std::move(pendingT8GouraudDepthTriangles),
+                        std::move(pendingT8Palettes),
+                        &executionError);
+            }
+            else
+            {
+                executed = executor
+                    ->executePreparedResidentT8GouraudDepthCt32Triangles(
+                        std::move(pendingT8GouraudDepthTriangles),
+                        std::move(pendingT8Palettes),
+                        &executionError);
+            }
         }
         else if (pipeline == ResidentPipeline::DepthCt32Sprite)
         {
@@ -1135,6 +1160,8 @@ struct GsVulkanRasterBackend::Impl final
                     std::string(gsFlushReasonName(reason)),
                 std::move(executionError));
         }
+        if (fusedPageUploadPages.any())
+            coherency.completeCpuToGpu(fusedPageUploadPages);
 
         if (pipeline ==
             ResidentPipeline::FeedbackNearestDepthCt32Triangle)

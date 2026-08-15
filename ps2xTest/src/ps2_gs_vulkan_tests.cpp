@@ -20377,13 +20377,6 @@ void register_ps2_gs_vulkan_tests()
 
             GsVramPageMask allPages;
             allPages.setAll();
-            t.IsTrue(service->uploadVramPages(
-                         initial, allPages, &operationError),
-                     "resident T8 validation should upload canonical VRAM");
-            t.IsTrue(operationError.empty(),
-                     "resident T8 upload should clear its diagnostic");
-            const GsVulkanServiceStatistics beforeResident =
-                service->statistics();
             std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle>
                 residentPrepared(prepared.size());
             for (size_t index = 0u; index < prepared.size(); ++index)
@@ -20393,25 +20386,68 @@ void register_ps2_gs_vulkan_tests()
                     sizeof(residentPrepared[index]));
                 residentPrepared[index].paletteIndex = 0u;
             }
-            const std::array<GsVulkanT8Palette, 1> residentPalettes{{
+            std::vector<GsVulkanT8Palette> residentPalettes{
                 prepared.front().palette,
-            }};
-            t.IsTrue(service->executeResidentT8GouraudDepthCt32Triangles(
-                         residentPrepared, residentPalettes,
-                         &operationError),
-                     "dependent T8 triangles should execute in one resident batch");
+            };
+            const GsVulkanServiceStatistics beforeResident =
+                service->statistics();
+            t.IsTrue(
+                service
+                    ->uploadVramPagesAndExecutePreparedResidentT8GouraudDepthCt32Triangles(
+                        initial, allPages,
+                        std::move(residentPrepared),
+                        std::move(residentPalettes),
+                        &operationError),
+                "the T8 upload and dependent triangles should share one request");
             t.IsTrue(operationError.empty(),
-                     "resident T8 execution should clear its diagnostic");
+                     "fused resident T8 execution should clear its diagnostic");
             const GsVulkanServiceStatistics afterResident =
                 service->statistics();
+            t.Equals(afterResident.queueSubmissions -
+                         beforeResident.queueSubmissions,
+                     1ull,
+                     "the upload and resident T8 batch should share one submission");
+            t.Equals(afterResident.fenceWaits -
+                         beforeResident.fenceWaits,
+                     1ull,
+                     "the upload and resident T8 batch should share one fence");
             t.Equals(afterResident.shaderDispatches -
                          beforeResident.shaderDispatches,
                      1ull,
                      "ordered resident T8 execution should use one dispatch");
             t.Equals(afterResident.pipelineBarriers -
                          beforeResident.pipelineBarriers,
-                     3ull,
-                     "ordered resident T8 execution should need only batch-level barriers");
+                     6ull,
+                     "fused T8 execution should retain three transfer and three draw barriers");
+            t.Equals(afterResident.pageUploadOperationsCompleted -
+                         beforeResident.pageUploadOperationsCompleted,
+                     1ull,
+                     "the fused request should retain one page-upload operation");
+            t.Equals(afterResident.pagesUploaded -
+                         beforeResident.pagesUploaded,
+                     512ull,
+                     "the fused request should account for every uploaded page");
+            const size_t residentRequestIndex =
+                gsVulkanRequestKindIndex(
+                    GsVulkanRequestKind::
+                        ResidentT8GouraudDepthCt32Triangles);
+            const size_t uploadRequestIndex =
+                gsVulkanRequestKindIndex(
+                    GsVulkanRequestKind::UploadPages);
+            t.Equals(
+                afterResident.requestsByKind[residentRequestIndex]
+                        .requestWaits -
+                    beforeResident.requestsByKind[residentRequestIndex]
+                        .requestWaits,
+                1ull,
+                "the fused operation should post one resident T8 request");
+            t.Equals(
+                afterResident.requestsByKind[uploadRequestIndex]
+                        .requestWaits -
+                    beforeResident.requestsByKind[uploadRequestIndex]
+                        .requestWaits,
+                0ull,
+                "the fused operation should not post a standalone page upload");
             std::vector<uint8_t> actualResident(
                 GS_VULKAN_VRAM_SIZE, 0u);
             t.IsTrue(service->downloadVramPages(
