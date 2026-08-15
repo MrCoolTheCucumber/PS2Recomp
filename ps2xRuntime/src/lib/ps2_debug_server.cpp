@@ -1503,6 +1503,23 @@ struct PS2DebugServer::Impl
             "demand_rebases",
             executionEpoch.demandRebases, allocator);
         executionEpochValue.AddMember(
+            "positive_demand_extensions",
+            executionEpoch.positiveDemandExtensions,
+            allocator);
+        executionEpochValue.AddMember(
+            "positive_demand_prefix_cycles_reused",
+            executionEpoch.positiveDemandPrefixCyclesReused,
+            allocator);
+        executionEpochValue.AddMember(
+            "positive_demand_extension_cycles",
+            executionEpoch.positiveDemandExtensionCycles,
+            allocator);
+        executionEpochValue.AddMember(
+            "positive_demand_extension_executed_cycles",
+            executionEpoch
+                .positiveDemandExtensionExecutedCycles,
+            allocator);
+        executionEpochValue.AddMember(
             "checkpoint_wait_count",
             executionEpoch.checkpointWaitCount, allocator);
         executionEpochValue.AddMember(

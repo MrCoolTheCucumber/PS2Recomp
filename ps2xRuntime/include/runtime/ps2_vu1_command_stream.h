@@ -802,6 +802,10 @@ struct Vu1ExecutionEpochStatistics
     uint64_t checkpointsPublished = 0u;
     uint64_t suffixCheckpointsDiscarded = 0u;
     uint64_t demandRebases = 0u;
+    uint64_t positiveDemandExtensions = 0u;
+    uint64_t positiveDemandPrefixCyclesReused = 0u;
+    uint64_t positiveDemandExtensionCycles = 0u;
+    uint64_t positiveDemandExtensionExecutedCycles = 0u;
     uint64_t checkpointWaitCount = 0u;
     uint64_t checkpointWaitNanoseconds = 0u;
     size_t maximumJournalDepth = 0u;
@@ -1160,6 +1164,13 @@ private:
     std::atomic<uint64_t>
         m_epochSuffixCheckpointsDiscarded{0u};
     std::atomic<uint64_t> m_epochDemandRebases{0u};
+    std::atomic<uint64_t> m_epochPositiveDemandExtensions{0u};
+    std::atomic<uint64_t>
+        m_epochPositiveDemandPrefixCyclesReused{0u};
+    std::atomic<uint64_t>
+        m_epochPositiveDemandExtensionCycles{0u};
+    std::atomic<uint64_t>
+        m_epochPositiveDemandExtensionExecutedCycles{0u};
     std::atomic<uint64_t> m_epochCheckpointWaitCount{0u};
     std::atomic<uint64_t>
         m_epochCheckpointWaitNanoseconds{0u};

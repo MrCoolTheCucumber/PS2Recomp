@@ -4067,6 +4067,12 @@ void ThreadedVu1Executor::runExecutionEpoch(WorkItem &item)
             processor;
     };
 
+    struct PositiveDemandExtension
+    {
+        LocalCheckpoint prefix;
+        uint32_t exactCycles = 0u;
+    };
+
     auto baseline = m_processor.captureProcessorCheckpoint();
     // The transport identity is consumed even if no speculative checkpoint
     // becomes guest-visible. Ordered work behind the epoch therefore keeps a
@@ -4092,6 +4098,7 @@ void ThreadedVu1Executor::runExecutionEpoch(WorkItem &item)
             enum class Action : uint8_t
             {
                 Produce,
+                Extend,
                 Rebase,
                 Stop,
                 Finish,
@@ -4100,6 +4107,8 @@ void ThreadedVu1Executor::runExecutionEpoch(WorkItem &item)
             uint32_t cycles = 0u;
             uint64_t revision = handledRevision;
             uint64_t discarded = 0u;
+            std::optional<PositiveDemandExtension>
+                positiveDemandExtension;
             {
                 std::unique_lock<std::mutex> lock(
                     item.executionEpoch->mutex);
@@ -4143,6 +4152,35 @@ void ThreadedVu1Executor::runExecutionEpoch(WorkItem &item)
                     if (item.executionEpoch->demandRevision !=
                         handledRevision)
                     {
+                        const uint32_t exactCycles =
+                            item.executionEpoch->demandedCycles;
+                        const bool canExtendFront =
+                            !localJournal.empty() &&
+                            !localJournal.front().shared->consumed &&
+                            localJournal.front().shared->revision ==
+                                handledRevision &&
+                            exactCycles >
+                                localJournal.front().shared->cycles;
+                        if (canExtendFront)
+                        {
+                            discarded =
+                                localJournal.size() - 1u;
+                            positiveDemandExtension.emplace(
+                                PositiveDemandExtension{
+                                    .prefix = std::move(
+                                        localJournal.front()),
+                                    .exactCycles = exactCycles,
+                                });
+                            item.executionEpoch->journal.clear();
+                            localJournal.clear();
+                            handledRevision =
+                                item.executionEpoch->demandRevision;
+                            revision = handledRevision;
+                            reachedInactive = false;
+                            action = Action::Extend;
+                            break;
+                        }
+
                         discarded = localJournal.size();
                         item.executionEpoch->journal.clear();
                         localJournal.clear();
@@ -4176,6 +4214,196 @@ void ThreadedVu1Executor::runExecutionEpoch(WorkItem &item)
             {
                 m_epochSuffixCheckpointsDiscarded.fetch_add(
                     discarded, std::memory_order_relaxed);
+            }
+            if (action == Action::Extend)
+            {
+                if (!positiveDemandExtension)
+                {
+                    throw std::logic_error(
+                        "VU1 epoch positive demand lost its prefix");
+                }
+                LocalCheckpoint prefixCheckpoint =
+                    std::move(
+                        positiveDemandExtension->prefix);
+                const uint32_t exactCycles =
+                    positiveDemandExtension->exactCycles;
+                const uint32_t prefixCycles =
+                    prefixCheckpoint.shared->cycles;
+                if (prefixCycles == 0u ||
+                    exactCycles <= prefixCycles ||
+                    prefixCheckpoint.shared->consumed)
+                {
+                    throw std::logic_error(
+                        "VU1 epoch received an invalid positive demand");
+                }
+
+                Vu1CommandResult prefixResult =
+                    std::move(
+                        prefixCheckpoint.shared->result);
+                auto *const prefix =
+                    std::get_if<Vu1SliceResult>(
+                        &prefixResult.payload);
+                if (!prefix ||
+                    prefixResult.disposition !=
+                        Vu1CommandDisposition::Completed ||
+                    prefix->run.requestedCycles != prefixCycles)
+                {
+                    throw std::logic_error(
+                        "VU1 epoch positive demand has an invalid prefix");
+                }
+
+                // If later journal entries ran after the retained front,
+                // restore its exact processor state before executing only
+                // the newly demanded suffix. With no later entry the owner
+                // is already at this checkpoint and avoids a redundant copy.
+                if (discarded != 0u)
+                {
+                    m_processor.restoreProcessorCheckpoint(
+                        prefixCheckpoint.processor);
+                }
+                const uint32_t extensionCycles =
+                    exactCycles - prefixCycles;
+                Vu1CommandResult extensionResult =
+                    m_processor.processEpochContinuation(
+                        item.command.identity,
+                        Vu1AdvanceSliceCommand{
+                            .maximumCycles = extensionCycles,
+                            .captureState =
+                                item.executionEpoch->options
+                                    .captureState,
+                        });
+                auto *const extension =
+                    std::get_if<Vu1SliceResult>(
+                        &extensionResult.payload);
+                if (!extension ||
+                    extensionResult.disposition !=
+                        Vu1CommandDisposition::Completed ||
+                    extension->run.requestedCycles !=
+                        extensionCycles ||
+                    prefix->run.executedCycles >
+                        std::numeric_limits<uint32_t>::max() -
+                            extension->run.executedCycles)
+                {
+                    throw std::logic_error(
+                        "VU1 epoch positive suffix was rejected");
+                }
+
+                if (!prefixResult.diagnostics.empty())
+                {
+                    const auto *const boundary = std::get_if<
+                        Vu1TraceInvocationEndDiagnostic>(
+                        &prefixResult.diagnostics.back());
+                    if (boundary && boundary->hitCycleLimit)
+                        prefixResult.diagnostics.pop_back();
+                }
+                prefix->path1Packets.reserve(
+                    prefix->path1Packets.size() +
+                    extension->path1Packets.size());
+                for (Vu1Path1Packet &packet :
+                     extension->path1Packets)
+                {
+                    prefix->path1Packets.emplace_back(
+                        std::move(packet));
+                }
+                const uint32_t reusedCycles =
+                    prefix->run.executedCycles;
+                const uint32_t extensionExecutedCycles =
+                    extension->run.executedCycles;
+                prefix->run.requestedCycles = exactCycles;
+                prefix->run.executedCycles +=
+                    extensionExecutedCycles;
+                prefix->run.reason = extension->run.reason;
+                prefix->run.activeAfter =
+                    extension->run.activeAfter;
+                prefix->run.completed =
+                    extension->run.completed;
+                prefix->state = std::move(extension->state);
+                prefix->architecturalStateHash =
+                    extension->architecturalStateHash;
+                prefix->vifCanResume =
+                    extension->vifCanResume;
+                prefix->fault = std::move(extension->fault);
+
+                prefixResult.diagnostics.reserve(
+                    prefixResult.diagnostics.size() +
+                    extensionResult.diagnostics.size());
+                for (Vu1DiagnosticRecord &diagnostic :
+                     extensionResult.diagnostics)
+                {
+                    prefixResult.diagnostics.emplace_back(
+                        std::move(diagnostic));
+                }
+                extensionResult.diagnostics =
+                    std::move(prefixResult.diagnostics);
+                extensionResult.payload =
+                    std::move(prefixResult.payload);
+
+                const bool captureDigest =
+                    m_processor.m_configuration
+                        .captureCommandDigests;
+                extensionResult.digest = prefixResult.digest;
+                if (captureDigest)
+                {
+                    const Vu1CommandPayload exactPayload{
+                        Vu1AdvanceSliceCommand{
+                            .maximumCycles = exactCycles,
+                            .captureState =
+                                item.executionEpoch->options
+                                    .captureState,
+                        }};
+                    extensionResult.digest.payloadHash =
+                        vu1CommandPayloadHash(exactPayload);
+                }
+
+                auto processorCheckpoint =
+                    m_processor.captureProcessorCheckpoint();
+                auto sharedCheckpoint =
+                    std::make_shared<
+                        Vu1ExecutionEpochState::Checkpoint>();
+                sharedCheckpoint->revision = revision;
+                sharedCheckpoint->cycles = exactCycles;
+                sharedCheckpoint->active =
+                    extensionResult.active;
+                sharedCheckpoint->result =
+                    std::move(extensionResult);
+                if (m_options.beforePublish)
+                {
+                    m_options.beforePublish(
+                        sharedCheckpoint->result,
+                        item.ticket);
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        item.executionEpoch->mutex);
+                    item.executionEpoch->journal.push_back(
+                        sharedCheckpoint);
+                    localJournal.push_back(
+                        LocalCheckpoint{
+                            .shared = sharedCheckpoint,
+                            .processor =
+                                std::move(processorCheckpoint),
+                        });
+                    reachedInactive =
+                        !sharedCheckpoint->active;
+                    updateVu1AtomicMaximum(
+                        m_epochMaximumJournalDepth,
+                        localJournal.size());
+                }
+                m_epochCheckpointsProduced.fetch_add(
+                    1u, std::memory_order_relaxed);
+                m_epochPositiveDemandExtensions.fetch_add(
+                    1u, std::memory_order_relaxed);
+                m_epochPositiveDemandPrefixCyclesReused.fetch_add(
+                    reusedCycles, std::memory_order_relaxed);
+                m_epochPositiveDemandExtensionCycles.fetch_add(
+                    extensionCycles,
+                    std::memory_order_relaxed);
+                m_epochPositiveDemandExtensionExecutedCycles.fetch_add(
+                    extensionExecutedCycles,
+                    std::memory_order_relaxed);
+                item.executionEpoch->changed.notify_all();
+                continue;
             }
             if (action == Action::Stop ||
                 action == Action::Finish)
@@ -4681,6 +4909,18 @@ ThreadedVu1Executor::statistics() const
                     std::memory_order_acquire),
             .demandRebases =
                 m_epochDemandRebases.load(
+                    std::memory_order_acquire),
+            .positiveDemandExtensions =
+                m_epochPositiveDemandExtensions.load(
+                    std::memory_order_acquire),
+            .positiveDemandPrefixCyclesReused =
+                m_epochPositiveDemandPrefixCyclesReused.load(
+                    std::memory_order_acquire),
+            .positiveDemandExtensionCycles =
+                m_epochPositiveDemandExtensionCycles.load(
+                    std::memory_order_acquire),
+            .positiveDemandExtensionExecutedCycles =
+                m_epochPositiveDemandExtensionExecutedCycles.load(
                     std::memory_order_acquire),
             .checkpointWaitCount =
                 m_epochCheckpointWaitCount.load(

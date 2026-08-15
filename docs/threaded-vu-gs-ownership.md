@@ -609,10 +609,16 @@ guest-visible until EE consumes it at its corresponding scheduler event.
 
 The exact cycle demand for a late event is an identity-scoped, coalescing
 revision on the existing epoch. If the journal front was predicted for a
-different budget, the owner restores the last published baseline, discards
-only the unpublished suffix, and regenerates the front with the exact demand.
-This does not allocate another transport ticket or wait on a per-command
-future. The following checkpoints resume the unchanged 128-cycle cadence.
+smaller budget than the positive exact demand, the owner retains that front,
+discards only later unpublished entries, and continues from the front's exact
+processor checkpoint for the additional cycles. Its ordered diagnostics and
+PATH1 packets are merged with the suffix result, and its command digest is
+rebuilt for the exact combined budget. If no later lookahead ran, the owner is
+already at the retained front and avoids the restore. A smaller demand or an
+otherwise incompatible front still restores the last published baseline and
+regenerates the unpublished result. Neither route allocates another transport
+ticket or waits on a per-command future. The following checkpoints resume the
+unchanged 128-cycle cadence.
 
 Any later ordered VU command requests epoch stop while holding the serialized
 producer admission lock. The owner first absorbs every consumed checkpoint
@@ -633,9 +639,10 @@ threaded-synchronous execution are unaffected.
 
 `system.status.vu1_async.owner.execution_epoch` exposes submitted/completed
 epochs, checkpoints produced/published, discarded suffix entries, demand
-rebases, checkpoint wait count/time, and maximum journal depth. These counters
-are observational. They never alter guest time, scheduler priority, VU busy
-publication, VIF wakeup, or XGKICK order.
+rebases, positive-demand extension count, reused prefix cycles, demanded and
+executed extension cycles, checkpoint wait count/time, and maximum journal
+depth. These counters are observational. They never alter guest time,
+scheduler priority, VU busy publication, VIF wakeup, or XGKICK order.
 
 ## Audit maintenance
 

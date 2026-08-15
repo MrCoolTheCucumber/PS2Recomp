@@ -2063,6 +2063,21 @@ void register_ps2_vu1_command_stream_tests()
                     lateSlice->run.executedCycles == 129u &&
                     lateSlice->state->vi[1] == 145,
                 "late exact demand should rebase only the unpublished suffix");
+            Vu1Command expectedLateCommand{
+                .identity = late.identity,
+                .type = Vu1CommandType::AdvanceSlice,
+                .payload = Vu1AdvanceSliceCommand{
+                    .maximumCycles = 129u,
+                    .captureState = true,
+                },
+            };
+            expectedLateCommand.payloadSize =
+                vu1CommandPayloadSize(
+                    expectedLateCommand.payload);
+            t.IsTrue(
+                late.digest ==
+                    vu1CommandDigest(expectedLateCommand),
+                "the positive extension should publish the canonical exact-budget digest");
 
             const Vu1CommandResult third =
                 executor.waitExecutionEpochCheckpoint(
@@ -2111,6 +2126,23 @@ void register_ps2_vu1_command_stream_tests()
             t.Equals(
                 statistics.executionEpoch.demandRebases, 1ull,
                 "one late event should update the existing epoch horizon");
+            t.Equals(
+                statistics.executionEpoch.positiveDemandExtensions,
+                1ull,
+                "positive late demand should extend the retained front checkpoint");
+            t.Equals(
+                statistics.executionEpoch.positiveDemandPrefixCyclesReused,
+                128ull,
+                "the exact extension should retain the complete predicted prefix");
+            t.Equals(
+                statistics.executionEpoch.positiveDemandExtensionCycles,
+                1ull,
+                "the exact extension should execute only the additional demand");
+            t.Equals(
+                statistics.executionEpoch
+                    .positiveDemandExtensionExecutedCycles,
+                1ull,
+                "the one-cycle suffix should execute exactly once");
             t.IsTrue(
                 statistics.executionEpoch.maximumJournalDepth >= 3u,
                 "the bounded journal should hold multiple future checkpoints");
@@ -5186,12 +5218,15 @@ void register_ps2_vu1_command_stream_tests()
             const auto run =
                 [&](uint32_t secondKickPair,
                     size_t packetsAfterStartup,
-                    uint64_t serviceTicks)
+                    uint64_t serviceTicks,
+                    bool checkpointEpochs)
                 {
                     PS2RuntimeConfiguration configuration =
                         defaultPs2RuntimeConfiguration();
                     configuration.vu1ExecutionMode =
                         Vu1ExecutionMode::ThreadedAsync;
+                    configuration.vu1CheckpointEpochs =
+                        checkpointEpochs;
                     configuration.vu1CommandQueueCapacity = 2u;
                     configuration.vu1CommandPayloadCapacityBytes =
                         1024u * 1024u;
@@ -5264,10 +5299,17 @@ void register_ps2_vu1_command_stream_tests()
                         reinterpret_cast<const uint8_t *>(&mscal),
                         sizeof(mscal));
                     if (!waitUntil(
-                            [&runtime]()
+                            [&runtime, checkpointEpochs]()
                             {
                                 const auto statistics =
                                     runtime.vu1AsyncStatistics();
+                                if (checkpointEpochs)
+                                {
+                                    return statistics.owner
+                                               .executionEpoch
+                                               .maximumJournalDepth >=
+                                           2u;
+                                }
                                 return statistics.owner.completedTickets ==
                                        statistics.owner.submittedTickets;
                             }))
@@ -5319,21 +5361,43 @@ void register_ps2_vu1_command_stream_tests()
                             runtime.vu1AsyncStatistics();
                         t.Equals(statistics.budgetFallbackCount, 0ull,
                                  "the late XGKICK slice should not replay");
-                        t.Equals(statistics.budgetExtensionCount, 1ull,
-                                 "the late XGKICK slice should extend once");
-                        t.Equals(
-                            statistics.budgetExtensionExecutedCycles,
-                            1ull,
-                            "the second packet should be earned by one suffix cycle");
+                        if (checkpointEpochs)
+                        {
+                            t.Equals(
+                                statistics.owner.executionEpoch
+                                    .positiveDemandExtensions,
+                                1ull,
+                                "the late epoch should extend its retained prefix once");
+                            t.Equals(
+                                statistics.owner.executionEpoch
+                                    .positiveDemandPrefixCyclesReused,
+                                16ull,
+                                "the late epoch should retain its predicted prefix");
+                            t.Equals(
+                                statistics.owner.executionEpoch
+                                    .positiveDemandExtensionExecutedCycles,
+                                1ull,
+                                "the epoch suffix should earn the second packet once");
+                        }
+                        else
+                        {
+                            t.Equals(statistics.budgetExtensionCount, 1ull,
+                                     "the late XGKICK slice should extend once");
+                            t.Equals(
+                                statistics.budgetExtensionExecutedCycles,
+                                1ull,
+                                "the second packet should be earned by one suffix cycle");
+                        }
                     }
                 };
 
-            run(3u, 2u, 128u);
-            run(18u, 1u, 128u);
+            run(3u, 2u, 128u, false);
+            run(18u, 1u, 128u, false);
             // The second XGKICK is issued in the last scheduled cycle. It
             // retains one cycle of PATH1 credit privately; the one-cycle
             // late suffix earns the qword and must append it after packet 1.
-            run(15u, 2u, 136u);
+            run(15u, 2u, 136u, false);
+            run(15u, 2u, 136u, true);
         });
 
         tc.Run("runtime async checkpoints match inline under ready late and jitter schedules", [](TestCase &t)
