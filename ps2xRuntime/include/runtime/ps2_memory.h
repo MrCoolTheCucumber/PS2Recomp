@@ -1824,7 +1824,7 @@ public:
 
     static constexpr size_t kTlbTranslationCacheSetCount = 32u;
     static constexpr size_t kTlbTranslationCacheWayCount = 4u;
-    static constexpr size_t kTlbFastCacheSetCount = 64u;
+    static constexpr size_t kTlbFastCacheSetCount = 512u;
     static constexpr uint32_t kTlbTranslationCachePageSize = 0x1000u;
     static_assert(
         (kTlbTranslationCacheSetCount &
