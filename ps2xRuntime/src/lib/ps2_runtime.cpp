@@ -18256,8 +18256,7 @@ void PS2Runtime::run()
                 std::snprintf(
                     title.data(),
                     title.size(),
-                    "%s | %.1f FPS | %.1f%% speed",
-                    m_windowTitle.c_str(),
+                    "%.1f FPS | %.1f%% speed",
                     guestFramesPerSecond,
                     runRatePercent);
                 SetWindowTitle(title.data());
