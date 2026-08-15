@@ -717,6 +717,8 @@ private:
     [[nodiscard]] uint64_t stateHash() const noexcept;
     [[nodiscard]] Vu1ArchitecturalStateHashes
     stateHashes() const noexcept;
+    [[nodiscard]] Vu1ArchitecturalStateHashes
+    stateHashes(bool diagnostic) const noexcept;
     [[nodiscard]] Vu1CommandResultPayload apply(
         Vu1CommandPayload &payload,
         Vu1CommandDisposition &disposition);

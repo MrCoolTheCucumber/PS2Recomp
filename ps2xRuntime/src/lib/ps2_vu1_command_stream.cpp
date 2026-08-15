@@ -1755,9 +1755,18 @@ uint64_t Vu1CommandProcessor::stateHash() const noexcept
 Vu1ArchitecturalStateHashes
 Vu1CommandProcessor::stateHashes() const noexcept
 {
-    const bool diagnostic =
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    return stateHashes(
         m_diagnosticArchitecturalStateHashes.load(
-            std::memory_order_acquire);
+            std::memory_order_acquire));
+#else
+    return stateHashes(false);
+#endif
+}
+
+Vu1ArchitecturalStateHashes
+Vu1CommandProcessor::stateHashes(bool diagnostic) const noexcept
+{
     if ((!m_configuration.captureArchitecturalStateHashes &&
          !diagnostic) || !m_microMemory || !m_dataMemory)
     {
@@ -1807,8 +1816,16 @@ Vu1SliceResult Vu1CommandProcessor::advanceSlice(
     const Vu1AdvanceSliceCommand &command)
 {
     Vu1SliceResult slice{};
-    const Vu1ArchitecturalStateHashes inputHashes =
-        stateHashes();
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    const bool diagnostic =
+        m_diagnosticArchitecturalStateHashes.load(
+            std::memory_order_acquire);
+#else
+    constexpr bool diagnostic = false;
+#endif
+    const Vu1ArchitecturalStateHashes inputHashes = diagnostic
+        ? stateHashes(true)
+        : Vu1ArchitecturalStateHashes{};
     Vu1SliceSideEffectSink effects(slice.path1Packets);
     VuExecutionContext context{
         .state = m_unit.state(),
@@ -1843,7 +1860,8 @@ Vu1SliceResult Vu1CommandProcessor::advanceSlice(
             std::make_unique<VuExecutionState>(
                 m_unit.state());
     }
-    Vu1ArchitecturalStateHashes hashes = stateHashes();
+    Vu1ArchitecturalStateHashes hashes =
+        stateHashes(diagnostic);
     hashes.inputAggregate = inputHashes.aggregate;
     hashes.inputExecution = inputHashes.execution;
     hashes.inputMicroMemory = inputHashes.microMemory;
@@ -1873,8 +1891,16 @@ Vu1SliceResult Vu1CommandProcessor::runInvocation(
     Vu1SliceResult invocation{};
     invocation.run.requestedCycles = command.maximumCycles;
     invocation.run.activeBefore = m_unit.isActive();
-    const Vu1ArchitecturalStateHashes inputHashes =
-        stateHashes();
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    const bool diagnostic =
+        m_diagnosticArchitecturalStateHashes.load(
+            std::memory_order_acquire);
+#else
+    constexpr bool diagnostic = false;
+#endif
+    const Vu1ArchitecturalStateHashes inputHashes = diagnostic
+        ? stateHashes(true)
+        : Vu1ArchitecturalStateHashes{};
     uint64_t path1Bytes = 0u;
     uint32_t segments = 0u;
 
@@ -1961,7 +1987,8 @@ Vu1SliceResult Vu1CommandProcessor::runInvocation(
         invocation.state =
             std::make_unique<VuExecutionState>(m_unit.state());
     }
-    Vu1ArchitecturalStateHashes hashes = stateHashes();
+    Vu1ArchitecturalStateHashes hashes =
+        stateHashes(diagnostic);
     hashes.inputAggregate = inputHashes.aggregate;
     hashes.inputExecution = inputHashes.execution;
     hashes.inputMicroMemory = inputHashes.microMemory;
