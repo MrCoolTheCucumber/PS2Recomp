@@ -1244,10 +1244,10 @@ void register_ee_thread_scheduler_tests()
                 {
                     consequenceObservedTransition =
                         target.currentThreadId()
-                                .value_or(0) == 3 &&
+                                .value_or(0) == 2 &&
                         equals(
                             target.readyOrder(40),
-                            {2, 1});
+                            {3, 1});
                     targetHooks.eventOrder.push_back(4);
                     const auto wakeTarget =
                         target.threadHandle(4);
@@ -1291,19 +1291,60 @@ void register_ee_thread_scheduler_tests()
                 consequenceObservedTransition &&
                     equals(
                         hooks.publishedThreads,
-                        {3, 4}) &&
+                        {2, 4}) &&
                     hooks.eventOrder ==
                         std::vector<int>({1, 2, 3, 4, 2}),
                 "commit and the transition-selected context must precede the external consequence");
             t.IsTrue(
                 equals(
                     scheduler.readyOrder(40),
-                    {2, 1, 3}) &&
+                    {3, 1, 2}) &&
                     executor.statistics()
                             .ownerLocalTransitionsApplied ==
                         1u &&
                     scheduler.validate(),
                 "the direct transition should reschedule exactly once before the higher-priority wake");
+
+            EeThreadScheduler namedQueueScheduler;
+            EeSchedulerExecutor namedQueueExecutor;
+            ScriptedBoundaryHooks namedQueueHooks;
+            t.IsTrue(
+                namedQueueScheduler.addRunningThread(
+                    1, 1u, 40) &&
+                    namedQueueScheduler.addDormantThread(
+                        2, 1u, 50) &&
+                    namedQueueScheduler.startThread(2) &&
+                    namedQueueScheduler.addDormantThread(
+                        3, 1u, 50) &&
+                    namedQueueScheduler.startThread(3),
+                "the non-current-priority fixture should retain two READY peers in one named queue");
+            EeSchedulerOwnerLocalTransition namedQueue =
+                transition;
+            namedQueue.priority = 50;
+            const EeSchedulerBoundaryResult namedResult =
+                namedQueueExecutor.processBoundary(
+                    namedQueueScheduler,
+                    namedQueueHooks,
+                    EeSchedulerBoundaryInput{
+                        1,
+                        ps2x::timing::
+                            eeTickDeltaFromRaw(1u),
+                        EeSchedulerReschedulePolicy::None,
+                        namedQueue,
+                    });
+            t.IsTrue(
+                namedResult.selectedThreadId.value_or(0) ==
+                        1 &&
+                    namedResult.ownerLocalTransitionsApplied ==
+                        1u &&
+                    equals(
+                        namedQueueScheduler.readyOrder(50),
+                        {3, 2}) &&
+                    equals(
+                        namedQueueHooks.publishedThreads,
+                        {1}) &&
+                    namedQueueScheduler.validate(),
+                "a non-current-priority transition should rotate only its named READY queue without preempting the runner");
 
             EeThreadScheduler rejectedScheduler;
             EeSchedulerExecutor rejectedExecutor;

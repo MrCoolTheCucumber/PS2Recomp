@@ -78,7 +78,23 @@ namespace ps2x::ee
         {
         case EeSchedulerOwnerLocalTransitionKind::
             RotateReadyQueue:
-            if (!scheduler.rotateReadyQueue(
+        {
+            const auto origin =
+                scheduler.thread(
+                    transition.originatingThread.id);
+            if (!origin.has_value() ||
+                origin->generation !=
+                    transition.originatingThread
+                        .generation)
+            {
+                throw std::logic_error(
+                    "an owner-local ready-queue rotation "
+                    "lost its originating thread");
+            }
+            const bool currentPriority =
+                origin->priority == transition.priority;
+            if (!currentPriority &&
+                !scheduler.rotateReadyQueue(
                     transition.priority))
             {
                 throw std::logic_error(
@@ -86,6 +102,7 @@ namespace ps2x::ee
                     "violated a scheduler invariant");
             }
             break;
+        }
         case EeSchedulerOwnerLocalTransitionKind::None:
             throw std::logic_error(
                 "an empty owner-local transition cannot be "
