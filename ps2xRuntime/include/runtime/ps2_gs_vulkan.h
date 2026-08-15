@@ -209,6 +209,105 @@ struct GsVulkanServiceConfig
     uint64_t fenceTimeoutNanoseconds = 30'000'000'000ull;
 };
 
+enum class GsVulkanRequestKind : uint8_t
+{
+    RoundTrip,
+    MemoryCases,
+    Ct32Sprite,
+    DepthCt32Sprite,
+    NearestCt32Sprite,
+    LinearCt32Sprite,
+    FeedbackLinearDepthCt32Sprite,
+    Ct32Triangle,
+    GouraudDepthCt32Triangle,
+    T8GouraudDepthCt32Triangle,
+    UploadPages,
+    DownloadPages,
+    DownloadFeedbackSnapshot,
+    ResidentCt32Sprites,
+    ResidentDepthCt32Sprites,
+    ResidentFeedbackLinearDepthCt32Sprites,
+    ResidentNearestCt32Sprites,
+    ResidentLinearCt32Sprites,
+    ResidentCt32Triangles,
+    ResidentGouraudDepthCt32Triangles,
+    ResidentT8GouraudDepthCt32Triangles,
+    ResidentFeedbackNearestDepthCt32Triangles,
+    Count,
+};
+
+inline constexpr size_t GS_VULKAN_REQUEST_KIND_COUNT =
+    static_cast<size_t>(GsVulkanRequestKind::Count);
+
+constexpr size_t gsVulkanRequestKindIndex(
+    GsVulkanRequestKind kind) noexcept
+{
+    return static_cast<size_t>(kind);
+}
+
+constexpr std::string_view gsVulkanRequestKindName(
+    GsVulkanRequestKind kind) noexcept
+{
+    switch (kind)
+    {
+    case GsVulkanRequestKind::RoundTrip:
+        return "round-trip";
+    case GsVulkanRequestKind::MemoryCases:
+        return "memory-cases";
+    case GsVulkanRequestKind::Ct32Sprite:
+        return "ct32-sprite";
+    case GsVulkanRequestKind::DepthCt32Sprite:
+        return "depth-ct32-sprite";
+    case GsVulkanRequestKind::NearestCt32Sprite:
+        return "nearest-ct32-sprite";
+    case GsVulkanRequestKind::LinearCt32Sprite:
+        return "linear-ct32-sprite";
+    case GsVulkanRequestKind::FeedbackLinearDepthCt32Sprite:
+        return "feedback-linear-depth-ct32-sprite";
+    case GsVulkanRequestKind::Ct32Triangle:
+        return "ct32-triangle";
+    case GsVulkanRequestKind::GouraudDepthCt32Triangle:
+        return "gouraud-depth-ct32-triangle";
+    case GsVulkanRequestKind::T8GouraudDepthCt32Triangle:
+        return "t8-gouraud-depth-ct32-triangle";
+    case GsVulkanRequestKind::UploadPages:
+        return "page-upload";
+    case GsVulkanRequestKind::DownloadPages:
+        return "page-download";
+    case GsVulkanRequestKind::DownloadFeedbackSnapshot:
+        return "feedback-snapshot-download";
+    case GsVulkanRequestKind::ResidentCt32Sprites:
+        return "resident-ct32-sprites";
+    case GsVulkanRequestKind::ResidentDepthCt32Sprites:
+        return "resident-depth-ct32-sprites";
+    case GsVulkanRequestKind::ResidentFeedbackLinearDepthCt32Sprites:
+        return "resident-feedback-linear-depth-ct32-sprites";
+    case GsVulkanRequestKind::ResidentNearestCt32Sprites:
+        return "resident-nearest-ct32-sprites";
+    case GsVulkanRequestKind::ResidentLinearCt32Sprites:
+        return "resident-linear-ct32-sprites";
+    case GsVulkanRequestKind::ResidentCt32Triangles:
+        return "resident-ct32-triangles";
+    case GsVulkanRequestKind::ResidentGouraudDepthCt32Triangles:
+        return "resident-gouraud-depth-ct32-triangles";
+    case GsVulkanRequestKind::ResidentT8GouraudDepthCt32Triangles:
+        return "resident-t8-gouraud-depth-ct32-triangles";
+    case GsVulkanRequestKind::ResidentFeedbackNearestDepthCt32Triangles:
+        return "resident-feedback-nearest-depth-ct32-triangles";
+    case GsVulkanRequestKind::Count:
+        break;
+    }
+    return "unknown";
+}
+
+struct GsVulkanRequestStatistics
+{
+    uint64_t requestWaits = 0u;
+    uint64_t requestWaitNanoseconds = 0u;
+    uint64_t fenceWaits = 0u;
+    uint64_t fenceWaitNanoseconds = 0u;
+};
+
 struct GsVulkanServiceStatistics
 {
     uint64_t roundTripsCompleted = 0u;
@@ -219,6 +318,9 @@ struct GsVulkanServiceStatistics
     uint64_t requestWaits = 0u;
     uint64_t requestWaitNanoseconds = 0u;
     uint64_t maximumRequestWaitNanoseconds = 0u;
+    std::array<
+        GsVulkanRequestStatistics,
+        GS_VULKAN_REQUEST_KIND_COUNT> requestsByKind{};
     uint64_t queueSubmissions = 0u;
     uint64_t shaderDispatches = 0u;
     uint64_t pipelineBarriers = 0u;

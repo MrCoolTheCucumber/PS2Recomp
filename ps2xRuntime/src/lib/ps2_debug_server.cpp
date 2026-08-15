@@ -1184,6 +1184,41 @@ struct PS2DebugServer::Impl
             serviceValue.AddMember(
                 "maximum_request_wait_ns",
                 service.maximumRequestWaitNanoseconds, allocator);
+            Value requestsByKindValue(rapidjson::kObjectType);
+            static_assert(
+                GS_VULKAN_REQUEST_KIND_COUNT ==
+                std::tuple_size_v<
+                    decltype(service.requestsByKind)>);
+            for (size_t index = 0u;
+                 index < service.requestsByKind.size(); ++index)
+            {
+                const GsVulkanRequestStatistics &request =
+                    service.requestsByKind[index];
+                Value requestValue(rapidjson::kObjectType);
+                requestValue.AddMember(
+                    "request_waits", request.requestWaits,
+                    allocator);
+                requestValue.AddMember(
+                    "request_wait_ns",
+                    request.requestWaitNanoseconds,
+                    allocator);
+                requestValue.AddMember(
+                    "fence_waits", request.fenceWaits,
+                    allocator);
+                requestValue.AddMember(
+                    "fence_wait_ns",
+                    request.fenceWaitNanoseconds,
+                    allocator);
+                Value requestName = makeString(
+                    gsVulkanRequestKindName(
+                        static_cast<GsVulkanRequestKind>(index)),
+                    allocator);
+                requestsByKindValue.AddMember(
+                    requestName, requestValue, allocator);
+            }
+            serviceValue.AddMember(
+                "requests_by_kind", requestsByKindValue,
+                allocator);
             serviceValue.AddMember(
                 "queue_submissions",
                 service.queueSubmissions, allocator);

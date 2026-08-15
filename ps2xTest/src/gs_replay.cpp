@@ -396,7 +396,29 @@ namespace
                << statistics.requestWaitNanoseconds
                << ",\"maximum_request_wait_nanoseconds\":"
                << statistics.maximumRequestWaitNanoseconds
-               << ",\"queue_submissions\":"
+               << ",\"requests_by_kind\":{";
+        for (size_t index = 0u;
+             index < statistics.requestsByKind.size(); ++index)
+        {
+            if (index != 0u)
+                output << ',';
+            writeJsonString(
+                output,
+                gsVulkanRequestKindName(
+                    static_cast<GsVulkanRequestKind>(index)));
+            const GsVulkanRequestStatistics &request =
+                statistics.requestsByKind[index];
+            output << ":{\"request_waits\":"
+                   << request.requestWaits
+                   << ",\"request_wait_nanoseconds\":"
+                   << request.requestWaitNanoseconds
+                   << ",\"fence_waits\":"
+                   << request.fenceWaits
+                   << ",\"fence_wait_nanoseconds\":"
+                   << request.fenceWaitNanoseconds
+                   << '}';
+        }
+        output << "},\"queue_submissions\":"
                << statistics.queueSubmissions
                << ",\"shader_dispatches\":"
                << statistics.shaderDispatches

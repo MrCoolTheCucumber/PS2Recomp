@@ -17327,6 +17327,36 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(statistics.requestWaitNanoseconds > 0u &&
                          statistics.maximumRequestWaitNanoseconds > 0u,
                      "service coordination time should remain observable");
+            const GsVulkanRequestStatistics &roundTripStatistics =
+                statistics.requestsByKind[
+                    gsVulkanRequestKindIndex(
+                        GsVulkanRequestKind::RoundTrip)];
+            t.Equals(roundTripStatistics.requestWaits, 6ull,
+                     "the accepted waits should be attributed to round trips");
+            t.Equals(
+                roundTripStatistics.requestWaitNanoseconds,
+                statistics.requestWaitNanoseconds,
+                "per-kind posting time should reconcile with the aggregate");
+            t.Equals(roundTripStatistics.fenceWaits, 6ull,
+                     "the accepted fences should be attributed to round trips");
+            t.Equals(
+                roundTripStatistics.fenceWaitNanoseconds,
+                statistics.fenceWaitNanoseconds,
+                "per-kind fence time should reconcile with the aggregate");
+            for (size_t index = 1u;
+                 index < statistics.requestsByKind.size(); ++index)
+            {
+                const GsVulkanRequestStatistics &unused =
+                    statistics.requestsByKind[index];
+                t.Equals(unused.requestWaits, 0ull,
+                         "unused request kinds should not inherit posting waits");
+                t.Equals(unused.requestWaitNanoseconds, 0ull,
+                         "unused request kinds should not inherit posting time");
+                t.Equals(unused.fenceWaits, 0ull,
+                         "unused request kinds should not inherit fence waits");
+                t.Equals(unused.fenceWaitNanoseconds, 0ull,
+                         "unused request kinds should not inherit fence time");
+            }
             t.Equals(statistics.queueSubmissions, 6ull,
                      "each request should use one bounded queue submission");
             t.Equals(statistics.shaderDispatches, 6ull,

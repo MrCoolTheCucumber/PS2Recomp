@@ -8463,32 +8463,6 @@ namespace
 #endif
 
 #if PS2X_HAS_GS_VULKAN
-enum class GsVulkanRequestKind : uint8_t
-{
-    RoundTrip,
-    MemoryCases,
-    Ct32Sprite,
-    DepthCt32Sprite,
-    NearestCt32Sprite,
-    LinearCt32Sprite,
-    FeedbackLinearDepthCt32Sprite,
-    Ct32Triangle,
-    GouraudDepthCt32Triangle,
-    T8GouraudDepthCt32Triangle,
-    UploadPages,
-    DownloadPages,
-    DownloadFeedbackSnapshot,
-    ResidentCt32Sprites,
-    ResidentDepthCt32Sprites,
-    ResidentFeedbackLinearDepthCt32Sprites,
-    ResidentNearestCt32Sprites,
-    ResidentLinearCt32Sprites,
-    ResidentCt32Triangles,
-    ResidentGouraudDepthCt32Triangles,
-    ResidentT8GouraudDepthCt32Triangles,
-    ResidentFeedbackNearestDepthCt32Triangles,
-};
-
 struct GsVulkanService::Impl final
 {
     explicit Impl(const GsVulkanServiceConfig &serviceConfig)
@@ -8819,6 +8793,10 @@ struct GsVulkanService::Impl final
             std::vector<GsVulkanMemoryResult> memoryResults;
             std::string operationError;
             bool succeeded = false;
+            const uint64_t fenceWaitsBefore =
+                localStatistics.fenceWaits;
+            const uint64_t fenceWaitNanosecondsBefore =
+                localStatistics.fenceWaitNanoseconds;
             if (kind == GsVulkanRequestKind::MemoryCases)
             {
                 succeeded = context.executeMemoryCases(
@@ -9492,6 +9470,14 @@ struct GsVulkanService::Impl final
             {
                 ++localStatistics.roundTripsFailed;
             }
+            GsVulkanRequestStatistics &requestStatistics =
+                localStatistics.requestsByKind[
+                    gsVulkanRequestKindIndex(kind)];
+            requestStatistics.fenceWaits +=
+                localStatistics.fenceWaits - fenceWaitsBefore;
+            requestStatistics.fenceWaitNanoseconds +=
+                localStatistics.fenceWaitNanoseconds -
+                fenceWaitNanosecondsBefore;
             context.refreshDiagnostics(
                 localCapabilities, localStatistics);
 
@@ -9693,6 +9679,12 @@ struct GsVulkanService::Impl final
         requestWaits.fetch_add(1u, std::memory_order_relaxed);
         requestWaitTotalNanoseconds.fetch_add(
             requestWaitNanoseconds, std::memory_order_relaxed);
+        const size_t requestKindIndex =
+            gsVulkanRequestKindIndex(kind);
+        requestWaitsByKind[requestKindIndex].fetch_add(
+            1u, std::memory_order_relaxed);
+        requestWaitNanosecondsByKind[requestKindIndex].fetch_add(
+            requestWaitNanoseconds, std::memory_order_relaxed);
         uint64_t maximumWait =
             maximumRequestWaitNanoseconds.load(
                 std::memory_order_relaxed);
@@ -9811,6 +9803,12 @@ struct GsVulkanService::Impl final
     std::atomic<uint64_t> requestWaits{0u};
     std::atomic<uint64_t> requestWaitTotalNanoseconds{0u};
     std::atomic<uint64_t> maximumRequestWaitNanoseconds{0u};
+    std::array<
+        std::atomic<uint64_t>,
+        GS_VULKAN_REQUEST_KIND_COUNT> requestWaitsByKind{};
+    std::array<
+        std::atomic<uint64_t>,
+        GS_VULKAN_REQUEST_KIND_COUNT> requestWaitNanosecondsByKind{};
     // Classification only needs a current fail-fast signal. Request posting
     // still rechecks the mutex-protected lifecycle state, so publishing this
     // mirror removes a per-draw mutex without weakening execution safety.
@@ -11123,6 +11121,16 @@ GsVulkanServiceStatistics GsVulkanService::statistics() const
     statistics.maximumRequestWaitNanoseconds =
         m_impl->maximumRequestWaitNanoseconds.load(
             std::memory_order_relaxed);
+    for (size_t index = 0u;
+         index < GS_VULKAN_REQUEST_KIND_COUNT; ++index)
+    {
+        statistics.requestsByKind[index].requestWaits =
+            m_impl->requestWaitsByKind[index].load(
+                std::memory_order_relaxed);
+        statistics.requestsByKind[index].requestWaitNanoseconds =
+            m_impl->requestWaitNanosecondsByKind[index].load(
+                std::memory_order_relaxed);
+    }
     return statistics;
 #endif
 }
