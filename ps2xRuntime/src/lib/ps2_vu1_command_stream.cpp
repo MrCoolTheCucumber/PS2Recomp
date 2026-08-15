@@ -9,6 +9,7 @@
 #include <cstring>
 #include <deque>
 #include <immintrin.h>
+#include <iterator>
 #include <limits>
 #include <smmintrin.h>
 #include <stdexcept>
@@ -323,7 +324,8 @@ namespace
                 else if constexpr (
                     std::is_same_v<T, Vu1MscalCommand> ||
                     std::is_same_v<T, Vu1MscalfCommand> ||
-                    std::is_same_v<T, Vu1MscntCommand>)
+                    std::is_same_v<T, Vu1MscntCommand> ||
+                    std::is_same_v<T, Vu1InvocationCommand>)
                 {
                     return value.unpacksBefore
                         ? value.unpacksBefore->commands.size()
@@ -858,14 +860,24 @@ namespace
                 else if constexpr (
                     std::is_same_v<T, Vu1MscalCommand> ||
                     std::is_same_v<T, Vu1MscalfCommand> ||
-                    std::is_same_v<T, Vu1MscntCommand>)
+                    std::is_same_v<T, Vu1MscntCommand> ||
+                    std::is_same_v<T, Vu1InvocationCommand>)
                 {
-                    return !value.unpacksBefore ||
-                           (!value.unpacksBefore->commands.empty() &&
-                            std::all_of(
-                                value.unpacksBefore->commands.begin(),
-                                value.unpacksBefore->commands.end(),
-                                validDecodedUnpackPayload));
+                    const bool validUnpacks =
+                        !value.unpacksBefore ||
+                        (!value.unpacksBefore->commands.empty() &&
+                         std::all_of(
+                             value.unpacksBefore->commands.begin(),
+                             value.unpacksBefore->commands.end(),
+                             validDecodedUnpackPayload));
+                    if constexpr (
+                        std::is_same_v<T, Vu1InvocationCommand>)
+                    {
+                        return validUnpacks &&
+                               value.maximumCycles != 0u &&
+                               value.maximumPath1Bytes != 0u;
+                    }
+                    return validUnpacks;
                 }
                 else if constexpr (
                     std::is_same_v<T, Vu1AdvanceSliceCommand>)
@@ -922,6 +934,8 @@ const char *vu1CommandTypeName(Vu1CommandType type) noexcept
         return "mscalf";
     case Vu1CommandType::Mscnt:
         return "mscnt";
+    case Vu1CommandType::Invocation:
+        return "invocation";
     case Vu1CommandType::AdvanceSlice:
         return "advance-slice";
     case Vu1CommandType::Reset:
@@ -969,6 +983,8 @@ Vu1CommandType vu1CommandType(
                 return Vu1CommandType::Mscalf;
             else if constexpr (std::is_same_v<T, Vu1MscntCommand>)
                 return Vu1CommandType::Mscnt;
+            else if constexpr (std::is_same_v<T, Vu1InvocationCommand>)
+                return Vu1CommandType::Invocation;
             else if constexpr (std::is_same_v<T, Vu1AdvanceSliceCommand>)
                 return Vu1CommandType::AdvanceSlice;
             else if constexpr (std::is_same_v<T, Vu1ResetCommand>)
@@ -1052,6 +1068,20 @@ uint64_t vu1CommandPayloadSize(
             else if constexpr (std::is_same_v<T, Vu1MscntCommand>)
             {
                 return 2u * sizeof(uint32_t) +
+                       (value.unpacksBefore
+                            ? decodedUnpackBatchPayloadSize(
+                                  *value.unpacksBefore)
+                            : 0u) +
+                       (value.vifStateBefore
+                            ? 12u * sizeof(uint32_t)
+                            : 0u);
+            }
+            else if constexpr (
+                std::is_same_v<T, Vu1InvocationCommand>)
+            {
+                return sizeof(uint8_t) +
+                       4u * sizeof(uint32_t) +
+                       sizeof(uint64_t) + sizeof(bool) +
                        (value.unpacksBefore
                             ? decodedUnpackBatchPayloadSize(
                                   *value.unpacksBefore)
@@ -1188,6 +1218,31 @@ uint64_t vu1CommandPayloadHash(
             {
                 hashScalar(hash, value.top);
                 hashScalar(hash, value.itop);
+                if (value.unpacksBefore)
+                {
+                    hashScalar(
+                        hash,
+                        static_cast<uint64_t>(
+                            value.unpacksBefore->commands.size()));
+                    for (const Vu1DecodedUnpackCommand &command :
+                         value.unpacksBefore->commands)
+                    {
+                        hashDecodedUnpack(hash, command);
+                    }
+                }
+                if (value.vifStateBefore)
+                    hashVifState(hash, *value.vifStateBefore);
+            }
+            else if constexpr (
+                std::is_same_v<T, Vu1InvocationCommand>)
+            {
+                hashScalar(hash, value.kind);
+                hashScalar(hash, value.startPc);
+                hashScalar(hash, value.top);
+                hashScalar(hash, value.itop);
+                hashScalar(hash, value.maximumCycles);
+                hashScalar(hash, value.maximumPath1Bytes);
+                hashScalar(hash, value.captureState);
                 if (value.unpacksBefore)
                 {
                     hashScalar(
@@ -1756,6 +1811,104 @@ Vu1SliceResult Vu1CommandProcessor::advanceSlice(
     return slice;
 }
 
+Vu1SliceResult Vu1CommandProcessor::runInvocation(
+    const Vu1InvocationCommand &command)
+{
+    constexpr uint32_t kMaximumInvocationSegments = 4096u;
+
+    Vu1SliceResult invocation{};
+    invocation.run.requestedCycles = command.maximumCycles;
+    invocation.run.activeBefore = m_unit.isActive();
+    uint64_t path1Bytes = 0u;
+    uint32_t segments = 0u;
+
+    while (m_unit.isActive() &&
+           invocation.run.executedCycles < command.maximumCycles)
+    {
+        if (++segments > kMaximumInvocationSegments)
+        {
+            invocation.run.reason = VuExitReason::Fault;
+            invocation.fault = std::make_unique<std::string>(
+                "VU1 invocation exceeded its segment bound");
+            break;
+        }
+
+        const uint32_t cyclesBefore =
+            invocation.run.executedCycles;
+        Vu1SliceResult segment = advanceSlice(
+            Vu1AdvanceSliceCommand{
+                .maximumCycles =
+                    command.maximumCycles - cyclesBefore,
+            });
+        if (segment.run.executedCycles >
+            command.maximumCycles - cyclesBefore)
+        {
+            throw std::logic_error(
+                "VU1 invocation exceeded its cycle budget");
+        }
+        invocation.run.executedCycles +=
+            segment.run.executedCycles;
+        invocation.run.reason = segment.run.reason;
+
+        for (Vu1Path1Packet &packet : segment.path1Packets)
+        {
+            const uint32_t segmentCycleOffset =
+                packet.cycleOffset.value_or(
+                    segment.run.executedCycles);
+            if (segmentCycleOffset >
+                segment.run.executedCycles)
+            {
+                invocation.run.reason = VuExitReason::Fault;
+                invocation.fault =
+                    std::make_unique<std::string>(
+                        "VU1 invocation received an invalid PATH1 cycle offset");
+                break;
+            }
+            if (packet.bytes.size() >
+                command.maximumPath1Bytes - path1Bytes)
+            {
+                invocation.run.reason = VuExitReason::Fault;
+                invocation.fault =
+                    std::make_unique<std::string>(
+                        "VU1 invocation exceeded its PATH1 byte bound");
+                break;
+            }
+            path1Bytes += packet.bytes.size();
+            packet.cycleOffset =
+                cyclesBefore + segmentCycleOffset;
+            invocation.path1Packets.push_back(
+                std::move(packet));
+        }
+        if (invocation.fault)
+            break;
+        if (segment.fault)
+        {
+            invocation.fault = std::move(segment.fault);
+            break;
+        }
+        if (!m_unit.isActive())
+            break;
+        if (segment.run.executedCycles == 0u)
+        {
+            invocation.run.reason = VuExitReason::Fault;
+            invocation.fault = std::make_unique<std::string>(
+                "VU1 invocation made no forward progress");
+            break;
+        }
+    }
+
+    invocation.run.activeAfter = m_unit.isActive();
+    invocation.run.completed = !m_unit.isActive();
+    invocation.vifCanResume = !m_unit.isActive();
+    if (command.captureState)
+    {
+        invocation.state =
+            std::make_unique<VuExecutionState>(m_unit.state());
+    }
+    invocation.architecturalStateHash = stateHash();
+    return invocation;
+}
+
 Vu1CommandResultPayload Vu1CommandProcessor::apply(
     Vu1CommandPayload &payload,
     Vu1CommandDisposition &disposition)
@@ -1991,6 +2144,39 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
                         ? m_diagnosticsObserver
                         : this);
                 return Vu1NoResult{};
+            }
+            else if constexpr (
+                std::is_same_v<T, Vu1InvocationCommand>)
+            {
+                if (value.unpacksBefore &&
+                    !applyVu1DecodedUnpackBatchImpl(
+                        *value.unpacksBefore, m_vifState,
+                        m_dataMemory, m_dataMemorySize))
+                {
+                    disposition = Vu1CommandDisposition::Malformed;
+                    return Vu1NoResult{};
+                }
+                if (value.vifStateBefore)
+                    m_vifState = *value.vifStateBefore;
+
+                IVuExecutionObserver *const observer =
+                    m_diagnosticsObserver
+                        ? m_diagnosticsObserver
+                        : this;
+                switch (value.kind)
+                {
+                case Vu1InvocationKind::Mscal:
+                case Vu1InvocationKind::Mscalf:
+                    m_unit.start(
+                        value.startPc, value.top,
+                        value.itop, observer);
+                    break;
+                case Vu1InvocationKind::Mscnt:
+                    m_unit.resumeState(
+                        value.top, value.itop, observer);
+                    break;
+                }
+                return runInvocation(value);
             }
             else if constexpr (std::is_same_v<T, Vu1AdvanceSliceCommand>)
             {

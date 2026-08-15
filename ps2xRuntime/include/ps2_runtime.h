@@ -101,6 +101,17 @@ struct PS2RuntimeConfiguration
     // epochs for threaded-async execution.
     bool vu1CheckpointEpochs = false;
     size_t vu1CheckpointCapacity = 4u;
+    // The coarse mode is a separately selected timing experiment. It owns a
+    // whole activation on the VU thread and publishes at a deterministic
+    // guest-cycle estimate; none of these bounds affect exact modes.
+    uint32_t vu1CoarseInitialEstimateCycles = 16u;
+    uint32_t vu1CoarseMinimumEstimateCycles = 4u;
+    uint32_t vu1CoarseMaximumLeadCycles = 65536u;
+    uint32_t vu1CoarseMaximumInvocationCycles = 65536u;
+    uint64_t vu1CoarseMaximumPath1Bytes =
+        64u * 1024u * 1024u;
+    size_t vu1CoarseEstimatorHistoryCapacity = 4u;
+    size_t vu1CoarseEstimatorIdentityCapacity = 64u;
     std::function<void(const Vu1Command &, uint64_t)>
         vu1BeforeProcess;
     std::function<void(const Vu1CommandResult &, uint64_t)>
@@ -164,6 +175,51 @@ struct Vu1AsyncRuntimeStatistics
     uint64_t sliceSubmitCount = 0u;
     uint64_t sliceSubmitNanoseconds = 0u;
     uint64_t maximumSliceSubmitNanoseconds = 0u;
+    ThreadedVu1ExecutorStatistics owner{};
+};
+
+struct Vu1CoarseRuntimeStatistics
+{
+    bool enabled = false;
+    bool pendingInvocation = false;
+    uint32_t initialEstimateCycles = 0u;
+    uint32_t minimumEstimateCycles = 0u;
+    uint32_t maximumLeadCycles = 0u;
+    uint32_t maximumInvocationCycles = 0u;
+    uint64_t maximumPath1Bytes = 0u;
+    size_t estimatorHistoryCapacity = 0u;
+    size_t estimatorHistorySize = 0u;
+    size_t estimatorHistoryHighWater = 0u;
+    size_t estimatorIdentityCapacity = 0u;
+    size_t estimatorIdentitySize = 0u;
+    size_t estimatorIdentityHighWater = 0u;
+    uint64_t estimatorIdentityHitCount = 0u;
+    uint64_t estimatorIdentityMissCount = 0u;
+    size_t pendingInvocationHighWater = 0u;
+    uint64_t invocationsSubmitted = 0u;
+    uint64_t invocationsCompleted = 0u;
+    uint64_t invocationsPublished = 0u;
+    uint64_t resultsReadyAtEvent = 0u;
+    uint64_t resultsLateAtEvent = 0u;
+    uint64_t earlyEstimateCount = 0u;
+    uint64_t exactEstimateCount = 0u;
+    uint64_t lateEstimateCount = 0u;
+    uint64_t estimatedCycleSum = 0u;
+    uint64_t actualCycleSum = 0u;
+    uint64_t absoluteErrorCycleSum = 0u;
+    uint64_t maximumAbsoluteErrorCycles = 0u;
+    uint64_t forcedBarrierCount = 0u;
+    uint64_t forcedWaitCount = 0u;
+    uint64_t forcedWaitNanoseconds = 0u;
+    uint64_t maximumForcedWaitNanoseconds = 0u;
+    uint64_t path1BytesPublished = 0u;
+    uint64_t maximumInvocationPath1Bytes = 0u;
+    uint32_t lastEstimatedCycles = 0u;
+    uint32_t lastActualCycles = 0u;
+    int64_t lastEstimateErrorCycles = 0;
+    uint64_t estimatorInputDigest = 0u;
+    uint64_t estimatorOutputDigest = 0u;
+    uint64_t estimatorResultDigest = 0u;
     ThreadedVu1ExecutorStatistics owner{};
 };
 
@@ -800,6 +856,8 @@ public:
     vu1OwnerStatistics() const;
     [[nodiscard]] Vu1AsyncRuntimeStatistics
     vu1AsyncStatistics() const;
+    [[nodiscard]] Vu1CoarseRuntimeStatistics
+    vu1CoarseStatistics() const;
     [[nodiscard]] std::shared_ptr<const Vu1Snapshot>
     snapshotVu1Owner();
     [[nodiscard]] VuProgressSnapshot
@@ -2470,6 +2528,7 @@ private:
         Vu1SpeculationResolution resolution =
             Vu1SpeculationResolution::None;
         std::optional<Vu1PendingSlicePlan> requeue;
+        bool coarseInvocationCompleted = false;
     };
     enum class Vu1SpeculationPublicationState : uint8_t
     {
@@ -2504,6 +2563,34 @@ private:
         const ps2x::timing::EeEventService &service,
         uint32_t cycleBudget);
     void resolveVu1SpeculationForShutdown() noexcept;
+    struct Vu1CoarseEstimatorIdentity
+    {
+        Vu1InvocationKind kind = Vu1InvocationKind::Mscal;
+        uint32_t startPc = 0u;
+        uint32_t top = 0u;
+        uint32_t itop = 0u;
+        uint64_t codeGeneration = 0u;
+
+        bool operator==(
+            const Vu1CoarseEstimatorIdentity &) const = default;
+    };
+    struct Vu1CoarseEstimatorEntry
+    {
+        Vu1CoarseEstimatorIdentity identity{};
+        std::deque<uint32_t> cycleHistory;
+    };
+    [[nodiscard]] Vu1CoarseEstimatorIdentity
+    vu1CoarseEstimatorIdentity(
+        const Vu1InvocationCommand &command) const;
+    [[nodiscard]] uint32_t estimateVu1CoarseCycles(
+        const Vu1CoarseEstimatorIdentity &identity);
+    void submitVu1CoarseInvocation(
+        Vu1InvocationCommand command,
+        ps2x::timing::EeTick startTick);
+    void completeVu1CoarseInvocation(
+        ps2x::timing::EeTick publicationTick,
+        bool schedulerEvent);
+    void resolveVu1CoarseInvocationForShutdown() noexcept;
     [[nodiscard]] Vu1CommandResult submitVu1Command(
         Vu1CommandPayload payload,
         uint64_t guestTick = 0u,
@@ -2775,6 +2862,14 @@ private:
     size_t m_vu1CheckpointCapacity = 4u;
     uint64_t m_vu1CommandPayloadCapacityBytes =
         8u * 1024u * 1024u;
+    uint32_t m_vu1CoarseInitialEstimateCycles = 16u;
+    uint32_t m_vu1CoarseMinimumEstimateCycles = 4u;
+    uint32_t m_vu1CoarseMaximumLeadCycles = 65536u;
+    uint32_t m_vu1CoarseMaximumInvocationCycles = 65536u;
+    uint64_t m_vu1CoarseMaximumPath1Bytes =
+        64u * 1024u * 1024u;
+    size_t m_vu1CoarseEstimatorHistoryCapacity = 4u;
+    size_t m_vu1CoarseEstimatorIdentityCapacity = 64u;
     std::atomic<bool> m_publishedVu1Active{false};
     std::atomic<uint32_t> m_publishedVu1ProgramCounter{0u};
     std::atomic<uint64_t> m_publishedVu1CodeGeneration{0u};
@@ -2800,6 +2895,22 @@ private:
     };
     std::optional<Vu1PendingExecutionEpoch>
         m_pendingVu1ExecutionEpoch;
+    struct Vu1PendingCoarseInvocation
+    {
+        Vu1CommandSubmission submission;
+        Vu1CoarseEstimatorIdentity estimatorIdentity{};
+        uint32_t estimatedCycles = 0u;
+        uint64_t estimatorInputHash = 0u;
+        ps2x::timing::EeTick startTick{};
+        ps2x::timing::EeTick deadline{};
+        uint64_t eventGeneration = 0u;
+        uint64_t executionGeneration = 0u;
+    };
+    std::optional<Vu1PendingCoarseInvocation>
+        m_pendingVu1CoarseInvocation;
+    std::deque<uint32_t> m_vu1CoarseCycleHistory;
+    std::deque<Vu1CoarseEstimatorEntry>
+        m_vu1CoarseEstimatorEntries;
     std::optional<Vu1PendingSlicePlan>
         m_deferredVu1SlicePlan;
     Vu1SpeculationPublicationState
@@ -2841,6 +2952,38 @@ private:
     std::atomic<uint64_t> m_vu1AsyncSliceSubmitCount{0u};
     std::atomic<uint64_t> m_vu1AsyncSliceSubmitNanoseconds{0u};
     std::atomic<uint64_t> m_vu1AsyncMaximumSliceSubmitNanoseconds{0u};
+    std::atomic<size_t> m_vu1CoarseEstimatorHistorySize{0u};
+    std::atomic<bool> m_vu1CoarsePendingInvocation{false};
+    std::atomic<size_t> m_vu1CoarseEstimatorHistoryHighWater{0u};
+    std::atomic<size_t> m_vu1CoarseEstimatorIdentitySize{0u};
+    std::atomic<size_t> m_vu1CoarseEstimatorIdentityHighWater{0u};
+    std::atomic<uint64_t> m_vu1CoarseEstimatorIdentityHitCount{0u};
+    std::atomic<uint64_t> m_vu1CoarseEstimatorIdentityMissCount{0u};
+    std::atomic<size_t> m_vu1CoarsePendingInvocationHighWater{0u};
+    std::atomic<uint64_t> m_vu1CoarseInvocationsSubmitted{0u};
+    std::atomic<uint64_t> m_vu1CoarseInvocationsCompleted{0u};
+    std::atomic<uint64_t> m_vu1CoarseInvocationsPublished{0u};
+    std::atomic<uint64_t> m_vu1CoarseResultsReadyAtEvent{0u};
+    std::atomic<uint64_t> m_vu1CoarseResultsLateAtEvent{0u};
+    std::atomic<uint64_t> m_vu1CoarseEarlyEstimateCount{0u};
+    std::atomic<uint64_t> m_vu1CoarseExactEstimateCount{0u};
+    std::atomic<uint64_t> m_vu1CoarseLateEstimateCount{0u};
+    std::atomic<uint64_t> m_vu1CoarseEstimatedCycleSum{0u};
+    std::atomic<uint64_t> m_vu1CoarseActualCycleSum{0u};
+    std::atomic<uint64_t> m_vu1CoarseAbsoluteErrorCycleSum{0u};
+    std::atomic<uint64_t> m_vu1CoarseMaximumAbsoluteErrorCycles{0u};
+    std::atomic<uint64_t> m_vu1CoarseForcedBarrierCount{0u};
+    std::atomic<uint64_t> m_vu1CoarseForcedWaitCount{0u};
+    std::atomic<uint64_t> m_vu1CoarseForcedWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_vu1CoarseMaximumForcedWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_vu1CoarsePath1BytesPublished{0u};
+    std::atomic<uint64_t> m_vu1CoarseMaximumInvocationPath1Bytes{0u};
+    std::atomic<uint32_t> m_vu1CoarseLastEstimatedCycles{0u};
+    std::atomic<uint32_t> m_vu1CoarseLastActualCycles{0u};
+    std::atomic<int64_t> m_vu1CoarseLastEstimateErrorCycles{0};
+    std::atomic<uint64_t> m_vu1CoarseEstimatorInputDigest{0u};
+    std::atomic<uint64_t> m_vu1CoarseEstimatorOutputDigest{0u};
+    std::atomic<uint64_t> m_vu1CoarseEstimatorResultDigest{0u};
     ps2x::timing::Cop0Timing m_cop0Timing;
     static constexpr size_t kEeBranchHistoryEntries = 4096u;
     std::array<uint32_t, kEeBranchHistoryEntries>

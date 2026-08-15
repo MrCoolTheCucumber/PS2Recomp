@@ -1538,6 +1538,149 @@ struct PS2DebugServer::Impl
         result.AddMember(
             "vu1_async", vu1AsyncValue, allocator);
 
+        const Vu1CoarseRuntimeStatistics vu1Coarse =
+            runtime.vu1CoarseStatistics();
+        Value vu1CoarseValue(rapidjson::kObjectType);
+        vu1CoarseValue.AddMember(
+            "enabled", vu1Coarse.enabled, allocator);
+        vu1CoarseValue.AddMember(
+            "pending_invocation",
+            vu1Coarse.pendingInvocation, allocator);
+        vu1CoarseValue.AddMember(
+            "initial_estimate_cycles",
+            vu1Coarse.initialEstimateCycles, allocator);
+        vu1CoarseValue.AddMember(
+            "minimum_estimate_cycles",
+            vu1Coarse.minimumEstimateCycles, allocator);
+        vu1CoarseValue.AddMember(
+            "maximum_lead_cycles",
+            vu1Coarse.maximumLeadCycles, allocator);
+        vu1CoarseValue.AddMember(
+            "maximum_invocation_cycles",
+            vu1Coarse.maximumInvocationCycles, allocator);
+        vu1CoarseValue.AddMember(
+            "maximum_path1_bytes",
+            vu1Coarse.maximumPath1Bytes, allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_history_capacity",
+            static_cast<uint64_t>(
+                vu1Coarse.estimatorHistoryCapacity),
+            allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_history_size",
+            static_cast<uint64_t>(
+                vu1Coarse.estimatorHistorySize),
+            allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_history_high_water",
+            static_cast<uint64_t>(
+                vu1Coarse.estimatorHistoryHighWater),
+            allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_identity_capacity",
+            static_cast<uint64_t>(
+                vu1Coarse.estimatorIdentityCapacity),
+            allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_identity_size",
+            static_cast<uint64_t>(
+                vu1Coarse.estimatorIdentitySize),
+            allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_identity_high_water",
+            static_cast<uint64_t>(
+                vu1Coarse.estimatorIdentityHighWater),
+            allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_identity_hit_count",
+            vu1Coarse.estimatorIdentityHitCount,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_identity_miss_count",
+            vu1Coarse.estimatorIdentityMissCount,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "pending_invocation_high_water",
+            static_cast<uint64_t>(
+                vu1Coarse.pendingInvocationHighWater),
+            allocator);
+        vu1CoarseValue.AddMember(
+            "invocations_submitted",
+            vu1Coarse.invocationsSubmitted, allocator);
+        vu1CoarseValue.AddMember(
+            "invocations_completed",
+            vu1Coarse.invocationsCompleted, allocator);
+        vu1CoarseValue.AddMember(
+            "invocations_published",
+            vu1Coarse.invocationsPublished, allocator);
+        vu1CoarseValue.AddMember(
+            "results_ready_at_event",
+            vu1Coarse.resultsReadyAtEvent, allocator);
+        vu1CoarseValue.AddMember(
+            "results_late_at_event",
+            vu1Coarse.resultsLateAtEvent, allocator);
+        vu1CoarseValue.AddMember(
+            "early_estimate_count",
+            vu1Coarse.earlyEstimateCount, allocator);
+        vu1CoarseValue.AddMember(
+            "exact_estimate_count",
+            vu1Coarse.exactEstimateCount, allocator);
+        vu1CoarseValue.AddMember(
+            "late_estimate_count",
+            vu1Coarse.lateEstimateCount, allocator);
+        vu1CoarseValue.AddMember(
+            "estimated_cycle_sum",
+            vu1Coarse.estimatedCycleSum, allocator);
+        vu1CoarseValue.AddMember(
+            "actual_cycle_sum",
+            vu1Coarse.actualCycleSum, allocator);
+        vu1CoarseValue.AddMember(
+            "absolute_error_cycle_sum",
+            vu1Coarse.absoluteErrorCycleSum, allocator);
+        vu1CoarseValue.AddMember(
+            "maximum_absolute_error_cycles",
+            vu1Coarse.maximumAbsoluteErrorCycles, allocator);
+        vu1CoarseValue.AddMember(
+            "forced_barrier_count",
+            vu1Coarse.forcedBarrierCount, allocator);
+        vu1CoarseValue.AddMember(
+            "forced_wait_count",
+            vu1Coarse.forcedWaitCount, allocator);
+        vu1CoarseValue.AddMember(
+            "forced_wait_ns",
+            vu1Coarse.forcedWaitNanoseconds, allocator);
+        vu1CoarseValue.AddMember(
+            "maximum_forced_wait_ns",
+            vu1Coarse.maximumForcedWaitNanoseconds,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "path1_bytes_published",
+            vu1Coarse.path1BytesPublished, allocator);
+        vu1CoarseValue.AddMember(
+            "maximum_invocation_path1_bytes",
+            vu1Coarse.maximumInvocationPath1Bytes,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "last_estimated_cycles",
+            vu1Coarse.lastEstimatedCycles, allocator);
+        vu1CoarseValue.AddMember(
+            "last_actual_cycles",
+            vu1Coarse.lastActualCycles, allocator);
+        vu1CoarseValue.AddMember(
+            "last_estimate_error_cycles",
+            vu1Coarse.lastEstimateErrorCycles, allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_input_digest",
+            vu1Coarse.estimatorInputDigest, allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_output_digest",
+            vu1Coarse.estimatorOutputDigest, allocator);
+        vu1CoarseValue.AddMember(
+            "estimator_result_digest",
+            vu1Coarse.estimatorResultDigest, allocator);
+        result.AddMember(
+            "vu1_coarse", vu1CoarseValue, allocator);
+
         const auto vuBackendStatus =
             [&](VuBackendKind requested,
                 VuBackendKind resolved,

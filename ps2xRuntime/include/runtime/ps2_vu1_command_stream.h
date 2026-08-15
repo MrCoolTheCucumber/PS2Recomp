@@ -49,6 +49,7 @@ enum class Vu1CommandType : uint8_t
     Mscal,
     Mscalf,
     Mscnt,
+    Invocation,
     AdvanceSlice,
     Reset,
     Snapshot,
@@ -203,6 +204,29 @@ struct Vu1MscntCommand
     std::shared_ptr<const Vu1VifState> vifStateBefore;
 };
 
+enum class Vu1InvocationKind : uint8_t
+{
+    Mscal,
+    Mscalf,
+    Mscnt,
+};
+
+// Coarse scheduling keeps one complete VU activation private to the owner.
+// The cycle and PATH1 limits make the relaxed work item explicitly bounded;
+// exact slice commands remain available as the architectural oracle.
+struct Vu1InvocationCommand
+{
+    Vu1InvocationKind kind = Vu1InvocationKind::Mscal;
+    uint32_t startPc = 0u;
+    uint32_t top = 0u;
+    uint32_t itop = 0u;
+    uint32_t maximumCycles = 65536u;
+    uint64_t maximumPath1Bytes = 64u * 1024u * 1024u;
+    bool captureState = false;
+    std::shared_ptr<const Vu1DecodedUnpackBatch> unpacksBefore;
+    std::shared_ptr<const Vu1VifState> vifStateBefore;
+};
+
 struct Vu1AdvanceSliceCommand
 {
     uint32_t maximumCycles = 0u;
@@ -284,6 +308,7 @@ using Vu1CommandPayload = std::variant<
     Vu1MscalCommand,
     Vu1MscalfCommand,
     Vu1MscntCommand,
+    Vu1InvocationCommand,
     Vu1AdvanceSliceCommand,
     Vu1ResetCommand,
     Vu1SnapshotCommand,
@@ -652,6 +677,8 @@ private:
         Vu1CommandDisposition &disposition);
     [[nodiscard]] Vu1SliceResult advanceSlice(
         const Vu1AdvanceSliceCommand &command);
+    [[nodiscard]] Vu1SliceResult runInvocation(
+        const Vu1InvocationCommand &command);
 
     VuUnit &m_unit;
     Vu1CommandProcessorConfiguration m_configuration{};
@@ -687,6 +714,7 @@ enum class Vu1ExecutionMode : uint8_t
     Inline,
     ThreadedSynchronous,
     ThreadedAsync,
+    ThreadedCoarse,
 };
 
 [[nodiscard]] constexpr const char *vu1ExecutionModeName(
@@ -700,6 +728,8 @@ enum class Vu1ExecutionMode : uint8_t
         return "threaded-sync";
     case Vu1ExecutionMode::ThreadedAsync:
         return "threaded-async";
+    case Vu1ExecutionMode::ThreadedCoarse:
+        return "threaded-coarse";
     }
     return "unknown";
 }

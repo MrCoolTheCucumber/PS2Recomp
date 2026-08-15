@@ -153,6 +153,8 @@ namespace
             mode = Vu1ExecutionMode::ThreadedSynchronous;
         else if (text == "threaded-async")
             mode = Vu1ExecutionMode::ThreadedAsync;
+        else if (text == "threaded-coarse")
+            mode = Vu1ExecutionMode::ThreadedCoarse;
         else
             return false;
         return true;
@@ -177,7 +179,7 @@ namespace
             << "Usage: " << program
             << " [--renderer software|hybrid|verify|gpu-strict]"
                " [--gs-execution inline|threaded-sync|threaded-async]"
-               " [--vu1-execution inline|threaded-sync|threaded-async]"
+               " [--vu1-execution inline|threaded-sync|threaded-async|threaded-coarse]"
                " [--vu1-checkpoint-epochs on|off]"
                " [ELF [CD_IMAGE]]\n";
     }
@@ -237,7 +239,7 @@ namespace
                         argv[i], options.vu1ExecutionMode))
                 {
                     throw std::invalid_argument(
-                        "--vu1-execution requires inline, threaded-sync, or threaded-async");
+                        "--vu1-execution requires inline, threaded-sync, threaded-async, or threaded-coarse");
                 }
                 continue;
             }

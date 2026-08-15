@@ -415,6 +415,187 @@ void register_ps2_vu1_command_stream_tests()
                      "an ended slice should publish the VIF resume condition");
         });
 
+        tc.Run("bounded invocation owns complete VU work and PATH1 output", [](TestCase &t)
+        {
+            Fixture fixture;
+            const auto pair = instructionPair(
+                makeVuLowerSpecial(0x6cu, 0u), kVuUpperEnd);
+            fixture.submit(Vu1MicroMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = std::vector<uint8_t>(
+                    pair.begin(), pair.end()),
+            });
+
+            std::vector<uint8_t> packet(32u, 0u);
+            const uint64_t tag =
+                1u | (1ull << 15u) | (2ull << 58u);
+            std::memcpy(packet.data(), &tag, sizeof(tag));
+            for (uint32_t index = 0u; index < 16u; ++index)
+                packet[16u + index] =
+                    static_cast<uint8_t>(0x50u + index);
+            fixture.submit(Vu1DataMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = packet,
+            });
+
+            const Vu1CommandResult result = fixture.submit(
+                Vu1InvocationCommand{
+                    .kind = Vu1InvocationKind::Mscal,
+                    .maximumCycles = 64u,
+                    .maximumPath1Bytes = 1024u,
+                    .captureState = true,
+                });
+            t.IsTrue(
+                result.disposition ==
+                    Vu1CommandDisposition::Completed,
+                "a bounded whole invocation should be accepted");
+            t.IsTrue(
+                result.digest.type == Vu1CommandType::Invocation,
+                "the whole invocation should retain a distinct command type");
+            const Vu1SliceResult *const invocation =
+                sliceResult(result);
+            t.IsTrue(invocation != nullptr,
+                     "a whole invocation should return typed VU output");
+            if (!invocation)
+                return;
+            t.IsFalse(result.active,
+                      "the E-bit invocation should complete in one owner command");
+            t.IsTrue(invocation->run.executedCycles != 0u,
+                     "the invocation should account actual VU cycles");
+            t.IsTrue(invocation->run.completed,
+                     "the invocation run result should report completion");
+            t.Equals(invocation->path1Packets.size(), size_t{1u},
+                     "the invocation should aggregate ordered PATH1 output");
+            if (!invocation->path1Packets.empty())
+            {
+                t.Equals(invocation->path1Packets[0].bytes, packet,
+                         "the invocation should own the complete XGKICK packet");
+                t.IsTrue(
+                    invocation->path1Packets[0].cycleOffset.has_value(),
+                    "coarse output should retain a deterministic cycle offset");
+            }
+            t.IsTrue(static_cast<bool>(invocation->state),
+                     "requested final state should be captured once");
+        });
+
+        tc.Run("bounded invocation rejects excessive PATH1 output", [](TestCase &t)
+        {
+            Fixture fixture;
+            const auto pair = instructionPair(
+                makeVuLowerSpecial(0x6cu, 0u), kVuUpperEnd);
+            fixture.submit(Vu1MicroMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = std::vector<uint8_t>(
+                    pair.begin(), pair.end()),
+            });
+            std::vector<uint8_t> packet(32u, 0u);
+            const uint64_t tag =
+                1u | (1ull << 15u) | (2ull << 58u);
+            std::memcpy(packet.data(), &tag, sizeof(tag));
+            fixture.submit(Vu1DataMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = packet,
+            });
+
+            const Vu1CommandResult result = fixture.submit(
+                Vu1InvocationCommand{
+                    .maximumCycles = 64u,
+                    .maximumPath1Bytes = 16u,
+                });
+            const Vu1SliceResult *const invocation =
+                sliceResult(result);
+            t.IsTrue(invocation != nullptr,
+                     "a bounded failure should remain typed owner output");
+            t.IsTrue(
+                invocation && invocation->fault &&
+                    invocation->run.reason == VuExitReason::Fault,
+                "PATH1 overflow should fail at the explicit owner bound");
+            t.IsTrue(
+                invocation && invocation->path1Packets.empty(),
+                "output beyond the PATH1 limit must not be published");
+        });
+
+        tc.Run("bounded invocation retains PATH1 segment order and cycle offsets", [](TestCase &t)
+        {
+            Fixture fixture;
+            std::vector<uint8_t> program;
+            const auto appendPair =
+                [&program](uint32_t lower, uint32_t upper)
+                {
+                    const auto pair = instructionPair(lower, upper);
+                    program.insert(
+                        program.end(), pair.begin(), pair.end());
+                };
+            appendPair(makeVuIaddiu(1u, 0u, 0), kVuUpperNop);
+            appendPair(
+                makeVuLowerSpecial(0x6cu, 1u), kVuUpperNop);
+            appendPair(makeVuIaddiu(1u, 0u, 4), kVuUpperNop);
+            appendPair(
+                makeVuLowerSpecial(0x6cu, 1u), kVuUpperEnd);
+            appendPair(0u, kVuUpperNop);
+            fixture.submit(Vu1MicroMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = std::move(program),
+            });
+
+            std::vector<uint8_t> data(5u * 16u, 0u);
+            const uint64_t eopImageTag =
+                (1ull << 15u) | (2ull << 58u);
+            const uint64_t firstMarker = 0x1111u;
+            const uint64_t secondMarker = 0x2222u;
+            std::memcpy(data.data(), &eopImageTag, sizeof(eopImageTag));
+            std::memcpy(
+                data.data() + 8u, &firstMarker, sizeof(firstMarker));
+            std::memcpy(
+                data.data() + 4u * 16u,
+                &eopImageTag, sizeof(eopImageTag));
+            std::memcpy(
+                data.data() + 4u * 16u + 8u,
+                &secondMarker, sizeof(secondMarker));
+            const std::vector<uint8_t> firstPacket(
+                data.begin(), data.begin() + 16u);
+            const std::vector<uint8_t> secondPacket(
+                data.begin() + 4u * 16u,
+                data.begin() + 5u * 16u);
+            fixture.submit(Vu1DataMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = std::move(data),
+            });
+
+            const Vu1CommandResult result = fixture.submit(
+                Vu1InvocationCommand{
+                    .kind = Vu1InvocationKind::Mscal,
+                    .maximumCycles = 64u,
+                    .maximumPath1Bytes = 1024u,
+                });
+            const Vu1SliceResult *const invocation =
+                sliceResult(result);
+            t.IsTrue(invocation != nullptr,
+                     "the multi-kick invocation should remain typed");
+            if (!invocation)
+                return;
+            t.Equals(invocation->path1Packets.size(), size_t{2u},
+                     "both XGKICK segments should be aggregated");
+            if (invocation->path1Packets.size() != 2u)
+                return;
+            t.Equals(invocation->path1Packets[0].bytes, firstPacket,
+                     "the first PATH1 packet should retain segment order");
+            t.Equals(invocation->path1Packets[1].bytes, secondPacket,
+                     "the second PATH1 packet should retain segment order");
+            const auto firstOffset =
+                invocation->path1Packets[0].cycleOffset;
+            const auto secondOffset =
+                invocation->path1Packets[1].cycleOffset;
+            t.IsTrue(firstOffset.has_value() && secondOffset.has_value(),
+                     "each packet should retain an invocation cycle offset");
+            if (!firstOffset || !secondOffset)
+                return;
+            t.IsTrue(*firstOffset <= *secondOffset,
+                     "PATH1 cycle offsets should be monotonic");
+            t.IsTrue(*secondOffset <= invocation->run.executedCycles,
+                     "PATH1 offsets must stay within actual invocation work");
+        });
+
         tc.Run("decoded UNPACK owns source bytes and applies VIF state", [](TestCase &t)
         {
             Fixture fixture;
@@ -3970,6 +4151,376 @@ void register_ps2_vu1_command_stream_tests()
                      "the blocked owner should be classified late");
             t.IsTrue(statistics.eventWaitNanoseconds >= 10'000'000ull,
                      "the event should report its forced host wait");
+        });
+
+        tc.Run("runtime coarse mode publishes one invocation at its deterministic estimate", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 4u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.captureVu1ArchitecturalStateHashes = true;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse runtime subsystems should bind");
+
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(1u, 0u, 9),
+                kVuUpperNop);
+            for (uint32_t pair = 1u; pair < 7u; ++pair)
+            {
+                writeRuntimeVu1InstructionPair(
+                    runtime, pair * 8u, 0u,
+                    kVuUpperNop);
+            }
+            writeRuntimeVu1InstructionPair(
+                runtime, 7u * 8u, 0u, kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u * 8u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1CoarseStatistics();
+                        return statistics.pendingInvocation &&
+                               statistics.owner.commandTypes[
+                                   vu1CommandTypeIndex(
+                                       Vu1CommandType::Invocation)]
+                                       .completed == 1u;
+                    }),
+                "the complete invocation should be owner-ready before publication");
+            const PS2Runtime::DebugVu1Timing before =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(before.active,
+                     "private owner completion must retain published Busy");
+            t.IsTrue(before.eventPending,
+                     "coarse completion should retain one scheduler event");
+            t.Equals(before.eventDeadlineTick, uint64_t{128u},
+                     "the empty estimator should use the configured 16-cycle seed");
+            t.Equals(before.totalAdvancedCycles, uint64_t{0u},
+                     "private work must not advance published guest time");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            const Vu1CoarseRuntimeStatistics first =
+                runtime.vu1CoarseStatistics();
+            t.Equals(snapshot->state.vi[1], int32_t{9},
+                     "estimated publication should expose final VU state");
+            t.IsFalse(runtime.debugVu1TimingSnapshot().active,
+                      "a completed invocation should clear Busy at publication");
+            t.Equals(first.invocationsSubmitted, 1ull,
+                     "one MSCAL should submit one coarse owner command");
+            t.Equals(first.invocationsPublished, 1ull,
+                     "one estimated event should publish one invocation");
+            t.Equals(first.estimatorHistorySize, size_t{1u},
+                     "the actual guest-cycle result should enter bounded history");
+            t.Equals(first.lastEstimatedCycles, uint32_t{16u},
+                     "the first invocation should retain its seed estimate");
+            t.IsTrue(first.lastActualCycles < first.lastEstimatedCycles,
+                     "the short fixture should classify as an early estimate");
+            t.Equals(first.earlyEstimateCount, 1ull,
+                     "the estimator should record every early result");
+            t.Equals(
+                first.owner.commandTypes[
+                    vu1CommandTypeIndex(Vu1CommandType::AdvanceSlice)]
+                    .submitted,
+                0ull,
+                "coarse mode must not fall back to exact slice tickets");
+
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            const PS2Runtime::DebugVu1Timing secondStart =
+                runtime.debugVu1TimingSnapshot();
+            const uint64_t secondDelta =
+                secondStart.eventDeadlineTick -
+                secondStart.currentTick;
+            t.Equals(
+                secondDelta,
+                static_cast<uint64_t>(
+                    first.lastActualCycles) * 8u,
+                "the next event should use only ordered guest-cycle history");
+            context.advanceEeCycleTicks(secondDelta);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const Vu1CoarseRuntimeStatistics second =
+                runtime.vu1CoarseStatistics();
+            t.Equals(second.invocationsPublished, 2ull,
+                     "the learned estimate should publish the second invocation");
+            t.Equals(second.lastEstimatedCycles,
+                     first.lastActualCycles,
+                     "the one-entry mean should equal the previous actual cycle count");
+            t.Equals(second.lastActualCycles,
+                     first.lastActualCycles,
+                     "identical guest work should have deterministic actual cycles");
+            t.Equals(second.exactEstimateCount, 1ull,
+                     "the second identical invocation should hit the estimate exactly");
+            t.IsTrue(second.estimatorInputDigest != 0u &&
+                         second.estimatorOutputDigest != 0u &&
+                         second.estimatorResultDigest != 0u,
+                     "all estimator input output and result streams should be digested");
+        });
+
+        tc.Run("runtime coarse estimator isolates bounded invocation identities", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.vu1CoarseEstimatorHistoryCapacity = 2u;
+            configuration.vu1CoarseEstimatorIdentityCapacity = 2u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "keyed-estimator runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "keyed-estimator runtime subsystems should bind");
+
+            const auto writeProgram =
+                [&](uint32_t startPc, uint32_t pairs)
+                {
+                    for (uint32_t pair = 0u; pair < pairs; ++pair)
+                    {
+                        writeRuntimeVu1InstructionPair(
+                            runtime, startPc + pair * 8u,
+                            pair == 0u
+                                ? makeVuIaddiu(1u, 1u, 1)
+                                : 0u,
+                            pair + 1u == pairs
+                                ? kVuUpperEnd
+                                : kVuUpperNop);
+                    }
+                    writeRuntimeVu1InstructionPair(
+                        runtime, startPc + pairs * 8u,
+                        0u, kVuUpperNop);
+                };
+            constexpr uint32_t kProgramA = 0x000u;
+            constexpr uint32_t kProgramB = 0x200u;
+            constexpr uint32_t kProgramC = 0x400u;
+            writeProgram(kProgramA, 8u);
+            writeProgram(kProgramB, 24u);
+            writeProgram(kProgramC, 12u);
+
+            R5900Context &context = runtime.cpu();
+            const auto run =
+                [&](uint32_t startPc)
+                {
+                    const uint32_t mscal = makeVifCommand(
+                        0x14u, 0u,
+                        static_cast<uint16_t>(startPc / 8u));
+                    runtime.memory().processVIF1Data(
+                        reinterpret_cast<const uint8_t *>(&mscal),
+                        sizeof(mscal));
+                    const PS2Runtime::DebugVu1Timing timing =
+                        runtime.debugVu1TimingSnapshot();
+                    context.advanceEeCycleTicks(
+                        timing.eventDeadlineTick - timing.currentTick);
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                    return runtime.vu1CoarseStatistics();
+                };
+
+            const Vu1CoarseRuntimeStatistics firstA =
+                run(kProgramA);
+            t.Equals(firstA.estimatorIdentityMissCount, 1ull,
+                     "the first identity should use the global fallback");
+            t.Equals(firstA.estimatorIdentitySize, size_t{1u},
+                     "the first result should create one identity history");
+            const uint32_t programACycles = firstA.lastActualCycles;
+
+            const Vu1CoarseRuntimeStatistics firstB =
+                run(kProgramB);
+            t.Equals(firstB.estimatorIdentityMissCount, 2ull,
+                     "a different entry point should be a second miss");
+            t.IsTrue(firstB.lastActualCycles != programACycles,
+                     "the fixture identities should have different durations");
+
+            const Vu1CoarseRuntimeStatistics secondA =
+                run(kProgramA);
+            t.Equals(secondA.estimatorIdentityHitCount, 1ull,
+                     "the repeated identity should use its private history");
+            t.Equals(secondA.lastEstimatedCycles, programACycles,
+                     "another program must not contaminate the keyed estimate");
+            t.Equals(secondA.estimatorIdentitySize, size_t{2u},
+                     "the identity table should respect its configured bound");
+            t.Equals(secondA.estimatorIdentityHighWater, size_t{2u},
+                     "identity high water should retain the configured bound");
+
+            const Vu1CoarseRuntimeStatistics firstC =
+                run(kProgramC);
+            t.Equals(firstC.estimatorIdentityMissCount, 3ull,
+                     "a third identity should miss and evict the LRU entry");
+            t.Equals(firstC.estimatorIdentitySize, size_t{2u},
+                     "LRU eviction must keep the identity table bounded");
+            const Vu1CoarseRuntimeStatistics secondB =
+                run(kProgramB);
+            t.Equals(secondB.estimatorIdentityMissCount, 4ull,
+                     "the deterministically evicted identity should miss again");
+        });
+
+        tc.Run("runtime coarse observation drains ready work before exposing state", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse barrier runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse barrier runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(2u, 0u, 11),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1CoarseStatistics();
+                        return statistics.owner.commandTypes[
+                            vu1CommandTypeIndex(
+                                Vu1CommandType::Invocation)]
+                            .completed == 1u;
+                    }),
+                "the observation fixture should have ready private work");
+
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            const Vu1CoarseRuntimeStatistics statistics =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            t.Equals(snapshot->state.vi[2], int32_t{11},
+                     "the observation barrier should publish owner state first");
+            t.Equals(statistics.forcedBarrierCount, 1ull,
+                     "the pre-event snapshot should record one explicit drain");
+            t.Equals(statistics.invocationsPublished, 1ull,
+                     "the drain should publish the invocation exactly once");
+            t.IsFalse(statistics.pendingInvocation,
+                      "the observation should consume the pending future");
+            t.IsFalse(timing.active,
+                      "the observation drain should clear Busy");
+            t.IsFalse(timing.eventPending,
+                      "the observation drain should cancel the old estimate event");
+        });
+
+        tc.Run("runtime coarse event reports a forced host wait without moving guest time", [](TestCase &t)
+        {
+            std::mutex gateMutex;
+            std::condition_variable gateCv;
+            bool entered = false;
+            bool release = false;
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.vu1BeforeProcess =
+                [&](const Vu1Command &command, uint64_t)
+                {
+                    if (command.type != Vu1CommandType::Invocation)
+                        return;
+                    std::unique_lock<std::mutex> lock(gateMutex);
+                    entered = true;
+                    gateCv.notify_all();
+                    gateCv.wait(
+                        lock,
+                        [&release]()
+                        {
+                            return release;
+                        });
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse late runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse late runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(3u, 0u, 13),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(
+                waitFor(
+                    gateCv, gateMutex,
+                    [&entered]()
+                    {
+                        return entered;
+                    }),
+                "the coarse owner should enter the delayed invocation");
+
+            std::thread releaser(
+                [&]()
+                {
+                    std::this_thread::sleep_for(20ms);
+                    {
+                        std::lock_guard<std::mutex> lock(gateMutex);
+                        release = true;
+                    }
+                    gateCv.notify_all();
+                });
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            releaser.join();
+
+            const Vu1CoarseRuntimeStatistics statistics =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            t.Equals(statistics.resultsReadyAtEvent, 0ull,
+                     "the blocked invocation must not be classified ready");
+            t.Equals(statistics.resultsLateAtEvent, 1ull,
+                     "the blocked invocation should be classified host-late");
+            t.Equals(statistics.forcedWaitCount, 1ull,
+                     "the scheduler should record the forced owner wait");
+            t.IsTrue(statistics.forcedWaitNanoseconds >= 10'000'000ull,
+                     "the delayed owner should report its bounded host wait");
+            t.Equals(timing.currentTick, 128ull,
+                     "host waiting must not add guest time");
+            t.Equals(timing.totalAdvancedCycles,
+                     static_cast<uint64_t>(statistics.lastActualCycles),
+                     "publication should account actual guest VU cycles only");
         });
 
         tc.Run("runtime checkpoint epochs publish exact ready and late event state", [](TestCase &t)

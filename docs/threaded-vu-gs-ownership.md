@@ -3,7 +3,7 @@
 Status: Milestone 1 contract, audited against PS2Recomp revision
 `588d9a68d69b8a87a8cd755618502278a10b4ec3` on 2026-08-13 and reconciled
 with the implemented GS owner through Milestone 5 and the VU1 owner through
-Milestone 8 Phase B on 2026-08-15.
+the Milestone 8 architecture selection on 2026-08-15.
 
 This document is the source inventory and publication contract for moving GS
 and VU1 work off the EE executor. It describes current behavior first and the
@@ -643,6 +643,44 @@ rebases, positive-demand extension count, reused prefix cycles, demanded and
 executed extension cycles, checkpoint wait count/time, and maximum journal
 depth. These counters are observational. They never alter guest time,
 scheduler priority, VU busy publication, VIF wakeup, or XGKICK order.
+
+## Milestone 8 coarse VU1 experiment — non-production
+
+`--vu1-execution threaded-coarse` is a separately selected, non-default
+research mode. It submits one owned MSCAL, MSCALF, or MSCNT invocation to the
+persistent VU1 owner and permits at most one invocation of producer lead. VU
+registers, VIF-owned state, micro/data memory, diagnostics, and ordered PATH1
+packets remain private until EE reaches the deterministic estimated completion
+event or explicitly requests a barrier. Worker completion and host wall time
+never publish guest state.
+
+The completion estimate uses only bounded guest-cycle history. Its identity is
+the invocation kind, start PC, TOP, ITOP, and VU code generation. The default
+table is a deterministic 64-entry LRU with four actual-cycle samples per
+identity and a four-sample global fallback for cold identities. Reset, restore,
+and memory rebinding clear estimator state. Input, output, result, hit/miss,
+error, forced-wait, and high-water telemetry is available under
+`system.status.vu1_coarse`.
+
+The prototype bounds a whole invocation and its estimated lead to 65,536 VU
+cycles, PATH1 ownership to 64 MiB, and pending lead to one invocation. A bound
+failure faults or applies admission backpressure; it never drops work. PATH1
+packets retain owner order and monotonic invocation-relative cycle offsets.
+Focused tests cover typed whole-invocation execution, PATH1 ownership/order and
+bounds, deterministic identity isolation/LRU eviction, estimator publication,
+and owner lifecycle. The mode did not receive the exhaustive observation and
+lifecycle hardening required for production because its live correctness gate
+failed first.
+
+On the canonical RAC1 Veldin interval, the identity-keyed arm retained exact
+gameplay state and exact GS draw/pixel work and reached 19.410318475 fields/s.
+It nevertheless differed from the same-binary exact checkpoint-epoch control
+by 3,533 EE instructions, 35,000 EE ticks, one DMA start, and -880 VU1 cycles.
+Consequently estimated coarse timing is rejected as a production architecture.
+The selected production configuration is inline VU1 plus asynchronous GS;
+`threaded-sync` and exact checkpoint-epoch `threaded-async` remain differential
+or research modes. No result from `threaded-coarse` may be treated as an exact
+correctness or production-performance result.
 
 ## Audit maintenance
 
