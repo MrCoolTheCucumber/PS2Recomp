@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 #include <tuple>
 #include <unordered_map>
 
@@ -59,6 +60,49 @@ namespace ps2x::ee
     {
         return std::tie(left.kind, left.objectId) <
                std::tie(right.kind, right.objectId);
+    }
+
+    bool eeSchedulerRunResultValid(
+        const EeSchedulerRunResult &result) noexcept
+    {
+        const bool emptyWait =
+            result.wait == EeSchedulerWaitKey{};
+        switch (result.reason)
+        {
+        case EeSchedulerExitReason::Yielded:
+        case EeSchedulerExitReason::Preempted:
+        case EeSchedulerExitReason::StopRequested:
+        case EeSchedulerExitReason::Finished:
+            if (!emptyWait || result.failure)
+            {
+                return false;
+            }
+            break;
+        case EeSchedulerExitReason::Blocked:
+            if (!result.wait.valid() || result.failure)
+            {
+                return false;
+            }
+            break;
+        case EeSchedulerExitReason::Exception:
+            if (!emptyWait || !result.failure)
+            {
+                return false;
+            }
+            break;
+        default:
+            return false;
+        }
+
+        const EeSchedulerOwnerLocalTransition &transition =
+            result.ownerLocalTransition;
+        if (!transition.structurallyValid())
+        {
+            return false;
+        }
+        return !transition.pending() ||
+               result.reason ==
+                   EeSchedulerExitReason::Preempted;
     }
 
     void EeThreadScheduler::enableTransitionTracing(
@@ -1206,6 +1250,13 @@ namespace ps2x::ee
         dispatch.resumedThreadId = *selected;
         dispatch.result =
             backend.resume(*selected, tickBudget);
+        if (!eeSchedulerRunResultValid(
+                dispatch.result))
+        {
+            throw std::logic_error(
+                "EE execution backend returned an invalid "
+                "scheduler exit protocol");
+        }
 
         switch (dispatch.result.reason)
         {

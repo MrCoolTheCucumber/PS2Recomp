@@ -240,6 +240,60 @@ namespace ps2x::ee
         EqualOrHigherPriority,
     };
 
+    enum class EeSchedulerOwnerLocalTransitionKind : uint8_t
+    {
+        None,
+        RotateReadyQueue,
+    };
+
+    // One typed scheduler mutation produced by the currently running guest
+    // continuation and consumed by its immediately following executor
+    // boundary. This deliberately cannot carry an arbitrary callback or
+    // shared completion state.
+    struct EeSchedulerOwnerLocalTransition
+    {
+        EeSchedulerOwnerLocalTransitionKind kind =
+            EeSchedulerOwnerLocalTransitionKind::None;
+        EeSchedulerThreadHandle originatingThread{};
+        int priority = 0;
+        EeSchedulerReschedulePolicy reschedulePolicy =
+            EeSchedulerReschedulePolicy::None;
+
+        [[nodiscard]] bool pending() const noexcept
+        {
+            return kind !=
+                   EeSchedulerOwnerLocalTransitionKind::None;
+        }
+
+        [[nodiscard]] bool structurallyValid() const noexcept
+        {
+            switch (kind)
+            {
+            case EeSchedulerOwnerLocalTransitionKind::None:
+                return originatingThread ==
+                           EeSchedulerThreadHandle{} &&
+                       priority == 0 &&
+                       reschedulePolicy ==
+                           EeSchedulerReschedulePolicy::None;
+            case EeSchedulerOwnerLocalTransitionKind::
+                RotateReadyQueue:
+                return originatingThread.valid() &&
+                       priority >= 0 &&
+                       priority < kEeThreadPriorityCount &&
+                       (reschedulePolicy ==
+                            EeSchedulerReschedulePolicy::None ||
+                        reschedulePolicy ==
+                            EeSchedulerReschedulePolicy::
+                                EqualOrHigherPriority);
+            }
+            return false;
+        }
+
+        friend bool operator==(
+            const EeSchedulerOwnerLocalTransition &,
+            const EeSchedulerOwnerLocalTransition &) = default;
+    };
+
     enum class EeSchedulerSleepDisposition : uint8_t
     {
         InvalidCurrentThread,
@@ -271,7 +325,14 @@ namespace ps2x::ee
         uint64_t elapsedTicks = 0u;
         EeSchedulerWaitKey wait{};
         std::exception_ptr failure;
+        EeSchedulerOwnerLocalTransition
+            ownerLocalTransition{};
     };
+
+    // Validates the complete exit protocol, including legal reason/wait,
+    // failure, and owner-local transition combinations.
+    [[nodiscard]] bool eeSchedulerRunResultValid(
+        const EeSchedulerRunResult &result) noexcept;
 
     class IEeSchedulerExecutionBackend
     {

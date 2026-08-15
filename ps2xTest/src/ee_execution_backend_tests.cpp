@@ -329,6 +329,152 @@ void register_ee_execution_backend_tests()
             });
 
         tc.Run(
+            "owner-local transitions survive exactly one fiber suspension",
+            [](TestCase &t)
+            {
+                const EeSchedulerOwnerLocalTransition transition{
+                    EeSchedulerOwnerLocalTransitionKind::
+                        RotateReadyQueue,
+                    {7, 3u},
+                    42,
+                    EeSchedulerReschedulePolicy::
+                        EqualOrHigherPriority,
+                };
+                EeSchedulerRunResult valid{
+                    EeSchedulerExitReason::Preempted,
+                    11u,
+                    {},
+                    {},
+                    transition,
+                };
+                t.IsTrue(
+                    eeSchedulerRunResultValid(valid),
+                    "a preempted exit should accept one structurally valid owner-local transition");
+
+                EeSchedulerRunResult blocked = valid;
+                blocked.reason =
+                    EeSchedulerExitReason::Blocked;
+                blocked.wait = {
+                    EeSchedulerWaitKind::Semaphore,
+                    9};
+                t.IsFalse(
+                    eeSchedulerRunResultValid(blocked),
+                    "a blocked exit must reject an owner-local transition");
+
+                EeSchedulerRunResult terminal = valid;
+                terminal.reason =
+                    EeSchedulerExitReason::Exception;
+                terminal.failure =
+                    std::make_exception_ptr(
+                        std::runtime_error(
+                            "terminal transition"));
+                t.IsFalse(
+                    eeSchedulerRunResultValid(terminal),
+                    "a terminal exit must reject an owner-local transition");
+
+                EeSchedulerRunResult stale = valid;
+                stale.ownerLocalTransition
+                    .originatingThread.generation = 0u;
+                t.IsFalse(
+                    eeSchedulerRunResultValid(stale),
+                    "a transition must reject a stale originating handle");
+
+                EeSchedulerRunResult invalidPriority = valid;
+                invalidPriority.ownerLocalTransition.priority =
+                    kEeThreadPriorityCount;
+                t.IsFalse(
+                    eeSchedulerRunResultValid(
+                        invalidPriority),
+                    "a transition must reject an invalid ready priority");
+
+                EeSchedulerRunResult invalidPolicy = valid;
+                invalidPolicy.ownerLocalTransition
+                    .reschedulePolicy =
+                    EeSchedulerReschedulePolicy::
+                        HigherPriorityOnly;
+                t.IsFalse(
+                    eeSchedulerRunResultValid(invalidPolicy),
+                    "ready rotation must reject an undeclared reschedule policy");
+
+                auto hostBackend =
+                    createEeExecutionBackend(
+                        EeExecutionBackendKind::
+                            LegacyHostThread);
+                bool hostRejected = false;
+                try
+                {
+                    hostBackend->yieldCurrent(valid);
+                }
+                catch (const std::logic_error &)
+                {
+                    hostRejected = true;
+                }
+                t.IsTrue(
+                    hostRejected,
+                    "the legacy host-thread backend must remain outside the owner-local protocol");
+
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                auto backend =
+                    createEeExecutionBackend(
+                        EeExecutionBackendKind::
+                            LegacyCppFiber);
+                bool incompatibleRejected = false;
+                size_t resumedStages = 0u;
+                backend->create(7, [&]()
+                {
+                    try
+                    {
+                        backend->yieldCurrent(blocked);
+                    }
+                    catch (const std::invalid_argument &)
+                    {
+                        incompatibleRejected = true;
+                    }
+                    backend->yieldCurrent(valid);
+                    ++resumedStages;
+                    backend->yieldCurrent(
+                        {
+                            EeSchedulerExitReason::
+                                Preempted,
+                            13u,
+                            {},
+                            {},
+                            {},
+                        });
+                    ++resumedStages;
+                });
+
+                const EeSchedulerRunResult first =
+                    backend->resume(7, 64u);
+                const EeSchedulerRunResult second =
+                    backend->resume(7, 64u);
+                const EeSchedulerRunResult third =
+                    backend->resume(7, 64u);
+                t.IsTrue(
+                    incompatibleRejected &&
+                        first.ownerLocalTransition ==
+                            transition &&
+                        first.elapsedTicks == 11u,
+                    "the typed transition should cross one suspension without alteration");
+                t.IsTrue(
+                    !second.ownerLocalTransition.pending() &&
+                        second.elapsedTicks == 13u &&
+                        resumedStages == 2u,
+                    "a consumed transition must not leak into the next dispatch");
+                t.IsTrue(
+                    third.reason ==
+                            EeSchedulerExitReason::Finished &&
+                        !third.ownerLocalTransition.pending(),
+                    "normal fiber completion must retain an empty transition");
+                backend->destroy(7);
+            });
+
+        tc.Run(
             "fiber exceptions and affinity return to the executor",
             [](TestCase &t)
             {

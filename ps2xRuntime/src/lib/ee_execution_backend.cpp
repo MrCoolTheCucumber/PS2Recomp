@@ -586,37 +586,20 @@ namespace
             const ps2x::ee::EeSchedulerRunResult &result)
         {
             using ps2x::ee::EeSchedulerExitReason;
-            switch (result.reason)
+            if (result.reason ==
+                    EeSchedulerExitReason::Finished ||
+                result.reason ==
+                    EeSchedulerExitReason::Exception)
             {
-            case EeSchedulerExitReason::Blocked:
-                if (!result.wait.valid())
-                {
-                    throw std::invalid_argument(
-                        "blocked EE fiber exit requires "
-                        "a wait key");
-                }
-                break;
-            case EeSchedulerExitReason::Yielded:
-            case EeSchedulerExitReason::Preempted:
-            case EeSchedulerExitReason::StopRequested:
-                if (result.wait.valid())
-                {
-                    throw std::invalid_argument(
-                        "non-blocking EE fiber exit must "
-                        "not carry a wait key");
-                }
-                break;
-            case EeSchedulerExitReason::Finished:
-            case EeSchedulerExitReason::Exception:
                 throw std::invalid_argument(
                     "terminal EE fiber exits are owned by "
                     "the entry boundary");
             }
-            if (result.failure)
+            if (!ps2x::ee::eeSchedulerRunResultValid(
+                    result))
             {
                 throw std::invalid_argument(
-                    "yielded EE fiber exits must not carry "
-                    "an exception");
+                    "invalid EE fiber exit protocol");
             }
         }
 
