@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <exception>
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
@@ -173,12 +174,31 @@ namespace
         return true;
     }
 
+    bool parsePositiveSize(
+        const std::string &text,
+        size_t &value)
+    {
+        size_t parsed = 0u;
+        const char *const begin = text.data();
+        const char *const end = begin + text.size();
+        const auto result =
+            std::from_chars(begin, end, parsed, 10);
+        if (begin == end || result.ec != std::errc{} ||
+            result.ptr != end || parsed == 0u)
+        {
+            return false;
+        }
+        value = parsed;
+        return true;
+    }
+
     void printUsage(const char *program)
     {
         std::cout
             << "Usage: " << program
             << " [--renderer software|hybrid|verify|gpu-strict]"
                " [--gs-execution inline|threaded-sync|threaded-async]"
+               " [--gs-command-queue-capacity POSITIVE_INTEGER]"
                " [--vu1-execution inline|threaded-sync|threaded-async|threaded-coarse]"
                " [--vu1-checkpoint-epochs on|off]"
                " [ELF [CD_IMAGE]]\n";
@@ -189,6 +209,8 @@ namespace
         bool showHelp = false;
         GsRendererMode rendererMode = GsRendererMode::Software;
         GsExecutionMode gsExecutionMode = GsExecutionMode::Inline;
+        // Absorb short command bursts without relaxing the threaded GS field bound.
+        size_t gsCommandQueueCapacity = 512u;
         Vu1ExecutionMode vu1ExecutionMode = Vu1ExecutionMode::Inline;
         bool vu1CheckpointEpochs = true;
         std::vector<std::filesystem::path> positionalPaths;
@@ -229,6 +251,19 @@ namespace
                 {
                     throw std::invalid_argument(
                         "--gs-execution requires inline, threaded-sync, or threaded-async");
+                }
+                continue;
+            }
+            if (!optionsEnded &&
+                argument == "--gs-command-queue-capacity")
+            {
+                if (++i >= argc || !argv[i] ||
+                    !parsePositiveSize(
+                        argv[i],
+                        options.gsCommandQueueCapacity))
+                {
+                    throw std::invalid_argument(
+                        "--gs-command-queue-capacity requires a positive integer");
                 }
                 continue;
             }
@@ -350,6 +385,8 @@ int main(int argc, char *argv[])
             defaultPs2RuntimeConfiguration();
         runtimeConfiguration.gsExecutionMode =
             options.gsExecutionMode;
+        runtimeConfiguration.gsCommandQueueCapacity =
+            options.gsCommandQueueCapacity;
         runtimeConfiguration.vu1ExecutionMode =
             options.vu1ExecutionMode;
         runtimeConfiguration.vu1CheckpointEpochs =
