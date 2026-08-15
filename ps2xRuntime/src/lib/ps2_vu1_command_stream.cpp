@@ -1749,24 +1749,66 @@ Vu1Snapshot Vu1CommandProcessor::captureSnapshot(
 
 uint64_t Vu1CommandProcessor::stateHash() const noexcept
 {
-    if (!m_configuration.captureArchitecturalStateHashes ||
-        !m_microMemory || !m_dataMemory)
+    return stateHashes().aggregate;
+}
+
+Vu1ArchitecturalStateHashes
+Vu1CommandProcessor::stateHashes() const noexcept
+{
+    const bool diagnostic =
+        m_diagnosticArchitecturalStateHashes.load(
+            std::memory_order_acquire);
+    if ((!m_configuration.captureArchitecturalStateHashes &&
+         !diagnostic) || !m_microMemory || !m_dataMemory)
     {
-        return 0u;
+        return {};
     }
-    return vu1ArchitecturalStateHash(
-        m_unit.state(),
-        std::span<const uint8_t>(
-            m_microMemory, m_microMemorySize),
-        std::span<const uint8_t>(
-            m_dataMemory, m_dataMemorySize),
-        m_vifState, codeGeneration());
+
+    const VuExecutionState &execution = m_unit.state();
+    const std::span<const uint8_t> microMemory(
+        m_microMemory, m_microMemorySize);
+    const std::span<const uint8_t> dataMemory(
+        m_dataMemory, m_dataMemorySize);
+    const uint64_t generation = codeGeneration();
+
+    Vu1ArchitecturalStateHashes hashes{};
+    hashes.aggregate = vu1ArchitecturalStateHash(
+        execution, microMemory, dataMemory,
+        m_vifState, generation);
+    if (!diagnostic)
+        return hashes;
+
+    hashes.execution = kFnvOffsetBasis;
+    hashExecutionState(hashes.execution, execution);
+
+    hashes.microMemory = kFnvOffsetBasis;
+    hashScalar(hashes.microMemory, generation);
+    hashScalar(
+        hashes.microMemory,
+        static_cast<uint64_t>(microMemory.size()));
+    hashBytes(
+        hashes.microMemory,
+        microMemory.data(), microMemory.size());
+
+    hashes.dataMemory = kFnvOffsetBasis;
+    hashScalar(
+        hashes.dataMemory,
+        static_cast<uint64_t>(dataMemory.size()));
+    hashBytes(
+        hashes.dataMemory,
+        dataMemory.data(), dataMemory.size());
+
+    hashes.vif = kFnvOffsetBasis;
+    hashVifState(hashes.vif, m_vifState);
+    return hashes;
 }
 
 Vu1SliceResult Vu1CommandProcessor::advanceSlice(
     const Vu1AdvanceSliceCommand &command)
 {
     Vu1SliceResult slice{};
+    const Vu1ArchitecturalStateHashes inputHashes =
+        stateHashes();
     Vu1SliceSideEffectSink effects(slice.path1Packets);
     VuExecutionContext context{
         .state = m_unit.state(),
@@ -1801,7 +1843,19 @@ Vu1SliceResult Vu1CommandProcessor::advanceSlice(
             std::make_unique<VuExecutionState>(
                 m_unit.state());
     }
-    slice.architecturalStateHash = stateHash();
+    Vu1ArchitecturalStateHashes hashes = stateHashes();
+    hashes.inputAggregate = inputHashes.aggregate;
+    hashes.inputExecution = inputHashes.execution;
+    hashes.inputMicroMemory = inputHashes.microMemory;
+    hashes.inputDataMemory = inputHashes.dataMemory;
+    hashes.inputVif = inputHashes.vif;
+    slice.architecturalStateHash = hashes.aggregate;
+    if (hashes.execution != 0u)
+    {
+        slice.diagnosticStateHashes =
+            std::make_unique<Vu1ArchitecturalStateHashes>(
+                hashes);
+    }
     slice.vifCanResume = !m_unit.isActive();
     if (slice.run.reason == VuExitReason::Fault)
     {
@@ -1819,6 +1873,8 @@ Vu1SliceResult Vu1CommandProcessor::runInvocation(
     Vu1SliceResult invocation{};
     invocation.run.requestedCycles = command.maximumCycles;
     invocation.run.activeBefore = m_unit.isActive();
+    const Vu1ArchitecturalStateHashes inputHashes =
+        stateHashes();
     uint64_t path1Bytes = 0u;
     uint32_t segments = 0u;
 
@@ -1905,7 +1961,19 @@ Vu1SliceResult Vu1CommandProcessor::runInvocation(
         invocation.state =
             std::make_unique<VuExecutionState>(m_unit.state());
     }
-    invocation.architecturalStateHash = stateHash();
+    Vu1ArchitecturalStateHashes hashes = stateHashes();
+    hashes.inputAggregate = inputHashes.aggregate;
+    hashes.inputExecution = inputHashes.execution;
+    hashes.inputMicroMemory = inputHashes.microMemory;
+    hashes.inputDataMemory = inputHashes.dataMemory;
+    hashes.inputVif = inputHashes.vif;
+    invocation.architecturalStateHash = hashes.aggregate;
+    if (hashes.execution != 0u)
+    {
+        invocation.diagnosticStateHashes =
+            std::make_unique<Vu1ArchitecturalStateHashes>(
+                hashes);
+    }
     return invocation;
 }
 
@@ -2744,7 +2812,15 @@ Vu1CommandProcessor::commitExtendedSpeculativeAdvance(
                     std::make_unique<VuExecutionState>(
                         m_unit.state());
             }
-            extension.architecturalStateHash = stateHash();
+            const Vu1ArchitecturalStateHashes hashes =
+                stateHashes();
+            extension.architecturalStateHash = hashes.aggregate;
+            if (hashes.execution != 0u)
+            {
+                extension.diagnosticStateHashes =
+                    std::make_unique<
+                        Vu1ArchitecturalStateHashes>(hashes);
+            }
             extension.vifCanResume = !active;
         }
         result.payload = std::move(extension);
@@ -4507,6 +4583,22 @@ void ThreadedVu1Executor::runExecutionEpoch(WorkItem &item)
                 prefix->state = std::move(extension->state);
                 prefix->architecturalStateHash =
                     extension->architecturalStateHash;
+                if (prefix->diagnosticStateHashes &&
+                    extension->diagnosticStateHashes)
+                {
+                    extension->diagnosticStateHashes->inputAggregate =
+                        prefix->diagnosticStateHashes->inputAggregate;
+                    extension->diagnosticStateHashes->inputExecution =
+                        prefix->diagnosticStateHashes->inputExecution;
+                    extension->diagnosticStateHashes->inputMicroMemory =
+                        prefix->diagnosticStateHashes->inputMicroMemory;
+                    extension->diagnosticStateHashes->inputDataMemory =
+                        prefix->diagnosticStateHashes->inputDataMemory;
+                    extension->diagnosticStateHashes->inputVif =
+                        prefix->diagnosticStateHashes->inputVif;
+                }
+                prefix->diagnosticStateHashes =
+                    std::move(extension->diagnosticStateHashes);
                 prefix->vifCanResume =
                     extension->vifCanResume;
                 prefix->fault = std::move(extension->fault);

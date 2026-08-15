@@ -433,6 +433,23 @@ struct Vu1NoResult
 {
 };
 
+struct Vu1ArchitecturalStateHashes
+{
+    // Component hashes are diagnostics-only. Input fields retain the state
+    // presented to the first instruction; the unprefixed fields retain the
+    // state after the returned slice or invocation.
+    uint64_t aggregate = 0u;
+    uint64_t execution = 0u;
+    uint64_t microMemory = 0u;
+    uint64_t dataMemory = 0u;
+    uint64_t vif = 0u;
+    uint64_t inputAggregate = 0u;
+    uint64_t inputExecution = 0u;
+    uint64_t inputMicroMemory = 0u;
+    uint64_t inputDataMemory = 0u;
+    uint64_t inputVif = 0u;
+};
+
 struct Vu1SliceResult
 {
     VuRunResult run{};
@@ -441,6 +458,8 @@ struct Vu1SliceResult
     // envelope avoids moving a full architectural state on every slice.
     std::unique_ptr<VuExecutionState> state;
     uint64_t architecturalStateHash = 0u;
+    std::unique_ptr<Vu1ArchitecturalStateHashes>
+        diagnosticStateHashes;
     bool vifCanResume = false;
     // Fault details are cold. Keep their string storage and object footprint
     // out of every scheduled slice result.
@@ -573,6 +592,15 @@ public:
         IVuExecutionObserver *diagnosticsObserver = nullptr);
     void bindInlineDiagnosticsObserver(
         IVuExecutionObserver *diagnosticsObserver);
+    // Bounded debugger traces can request complete owner-state hashes without
+    // paying their full-memory cost during ordinary execution. This flag is
+    // diagnostic-only and is safe to toggle from the paused debugger thread;
+    // the owner remains the only thread which reads and hashes VU state.
+    void setDiagnosticArchitecturalStateHashes(bool enabled) const noexcept
+    {
+        m_diagnosticArchitecturalStateHashes.store(
+            enabled, std::memory_order_release);
+    }
     void claimOwnerThread(std::thread::id owner);
     [[nodiscard]] std::thread::id ownerThreadId() const noexcept
     {
@@ -687,6 +715,8 @@ private:
     [[nodiscard]] Vu1Snapshot captureSnapshot(
         bool includeBackendDiagnostics) const;
     [[nodiscard]] uint64_t stateHash() const noexcept;
+    [[nodiscard]] Vu1ArchitecturalStateHashes
+    stateHashes() const noexcept;
     [[nodiscard]] Vu1CommandResultPayload apply(
         Vu1CommandPayload &payload,
         Vu1CommandDisposition &disposition);
@@ -702,6 +732,8 @@ private:
     uint8_t *m_dataMemory = nullptr;
     uint32_t m_dataMemorySize = 0u;
     std::atomic<uint64_t> m_codeGeneration{0u};
+    mutable std::atomic<bool>
+        m_diagnosticArchitecturalStateHashes{false};
     IVuExecutionObserver *m_diagnosticsObserver = nullptr;
     std::vector<uint8_t> m_ownedMicroMemory;
     std::vector<uint8_t> m_ownedDataMemory;

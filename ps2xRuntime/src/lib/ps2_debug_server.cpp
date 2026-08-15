@@ -3948,6 +3948,38 @@ struct PS2DebugServer::Impl
                 hostAddressString(
                     source.architecturalStateHash),
                 allocator);
+            addString(
+                entry, "input_execution_state_hash_fnv1a64",
+                hostAddressString(source.inputExecutionStateHash),
+                allocator);
+            addString(
+                entry, "input_micro_memory_hash_fnv1a64",
+                hostAddressString(source.inputMicroMemoryHash),
+                allocator);
+            addString(
+                entry, "input_data_memory_hash_fnv1a64",
+                hostAddressString(source.inputDataMemoryHash),
+                allocator);
+            addString(
+                entry, "input_vif_state_hash_fnv1a64",
+                hostAddressString(source.inputVifStateHash),
+                allocator);
+            addString(
+                entry, "execution_state_hash_fnv1a64",
+                hostAddressString(source.executionStateHash),
+                allocator);
+            addString(
+                entry, "micro_memory_hash_fnv1a64",
+                hostAddressString(source.microMemoryHash),
+                allocator);
+            addString(
+                entry, "data_memory_hash_fnv1a64",
+                hostAddressString(source.dataMemoryHash),
+                allocator);
+            addString(
+                entry, "vif_state_hash_fnv1a64",
+                hostAddressString(source.vifStateHash),
+                allocator);
             entry.AddMember(
                 "vif_stat", source.vifStat, allocator);
             entry.AddMember(

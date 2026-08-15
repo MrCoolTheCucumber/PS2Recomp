@@ -1404,6 +1404,14 @@ public:
         uint64_t path1CycleOffset = 0u;
         uint64_t path1Digest = 0u;
         uint64_t architecturalStateHash = 0u;
+        uint64_t inputExecutionStateHash = 0u;
+        uint64_t inputMicroMemoryHash = 0u;
+        uint64_t inputDataMemoryHash = 0u;
+        uint64_t inputVifStateHash = 0u;
+        uint64_t executionStateHash = 0u;
+        uint64_t microMemoryHash = 0u;
+        uint64_t dataMemoryHash = 0u;
+        uint64_t vifStateHash = 0u;
         uint32_t estimatedCycles = 0u;
         uint32_t executedCycles = 0u;
         uint32_t startPc = 0u;
@@ -3492,6 +3500,7 @@ private:
         ps2x::timing::EeTick startTick{};
         ps2x::timing::EeTick deadline{};
         uint64_t eventGeneration = 0u;
+        Vu1ArchitecturalStateHashes inputStateHashes{};
     };
     DebugVu1TimingInvocation m_debugVu1TimingInvocation{};
     uint64_t m_debugVu1TimingNextInvocation = 0u;

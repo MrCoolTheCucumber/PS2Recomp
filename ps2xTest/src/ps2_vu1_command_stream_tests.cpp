@@ -4429,8 +4429,6 @@ void register_ps2_vu1_command_stream_tests()
                     configuration.vu1CommandQueueCapacity = 4u;
                     configuration.vu1CommandPayloadCapacityBytes =
                         1024u * 1024u;
-                    configuration.captureVu1ArchitecturalStateHashes =
-                        true;
                     PS2Runtime runtime(configuration);
                     if (!runtime.memory().initialize() ||
                         !runtime.syncCoreSubsystems())
@@ -4609,6 +4607,50 @@ void register_ps2_vu1_command_stream_tests()
                     coarseCompletion->architecturalStateHash,
                     exactCompletion->architecturalStateHash,
                     "paired completion should retain final VU state");
+                t.IsTrue(
+                    exactCompletion->architecturalStateHash != 0u,
+                    "an armed timing trace should enable bounded "
+                    "owner-state hashing");
+                t.IsTrue(
+                    exactCompletion->inputExecutionStateHash != 0u &&
+                        exactCompletion->inputMicroMemoryHash != 0u &&
+                        exactCompletion->inputDataMemoryHash != 0u &&
+                        exactCompletion->inputVifStateHash != 0u,
+                    "an armed timing trace should record component "
+                    "invocation-input hashes");
+                t.IsTrue(
+                    exactCompletion->executionStateHash != 0u &&
+                        exactCompletion->microMemoryHash != 0u &&
+                        exactCompletion->dataMemoryHash != 0u &&
+                        exactCompletion->vifStateHash != 0u,
+                    "an armed timing trace should record component "
+                    "owner-state hashes");
+                t.IsTrue(
+                    coarseCompletion->inputExecutionStateHash ==
+                            exactCompletion->inputExecutionStateHash &&
+                        coarseCompletion->inputMicroMemoryHash ==
+                            exactCompletion->inputMicroMemoryHash &&
+                        coarseCompletion->inputDataMemoryHash ==
+                            exactCompletion->inputDataMemoryHash &&
+                        coarseCompletion->inputVifStateHash ==
+                            exactCompletion->inputVifStateHash,
+                    "paired completion should retain invocation input state");
+                t.IsTrue(
+                    coarseCompletion->executionStateHash ==
+                        exactCompletion->executionStateHash,
+                    "paired completion should retain VU execution state");
+                t.IsTrue(
+                    coarseCompletion->microMemoryHash ==
+                        exactCompletion->microMemoryHash,
+                    "paired completion should retain VU micro memory");
+                t.IsTrue(
+                    coarseCompletion->dataMemoryHash ==
+                        exactCompletion->dataMemoryHash,
+                    "paired completion should retain VU data memory");
+                t.IsTrue(
+                    coarseCompletion->vifStateHash ==
+                        exactCompletion->vifStateHash,
+                    "paired completion should retain owner VIF state");
                 t.IsFalse(exactCompletion->busy,
                           "exact completion should publish Busy clear");
                 t.IsFalse(coarseCompletion->busy,

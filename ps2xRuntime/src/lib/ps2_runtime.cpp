@@ -7470,6 +7470,22 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
             prefix.state = std::move(extension.state);
             prefix.architecturalStateHash =
                 extension.architecturalStateHash;
+            if (prefix.diagnosticStateHashes &&
+                extension.diagnosticStateHashes)
+            {
+                extension.diagnosticStateHashes->inputAggregate =
+                    prefix.diagnosticStateHashes->inputAggregate;
+                extension.diagnosticStateHashes->inputExecution =
+                    prefix.diagnosticStateHashes->inputExecution;
+                extension.diagnosticStateHashes->inputMicroMemory =
+                    prefix.diagnosticStateHashes->inputMicroMemory;
+                extension.diagnosticStateHashes->inputDataMemory =
+                    prefix.diagnosticStateHashes->inputDataMemory;
+                extension.diagnosticStateHashes->inputVif =
+                    prefix.diagnosticStateHashes->inputVif;
+            }
+            prefix.diagnosticStateHashes =
+                std::move(extension.diagnosticStateHashes);
             prefix.vifCanResume =
                 extension.vifCanResume;
             prefix.fault = std::move(extension.fault);
@@ -8191,6 +8207,25 @@ bool PS2Runtime::completeVu1CoarseInvocation(
         entry.executedCycles = actual;
         entry.architecturalStateHash =
             invocation->architecturalStateHash;
+        if (invocation->diagnosticStateHashes)
+        {
+            entry.inputExecutionStateHash =
+                invocation->diagnosticStateHashes->inputExecution;
+            entry.inputMicroMemoryHash =
+                invocation->diagnosticStateHashes->inputMicroMemory;
+            entry.inputDataMemoryHash =
+                invocation->diagnosticStateHashes->inputDataMemory;
+            entry.inputVifStateHash =
+                invocation->diagnosticStateHashes->inputVif;
+            entry.executionStateHash =
+                invocation->diagnosticStateHashes->execution;
+            entry.microMemoryHash =
+                invocation->diagnosticStateHashes->microMemory;
+            entry.dataMemoryHash =
+                invocation->diagnosticStateHashes->dataMemory;
+            entry.vifStateHash =
+                invocation->diagnosticStateHashes->vif;
+        }
         entry.exitReason = invocation->run.reason;
         entry.hasExitReason = true;
         entry.schedulerEvent = schedulerEvent;
@@ -9437,6 +9472,24 @@ void PS2Runtime::serviceVU1AtEvent(
         throw std::runtime_error(
             "VU1 advance command returned no slice result");
     }
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    if (m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed) &&
+        m_vu1ExecutionTiming.totalAdvancedCycles == 0u &&
+        slice->diagnosticStateHashes)
+    {
+        m_debugVu1TimingInvocation.inputStateHashes.aggregate =
+            slice->diagnosticStateHashes->inputAggregate;
+        m_debugVu1TimingInvocation.inputStateHashes.execution =
+            slice->diagnosticStateHashes->inputExecution;
+        m_debugVu1TimingInvocation.inputStateHashes.microMemory =
+            slice->diagnosticStateHashes->inputMicroMemory;
+        m_debugVu1TimingInvocation.inputStateHashes.dataMemory =
+            slice->diagnosticStateHashes->inputDataMemory;
+        m_debugVu1TimingInvocation.inputStateHashes.vif =
+            slice->diagnosticStateHashes->inputVif;
+    }
+#endif
     publishVu1SliceEffects(*slice);
     const VuRunResult &advance = slice->run;
     m_vu1ExecutionTiming.totalAdvancedCycles +=
@@ -9545,6 +9598,29 @@ void PS2Runtime::serviceVU1AtEvent(
                 UINT32_MAX));
         entry.architecturalStateHash =
             slice->architecturalStateHash;
+        entry.inputExecutionStateHash =
+            m_debugVu1TimingInvocation.
+                inputStateHashes.execution;
+        entry.inputMicroMemoryHash =
+            m_debugVu1TimingInvocation.
+                inputStateHashes.microMemory;
+        entry.inputDataMemoryHash =
+            m_debugVu1TimingInvocation.
+                inputStateHashes.dataMemory;
+        entry.inputVifStateHash =
+            m_debugVu1TimingInvocation.
+                inputStateHashes.vif;
+        if (slice->diagnosticStateHashes)
+        {
+            entry.executionStateHash =
+                slice->diagnosticStateHashes->execution;
+            entry.microMemoryHash =
+                slice->diagnosticStateHashes->microMemory;
+            entry.dataMemoryHash =
+                slice->diagnosticStateHashes->dataMemory;
+            entry.vifStateHash =
+                slice->diagnosticStateHashes->vif;
+        }
         entry.exitReason = advance.reason;
         entry.hasExitReason = true;
         entry.schedulerEvent = true;
@@ -16433,6 +16509,8 @@ void PS2Runtime::debugStartVu1TimingTrace(
     m_debugVu1TimingTraceNext = 0u;
     m_debugVu1TimingTraceTotal = 0u;
     m_debugVu1TimingTraceStopOnFull = stopOnFull;
+    m_vu1CommandProcessor.
+        setDiagnosticArchitecturalStateHashes(true);
     m_debugVu1TimingTraceEnabled.store(
         true, std::memory_order_release);
 }
@@ -16571,6 +16649,8 @@ void PS2Runtime::debugRecordVu1Timing(
         {
             m_debugVu1TimingTraceEnabled.store(
                 false, std::memory_order_release);
+            m_vu1CommandProcessor.
+                setDiagnosticArchitecturalStateHashes(false);
         }
         return;
     }
@@ -16589,6 +16669,8 @@ PS2Runtime::debugVu1TimingTraceSnapshot(bool stop)
     {
         m_debugVu1TimingTraceEnabled.store(
             false, std::memory_order_release);
+        m_vu1CommandProcessor.
+            setDiagnosticArchitecturalStateHashes(false);
     }
 
     std::lock_guard<std::mutex> lock(
