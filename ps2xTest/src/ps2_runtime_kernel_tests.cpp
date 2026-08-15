@@ -40,6 +40,7 @@ namespace
 
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
+    constexpr int KE_ILLEGAL_PRIORITY = -403;
     constexpr int KE_ILLEGAL_THID = -406;
     constexpr int KE_UNKNOWN_THID = -407;
     constexpr int KE_UNKNOWN_SEMID = -408;
@@ -550,6 +551,8 @@ namespace
         OrdinaryCurrentRotation,
         OrdinaryThreeCurrentRotation,
         NamedRotation,
+        PriorityZeroRotation,
+        InvalidRotation,
     };
 
     ExecutorPriorityScenario g_executorPriorityScenario =
@@ -562,6 +565,9 @@ namespace
     int g_executorPriorityStatusValue = -1;
     int g_executorPriorityFirstThreadId = 0;
     int g_executorPrioritySecondThreadId = 0;
+    bool g_executorPriorityMechanismAvailable = false;
+    uint64_t g_executorPriorityPublicationDelta = 0u;
+    uint64_t g_executorPriorityDirectTransitionDelta = 0u;
     std::atomic<uint32_t> g_executorDebugSpinCount{0u};
     std::atomic<bool> g_executorDebugFinish{false};
     std::atomic<bool> g_executorDebugTargetRequested{
@@ -3814,6 +3820,17 @@ namespace
         int statusValue = -1;
         int firstThreadId = 0;
         int secondThreadId = 0;
+        std::optional<
+            ps2x::ee::EeRuntimeExecutorStatistics>
+            mechanismBefore;
+        std::optional<
+            ps2x::ee::EeRuntimeExecutorStatistics>
+            mechanismAfter;
+        const auto captureMechanism = [&]()
+        {
+            return runtime
+                ->debugEeRuntimeExecutorStatisticsSnapshot();
+        };
 
         switch (scenario)
         {
@@ -3878,8 +3895,10 @@ namespace
                     0x00316000u, 40u, 2u);
             recordMain(1);
             setRegU32(*ctx, 4, 40u);
+            mechanismBefore = captureMechanism();
             iRotateThreadReadyQueue(
                 rdram, ctx, runtime);
+            mechanismAfter = captureMechanism();
             operationResult = getRegS32(*ctx, 2);
             recordMain(3);
             setRegU32(*ctx, 4, 0u);
@@ -3897,8 +3916,10 @@ namespace
                     0x00317000u, 40u, 2u);
             recordMain(1);
             setRegU32(*ctx, 4, 40u);
+            mechanismBefore = captureMechanism();
             RotateThreadReadyQueue(
                 rdram, ctx, runtime);
+            mechanismAfter = captureMechanism();
             operationResult = getRegS32(*ctx, 2);
             recordMain(3);
             break;
@@ -3913,8 +3934,10 @@ namespace
                     0x00317800u, 40u, 3u);
             recordMain(1);
             setRegU32(*ctx, 4, 40u);
+            mechanismBefore = captureMechanism();
             RotateThreadReadyQueue(
                 rdram, ctx, runtime);
+            mechanismAfter = captureMechanism();
             operationResult = getRegS32(*ctx, 2);
             recordMain(4);
             break;
@@ -3928,8 +3951,10 @@ namespace
                     0x00319000u, 50u, 3u);
             recordMain(1);
             setRegU32(*ctx, 4, 50u);
+            mechanismBefore = captureMechanism();
             RotateThreadReadyQueue(
                 rdram, ctx, runtime);
+            mechanismAfter = captureMechanism();
             operationResult = getRegS32(*ctx, 2);
             recordMain(4);
             setRegU32(*ctx, 4, 0u);
@@ -3938,6 +3963,35 @@ namespace
                 rdram, ctx, runtime);
             triggerResult = getRegS32(*ctx, 2);
             recordMain(5);
+            break;
+
+        case ExecutorPriorityScenario::
+            PriorityZeroRotation:
+            firstThreadId =
+                createAndStart(
+                    0x0031a000u, 50u, 2u);
+            recordMain(1);
+            setRegU32(*ctx, 4, 0u);
+            mechanismBefore = captureMechanism();
+            RotateThreadReadyQueue(
+                rdram, ctx, runtime);
+            mechanismAfter = captureMechanism();
+            operationResult = getRegS32(*ctx, 2);
+            recordMain(3);
+            break;
+
+        case ExecutorPriorityScenario::InvalidRotation:
+            firstThreadId =
+                createAndStart(
+                    0x0031b000u, 50u, 2u);
+            recordMain(1);
+            setRegU32(*ctx, 4, 128u);
+            mechanismBefore = captureMechanism();
+            RotateThreadReadyQueue(
+                rdram, ctx, runtime);
+            mechanismAfter = captureMechanism();
+            operationResult = getRegS32(*ctx, 2);
+            recordMain(3);
             break;
         }
 
@@ -3956,6 +4010,28 @@ namespace
                 firstThreadId;
             g_executorPrioritySecondThreadId =
                 secondThreadId;
+            g_executorPriorityMechanismAvailable =
+                mechanismBefore.has_value() &&
+                mechanismAfter.has_value();
+            if (g_executorPriorityMechanismAvailable)
+            {
+                g_executorPriorityPublicationDelta =
+                    mechanismAfter
+                        ->publicationsQueued -
+                    mechanismBefore
+                        ->publicationsQueued;
+                g_executorPriorityDirectTransitionDelta =
+                    mechanismAfter->boundary
+                            .ownerLocalTransitionsApplied -
+                    mechanismBefore->boundary
+                            .ownerLocalTransitionsApplied;
+            }
+            else
+            {
+                g_executorPriorityPublicationDelta = 0u;
+                g_executorPriorityDirectTransitionDelta =
+                    0u;
+            }
             g_executorPriorityCompleted = true;
         }
         ctx->pc = 0u;
@@ -7810,6 +7886,9 @@ void register_ps2_runtime_kernel_tests()
                     int schedulerSecondPriority = -1;
                     bool schedulerValid = false;
                     bool schedulerInspected = false;
+                    bool mechanismAvailable = false;
+                    uint64_t publicationDelta = 0u;
+                    uint64_t directTransitionDelta = 0u;
                     size_t managedContinuations = 1u;
                     BackendFixtureEvidence evidence;
                 };
@@ -7867,6 +7946,12 @@ void register_ps2_runtime_kernel_tests()
                                 0;
                             g_executorPrioritySecondThreadId =
                                 0;
+                            g_executorPriorityMechanismAvailable =
+                                false;
+                            g_executorPriorityPublicationDelta =
+                                0u;
+                            g_executorPriorityDirectTransitionDelta =
+                                0u;
                         }
 
                         beginBackendFixtureEvidence(runtime);
@@ -7913,6 +7998,12 @@ void register_ps2_runtime_kernel_tests()
                                 g_executorPriorityFirstThreadId;
                             result.secondThreadId =
                                 g_executorPrioritySecondThreadId;
+                            result.mechanismAvailable =
+                                g_executorPriorityMechanismAvailable;
+                            result.publicationDelta =
+                                g_executorPriorityPublicationDelta;
+                            result.directTransitionDelta =
+                                g_executorPriorityDirectTransitionDelta;
                         }
 
                         if (runtime
@@ -7995,6 +8086,8 @@ void register_ps2_runtime_kernel_tests()
                     int mainPriority;
                     int firstPriority;
                     int secondPriority;
+                    int publicationDelta;
+                    int directTransitionDelta;
                 };
                 const auto describeOrder =
                     [](const std::vector<int> &order)
@@ -8016,7 +8109,7 @@ void register_ps2_runtime_kernel_tests()
                     };
                 const std::array<
                     ScenarioExpectation,
-                    6u>
+                    8u>
                     expectations{{
                         {
                             ExecutorPriorityScenario::
@@ -8028,6 +8121,8 @@ void register_ps2_runtime_kernel_tests()
                             30,
                             60,
                             30,
+                            -1,
+                            -1,
                             -1,
                         },
                         {
@@ -8041,6 +8136,8 @@ void register_ps2_runtime_kernel_tests()
                             40,
                             30,
                             -1,
+                            -1,
+                            -1,
                         },
                         {
                             ExecutorPriorityScenario::
@@ -8053,6 +8150,8 @@ void register_ps2_runtime_kernel_tests()
                             60,
                             40,
                             -1,
+                            1,
+                            0,
                         },
                         {
                             ExecutorPriorityScenario::
@@ -8065,6 +8164,8 @@ void register_ps2_runtime_kernel_tests()
                             40,
                             40,
                             -1,
+                            0,
+                            1,
                         },
                         {
                             ExecutorPriorityScenario::
@@ -8077,6 +8178,8 @@ void register_ps2_runtime_kernel_tests()
                             40,
                             40,
                             40,
+                            0,
+                            1,
                         },
                         {
                             ExecutorPriorityScenario::
@@ -8089,6 +8192,36 @@ void register_ps2_runtime_kernel_tests()
                             60,
                             50,
                             50,
+                            0,
+                            1,
+                        },
+                        {
+                            ExecutorPriorityScenario::
+                                PriorityZeroRotation,
+                            "literal priority-zero rotation",
+                            {1, 3, 2},
+                            0,
+                            KE_ERROR,
+                            -1,
+                            40,
+                            50,
+                            -1,
+                            0,
+                            1,
+                        },
+                        {
+                            ExecutorPriorityScenario::
+                                InvalidRotation,
+                            "invalid-priority rotation",
+                            {1, 3, 2},
+                            KE_ILLEGAL_PRIORITY,
+                            KE_ERROR,
+                            -1,
+                            40,
+                            50,
+                            -1,
+                            0,
+                            0,
                         },
                     }};
 
@@ -8176,6 +8309,22 @@ void register_ps2_runtime_kernel_tests()
                             " should keep scheduler "
                             "priority and ownership "
                             "authoritative");
+                    if (expectation.publicationDelta >= 0)
+                    {
+                        t.IsTrue(
+                            !host.mechanismAvailable &&
+                                fiber.mechanismAvailable &&
+                                fiber.publicationDelta ==
+                                    static_cast<uint64_t>(
+                                        expectation
+                                            .publicationDelta) &&
+                                fiber.directTransitionDelta ==
+                                    static_cast<uint64_t>(
+                                        expectation
+                                            .directTransitionDelta),
+                            std::string(expectation.name) +
+                                " should use the declared publication/direct-transition mechanism exactly once");
+                    }
                     t.IsTrue(
                         sameBackendFixtureEvidence(
                             host.evidence,

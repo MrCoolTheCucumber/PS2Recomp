@@ -2250,6 +2250,9 @@ public:
     eeThreadContextsForTesting();
     [[nodiscard]] bool
     usesDedicatedEeExecutor() const noexcept;
+    [[nodiscard]] bool
+    canYieldEeExecutorOwnerLocalTransition()
+        const noexcept;
     // Headless lifecycle seams used by focused runtime fixtures. The generic
     // pair starts whichever production backend was selected; the dedicated
     // pair retains the stricter executor-only contract used by fiber-specific
@@ -2291,7 +2294,9 @@ public:
                 HigherPriorityOnly);
     void yieldEeExecutorCurrent(
         ps2x::ee::EeSchedulerExitReason reason,
-        ps2x::ee::EeSchedulerWaitKey wait = {});
+        ps2x::ee::EeSchedulerWaitKey wait = {},
+        ps2x::ee::EeSchedulerOwnerLocalTransition
+            ownerLocalTransition = {});
     [[nodiscard]] const void *
     hostPresentationUploadStateIdentityForTesting() const noexcept;
     [[nodiscard]] size_t

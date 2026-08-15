@@ -3570,6 +3570,8 @@ namespace ps2_syscalls
         static int logCount = 0;
         int prio = static_cast<int>(getRegU32(ctx, 4));
         const int requestedPriority = prio;
+        const int callerThreadId =
+            getCurrentThreadId(runtime);
         if (logCount < 16)
         {
             RUNTIME_LOG("[RotateThreadReadyQueue] prio=" << prio);
@@ -3578,7 +3580,7 @@ namespace ps2_syscalls
         if (prio < 0 || prio >= 128)
         {
             runtime->recordEeThreadQueueRotation(
-                getCurrentThreadId(runtime),
+                callerThreadId,
                 requestedPriority,
                 prio,
                 false);
@@ -3587,17 +3589,49 @@ namespace ps2_syscalls
         }
 
         runtime->recordEeThreadQueueRotation(
-            getCurrentThreadId(runtime),
+            callerThreadId,
             requestedPriority,
             prio,
             true);
+
+        if (reschedule &&
+            runtime
+                ->canYieldEeExecutorOwnerLocalTransition())
+        {
+            const std::shared_ptr<ThreadInfo> callerInfo =
+                ensureCurrentThreadInfo(runtime, ctx);
+            if (!callerInfo ||
+                callerInfo->generation == 0u)
+            {
+                throw std::logic_error(
+                    "RotateThreadReadyQueue lost its "
+                    "executor-owned caller generation");
+            }
+            setReturnS32(ctx, prio);
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted,
+                {},
+                {
+                    ps2x::ee::
+                        EeSchedulerOwnerLocalTransitionKind::
+                            RotateReadyQueue,
+                    {
+                        callerThreadId,
+                        callerInfo->generation,
+                    },
+                    prio,
+                    ps2x::ee::
+                        EeSchedulerReschedulePolicy::
+                            EqualOrHigherPriority,
+                });
+            return;
+        }
 
         if (runtime->usesDedicatedEeExecutor())
         {
             const auto applied =
                 std::make_shared<bool>(false);
-            const int callerThreadId =
-                getCurrentThreadId(runtime);
             const bool published =
                 runtime->publishEeSchedulerUpdate(
                     [prio, callerThreadId, applied](

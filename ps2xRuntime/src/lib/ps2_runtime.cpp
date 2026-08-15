@@ -2212,6 +2212,22 @@ bool PS2Runtime::usesDedicatedEeExecutor() const noexcept
     return m_eeRuntimeExecutor != nullptr;
 }
 
+bool PS2Runtime::
+    canYieldEeExecutorOwnerLocalTransition()
+        const noexcept
+{
+    if (!m_eeRuntimeExecutor ||
+        !m_eeRuntimeExecutor->ownsCurrentThread() ||
+        g_eeExecutorConsequenceContext.runtime == this)
+    {
+        return false;
+    }
+    const auto depth = g_guestExecutionDepths.find(
+        const_cast<PS2Runtime *>(this));
+    return depth != g_guestExecutionDepths.end() &&
+           depth->second != 0u;
+}
+
 bool PS2Runtime::publishEeExecutorUpdate(
     std::function<void(
         ps2x::ee::EeThreadScheduler &,
@@ -2353,7 +2369,9 @@ PS2Runtime::eeExecutorElapsedSinceSelection()
 
 void PS2Runtime::yieldEeExecutorCurrent(
     ps2x::ee::EeSchedulerExitReason reason,
-    ps2x::ee::EeSchedulerWaitKey wait)
+    ps2x::ee::EeSchedulerWaitKey wait,
+    ps2x::ee::EeSchedulerOwnerLocalTransition
+        ownerLocalTransition)
 {
     if (!m_eeRuntimeExecutor)
     {
@@ -2365,6 +2383,12 @@ void PS2Runtime::yieldEeExecutorCurrent(
     if (g_eeExecutorConsequenceContext.runtime ==
         this)
     {
+        if (ownerLocalTransition.pending())
+        {
+            throw std::logic_error(
+                "an EE interrupt/callback consequence "
+                "cannot defer an owner-local transition");
+        }
         if (reason ==
                 ps2x::ee::EeSchedulerExitReason::
                     Blocked ||
@@ -2379,6 +2403,14 @@ void PS2Runtime::yieldEeExecutorCurrent(
         // returns the strongest accumulated reschedule policy after all
         // callback code finishes; there is no guest fiber to suspend here.
         return;
+    }
+
+    if (ownerLocalTransition.pending() &&
+        !canYieldEeExecutorOwnerLocalTransition())
+    {
+        throw std::logic_error(
+            "an owner-local EE transition requires the "
+            "currently running executor fiber");
     }
 
     R5900Context *releasedContext = nullptr;
@@ -2398,6 +2430,7 @@ void PS2Runtime::yieldEeExecutorCurrent(
                 elapsed.raw(),
                 wait,
                 {},
+                std::move(ownerLocalTransition),
             });
     }
     catch (...)
