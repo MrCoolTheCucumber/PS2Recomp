@@ -8,6 +8,7 @@
 #include <deque>
 #include <functional>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -119,6 +120,7 @@ namespace
             ps2x::timing::EeTickDelta elapsed,
             ps2x::timing::EeTick now) override
         {
+            eventOrder.push_back(1);
             commits.push_back(
                 Commit{
                     priorThreadId,
@@ -130,6 +132,7 @@ namespace
             std::optional<int> selectedThreadId,
             ps2x::timing::EeTick) override
         {
+            eventOrder.push_back(2);
             publishedThreads.push_back(
                 selectedThreadId.value_or(0));
         }
@@ -160,6 +163,7 @@ namespace
             ps2x::timing::EeTick,
             EeThreadScheduler &scheduler) override
         {
+            eventOrder.push_back(3);
             appliedStages.push_back(stage);
             std::deque<Action> &actions =
                 m_actions[
@@ -183,6 +187,7 @@ namespace
         std::vector<int> publishedThreads;
         std::vector<EeSchedulerConsequenceStage>
             appliedStages;
+        std::vector<int> eventOrder;
 
     private:
         std::array<
@@ -1208,6 +1213,189 @@ void register_ee_thread_scheduler_tests()
                             contextPublications == 4u &&
                     scheduler.validate(),
                 "stable-boundary statistics and scheduler invariants should agree");
+        });
+
+        tc.Run("owner-local transition commits before external consequences", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            EeSchedulerExecutor executor;
+            ScriptedBoundaryHooks hooks;
+            bool consequenceObservedTransition = false;
+            t.IsTrue(
+                scheduler.addRunningThread(1, 1u, 40) &&
+                    scheduler.addDormantThread(2, 1u, 40) &&
+                    scheduler.startThread(2) &&
+                    scheduler.addDormantThread(3, 1u, 40) &&
+                    scheduler.startThread(3) &&
+                    scheduler.addDormantThread(4, 1u, 10),
+                "the owner-local fixture should retain one runner, two equal peers, and one external wake target");
+            t.IsTrue(
+                equals(
+                    scheduler.readyOrder(40),
+                    {2, 3}),
+                "the pre-boundary equal-priority order should be explicit");
+
+            hooks.queue(
+                EeSchedulerConsequenceStage::
+                    AsynchronousWake,
+                [&consequenceObservedTransition](
+                    EeThreadScheduler &target,
+                    ScriptedBoundaryHooks &targetHooks)
+                {
+                    consequenceObservedTransition =
+                        target.currentThreadId()
+                                .value_or(0) == 3 &&
+                        equals(
+                            target.readyOrder(40),
+                            {2, 1});
+                    targetHooks.eventOrder.push_back(4);
+                    const auto wakeTarget =
+                        target.threadHandle(4);
+                    if (!wakeTarget.has_value() ||
+                        !target.startThread(*wakeTarget))
+                    {
+                        throw std::logic_error(
+                            "external wake could not start its target");
+                    }
+                });
+
+            const EeSchedulerOwnerLocalTransition transition{
+                EeSchedulerOwnerLocalTransitionKind::
+                    RotateReadyQueue,
+                {1, 1u},
+                40,
+                EeSchedulerReschedulePolicy::
+                    EqualOrHigherPriority,
+            };
+            const EeSchedulerBoundaryResult result =
+                executor.processBoundary(
+                    scheduler,
+                    hooks,
+                    EeSchedulerBoundaryInput{
+                        1,
+                        ps2x::timing::
+                            eeTickDeltaFromRaw(8u),
+                        EeSchedulerReschedulePolicy::None,
+                        transition,
+                    });
+            t.IsTrue(
+                result.tick.raw() == 8u &&
+                    result.ownerLocalTransitionsApplied ==
+                        1u &&
+                    result.consequencesProcessed == 1u &&
+                    result.contextPublications == 2u &&
+                    result.selectedThreadId.value_or(0) ==
+                        4,
+                "one boundary should apply one direct transition and then its queued external wake");
+            t.IsTrue(
+                consequenceObservedTransition &&
+                    equals(
+                        hooks.publishedThreads,
+                        {3, 4}) &&
+                    hooks.eventOrder ==
+                        std::vector<int>({1, 2, 3, 4, 2}),
+                "commit and the transition-selected context must precede the external consequence");
+            t.IsTrue(
+                equals(
+                    scheduler.readyOrder(40),
+                    {2, 1, 3}) &&
+                    executor.statistics()
+                            .ownerLocalTransitionsApplied ==
+                        1u &&
+                    scheduler.validate(),
+                "the direct transition should reschedule exactly once before the higher-priority wake");
+
+            EeThreadScheduler rejectedScheduler;
+            EeSchedulerExecutor rejectedExecutor;
+            ScriptedBoundaryHooks rejectedHooks;
+            t.IsTrue(
+                rejectedScheduler.addRunningThread(
+                    1, 1u, 40) &&
+                    rejectedScheduler.addDormantThread(
+                        2, 1u, 40) &&
+                    rejectedScheduler.startThread(2),
+                "the rejection fixture should retain an unchanged selected owner");
+            bool provisionalRejected = false;
+            try
+            {
+                static_cast<void>(
+                    rejectedExecutor.processBoundary(
+                        rejectedScheduler,
+                        rejectedHooks,
+                        EeSchedulerBoundaryInput{
+                            1,
+                            ps2x::timing::
+                                eeTickDeltaFromRaw(9u),
+                            EeSchedulerReschedulePolicy::
+                                EqualOrHigherPriority,
+                            transition,
+                        }));
+            }
+            catch (const std::logic_error &)
+            {
+                provisionalRejected = true;
+            }
+            t.IsTrue(
+                provisionalRejected &&
+                    rejectedExecutor.now().raw() == 0u &&
+                    rejectedHooks.commits.empty() &&
+                    rejectedScheduler.currentThreadId()
+                            .value_or(0) == 1 &&
+                    equals(
+                        rejectedScheduler.readyOrder(40),
+                        {2}),
+                "a pending transition must reject a provisional policy before committing or mutating state");
+
+            bool staleRejected = false;
+            EeSchedulerOwnerLocalTransition stale =
+                transition;
+            stale.originatingThread.generation = 2u;
+            try
+            {
+                static_cast<void>(
+                    rejectedExecutor.processBoundary(
+                        rejectedScheduler,
+                        rejectedHooks,
+                        EeSchedulerBoundaryInput{
+                            1,
+                            ps2x::timing::
+                                eeTickDeltaFromRaw(9u),
+                            EeSchedulerReschedulePolicy::None,
+                            stale,
+                        }));
+            }
+            catch (const std::logic_error &)
+            {
+                staleRejected = true;
+            }
+
+            bool wrongOwnerRejected = false;
+            std::thread wrongOwner([&]()
+            {
+                try
+                {
+                    static_cast<void>(
+                        rejectedExecutor.processBoundary(
+                            rejectedScheduler,
+                            rejectedHooks,
+                            1,
+                            ps2x::timing::
+                                eeTickDeltaFromRaw(1u),
+                            EeSchedulerReschedulePolicy::
+                                None));
+                }
+                catch (const std::logic_error &)
+                {
+                    wrongOwnerRejected = true;
+                }
+            });
+            wrongOwner.join();
+            t.IsTrue(
+                staleRejected && wrongOwnerRejected &&
+                    rejectedExecutor.now().raw() == 0u &&
+                    rejectedHooks.commits.empty() &&
+                    rejectedScheduler.validate(),
+                "stale handles and non-owner boundary calls must fail deterministically without partial application");
         });
 
         tc.Run("executor rejects recursion and bounds consequence storms", [](TestCase &t)

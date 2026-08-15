@@ -1292,6 +1292,227 @@ void register_ee_runtime_executor_tests()
             });
 
         tc.Run(
+            "owner-local transition precedes a queued host publication",
+            [](TestCase &t)
+            {
+                ScriptedRuntimeBackend backend;
+                EeRuntimeExecutor executor(backend);
+                std::mutex stageMutex;
+                std::condition_variable stageCv;
+                bool callerEntered = false;
+                bool allowBoundary = false;
+                bool publicationObservedTransition = false;
+                std::vector<int> order;
+                const EeSchedulerOwnerLocalTransition
+                    transition{
+                        EeSchedulerOwnerLocalTransitionKind::
+                            RotateReadyQueue,
+                        {1, 1u},
+                        40,
+                        EeSchedulerReschedulePolicy::
+                            EqualOrHigherPriority,
+                    };
+
+                backend.plan(
+                    1,
+                    {
+                        [&]()
+                        {
+                            std::unique_lock<std::mutex>
+                                lock(stageMutex);
+                            callerEntered = true;
+                            stageCv.notify_all();
+                            stageCv.wait(
+                                lock,
+                                [&]()
+                                {
+                                    return allowBoundary;
+                                });
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Preempted,
+                                5u,
+                                {},
+                                {},
+                                transition};
+                        },
+                        [&]()
+                        {
+                            {
+                                std::lock_guard<std::mutex>
+                                    lock(stageMutex);
+                                order.push_back(1);
+                            }
+                            stageCv.notify_all();
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Finished,
+                                1u,
+                                {},
+                                {}};
+                        },
+                    });
+                backend.plan(
+                    2,
+                    {
+                        [&]()
+                        {
+                            {
+                                std::lock_guard<std::mutex>
+                                    lock(stageMutex);
+                                order.push_back(2);
+                            }
+                            stageCv.notify_all();
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Finished,
+                                1u,
+                                {},
+                                {}};
+                        },
+                    });
+                executor.start(
+                    [](EeThreadScheduler &scheduler,
+                       IEeExecutionBackend &selectedBackend)
+                    {
+                        selectedBackend.create(1, []()
+                        {
+                        });
+                        selectedBackend.create(2, []()
+                        {
+                        });
+                        if (!scheduler.addRunningThread(
+                                1, 1u, 40) ||
+                            !scheduler.addDormantThread(
+                                2, 1u, 40) ||
+                            !scheduler.startThread(
+                                EeSchedulerThreadHandle{
+                                    2,
+                                    1u}))
+                        {
+                            throw std::logic_error(
+                                "failed to seed owner-local "
+                                "transition fixture");
+                        }
+                    });
+                const bool reachedCaller = waitFor(
+                    stageCv,
+                    stageMutex,
+                    [&]()
+                    {
+                        return callerEntered;
+                    });
+                const bool published =
+                    reachedCaller &&
+                    executor.publish(
+                        [&](EeThreadScheduler &scheduler,
+                            IEeExecutionBackend &)
+                        {
+                            const std::lock_guard<std::mutex>
+                                lock(stageMutex);
+                            publicationObservedTransition =
+                                scheduler.currentThreadId()
+                                        .value_or(0) == 2 &&
+                                scheduler.readyOrder(40) ==
+                                    std::vector<int>{1};
+                        },
+                        EeSchedulerReschedulePolicy::None);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        stageMutex);
+                    allowBoundary = true;
+                }
+                stageCv.notify_all();
+                const bool completed = waitFor(
+                    stageCv,
+                    stageMutex,
+                    [&]()
+                    {
+                        return order.size() == 2u;
+                    });
+                executor.requestStop();
+                executor.join();
+                executor.rethrowFailure();
+
+                const EeRuntimeExecutorStatistics stats =
+                    executor.statistics();
+                t.IsTrue(
+                    reachedCaller && published &&
+                        completed &&
+                        publicationObservedTransition &&
+                        order == std::vector<int>({2, 1}),
+                    "a queued host command must observe the transition-selected owner before either guest resumes");
+                t.IsTrue(
+                    stats.boundary
+                            .ownerLocalTransitionsApplied ==
+                            1u &&
+                        stats.publicationsQueued == 1u &&
+                        stats.publicationsApplied == 1u &&
+                        stats.failures == 0u,
+                    "one owner-local transition should bypass publication accounting and apply exactly once");
+
+                ScriptedRuntimeBackend staleBackend;
+                EeRuntimeExecutor staleExecutor(
+                    staleBackend);
+                staleBackend.plan(
+                    1,
+                    {
+                        []()
+                        {
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Preempted,
+                                7u,
+                                {},
+                                {},
+                                {
+                                    EeSchedulerOwnerLocalTransitionKind::
+                                        RotateReadyQueue,
+                                    {1, 2u},
+                                    40,
+                                    EeSchedulerReschedulePolicy::
+                                        EqualOrHigherPriority,
+                                }};
+                        },
+                    });
+                staleExecutor.start(
+                    [](EeThreadScheduler &scheduler,
+                       IEeExecutionBackend &selectedBackend)
+                    {
+                        selectedBackend.create(1, []()
+                        {
+                        });
+                        if (!scheduler.addRunningThread(
+                                1, 1u, 40))
+                        {
+                            throw std::logic_error(
+                                "failed to seed stale owner-"
+                                "local transition fixture");
+                        }
+                    });
+                staleExecutor.join();
+                bool staleFailed = false;
+                try
+                {
+                    staleExecutor.rethrowFailure();
+                }
+                catch (const std::logic_error &error)
+                {
+                    staleFailed =
+                        std::string(error.what()).find(
+                            "stale") != std::string::npos;
+                }
+                t.IsTrue(
+                    staleFailed &&
+                        staleExecutor.statistics().failures ==
+                            1u &&
+                        staleExecutor.statistics().boundary
+                                .ownerLocalTransitionsApplied ==
+                            0u,
+                    "a stale transition should enter the existing executor failure path without partial application");
+            });
+
+        tc.Run(
             "no-reschedule publication preserves an already-ready caller",
             [](TestCase &t)
             {

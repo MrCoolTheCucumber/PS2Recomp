@@ -2733,6 +2733,11 @@ struct PS2DebugServer::Impl
                 statistics.boundary.boundaries,
                 allocator);
             boundary.AddMember(
+                "owner_local_transitions_applied",
+                statistics.boundary
+                    .ownerLocalTransitionsApplied,
+                allocator);
+            boundary.AddMember(
                 "consequences",
                 statistics.boundary.consequences,
                 allocator);

@@ -1,8 +1,112 @@
 #include "runtime/ee_scheduler_executor.h"
 #include "runtime/ps2_build_config.h"
 
+#include <stdexcept>
+
 namespace ps2x::ee
 {
+    void EeSchedulerExecutor::requireOwner()
+    {
+        const std::thread::id current =
+            std::this_thread::get_id();
+        if (m_ownerThreadId == std::thread::id{})
+        {
+            m_ownerThreadId = current;
+            return;
+        }
+        if (m_ownerThreadId != current)
+        {
+            throw std::logic_error(
+                "EE scheduler boundary requires its owner "
+                "thread");
+        }
+    }
+
+    void EeSchedulerExecutor::
+        validateOwnerLocalTransition(
+            const EeThreadScheduler &scheduler,
+            const EeSchedulerBoundaryInput &input) const
+    {
+        const EeSchedulerOwnerLocalTransition &transition =
+            input.ownerLocalTransition;
+        if (!transition.structurallyValid())
+        {
+            throw std::logic_error(
+                "EE scheduler boundary received an invalid "
+                "owner-local transition");
+        }
+        if (!transition.pending())
+        {
+            return;
+        }
+        if (input.initialPolicy !=
+            EeSchedulerReschedulePolicy::None)
+        {
+            throw std::logic_error(
+                "an owner-local transition requires a "
+                "suppressed provisional reschedule");
+        }
+        if (!input.priorThreadId.has_value() ||
+            *input.priorThreadId !=
+                transition.originatingThread.id ||
+            scheduler.currentThreadId() !=
+                input.priorThreadId)
+        {
+            throw std::logic_error(
+                "an owner-local transition does not match "
+                "the exiting scheduler owner");
+        }
+        const auto currentHandle =
+            scheduler.threadHandle(
+                transition.originatingThread.id);
+        if (!currentHandle.has_value() ||
+            *currentHandle !=
+                transition.originatingThread)
+        {
+            throw std::logic_error(
+                "an owner-local transition has a stale "
+                "originating thread handle");
+        }
+    }
+
+    std::optional<int>
+    EeSchedulerExecutor::applyOwnerLocalTransition(
+        EeThreadScheduler &scheduler,
+        const EeSchedulerOwnerLocalTransition &transition)
+    {
+        switch (transition.kind)
+        {
+        case EeSchedulerOwnerLocalTransitionKind::
+            RotateReadyQueue:
+            if (!scheduler.rotateReadyQueue(
+                    transition.priority))
+            {
+                throw std::logic_error(
+                    "an owner-local ready-queue rotation "
+                    "violated a scheduler invariant");
+            }
+            break;
+        case EeSchedulerOwnerLocalTransitionKind::None:
+            throw std::logic_error(
+                "an empty owner-local transition cannot be "
+                "applied");
+        default:
+            throw std::logic_error(
+                "unknown owner-local scheduler transition");
+        }
+
+        const std::optional<int> selected =
+            scheduler.reschedule(
+                transition.reschedulePolicy);
+        if (!selected.has_value())
+        {
+            throw std::logic_error(
+                "an owner-local transition lost the "
+                "selected scheduler context");
+        }
+        return selected;
+    }
+
     std::optional<EeSchedulerConsequenceStage>
     EeSchedulerExecutor::nextImmediateStage(
         const IEeSchedulerExecutorHooks &hooks,
@@ -30,10 +134,9 @@ namespace ps2x::ee
     EeSchedulerExecutor::processBoundary(
         EeThreadScheduler &scheduler,
         IEeSchedulerExecutorHooks &hooks,
-        std::optional<int> priorThreadId,
-        ps2x::timing::EeTickDelta elapsed,
-        EeSchedulerReschedulePolicy initialPolicy)
+        EeSchedulerBoundaryInput input)
     {
+        requireOwner();
         EeSchedulerBoundaryResult result{};
         result.tick = m_timeline.now();
         result.selectedThreadId =
@@ -48,17 +151,31 @@ namespace ps2x::ee
         m_processingBoundary = true;
         try
         {
+            validateOwnerLocalTransition(
+                scheduler, input);
             result.tick =
-                m_timeline.advance(elapsed);
+                m_timeline.advance(input.elapsed);
             scheduler.publishCanonicalTick(
                 result.tick);
             hooks.commitPriorContext(
-                priorThreadId,
-                elapsed,
+                input.priorThreadId,
+                input.elapsed,
                 result.tick);
 
-            result.selectedThreadId =
-                scheduler.reschedule(initialPolicy);
+            if (input.ownerLocalTransition.pending())
+            {
+                result.selectedThreadId =
+                    applyOwnerLocalTransition(
+                        scheduler,
+                        input.ownerLocalTransition);
+                result.ownerLocalTransitionsApplied = 1u;
+            }
+            else
+            {
+                result.selectedThreadId =
+                    scheduler.reschedule(
+                        input.initialPolicy);
+            }
             hooks.publishSelectedContext(
                 result.selectedThreadId,
                 result.tick);
@@ -122,6 +239,8 @@ namespace ps2x::ee
         m_processingBoundary = false;
 
         ++m_statistics.boundaries;
+        m_statistics.ownerLocalTransitionsApplied +=
+            result.ownerLocalTransitionsApplied;
         m_statistics.consequences +=
             result.consequencesProcessed;
         m_statistics.contextPublications +=
@@ -131,6 +250,25 @@ namespace ps2x::ee
             ++m_statistics.consequenceLimitHits;
         }
         return result;
+    }
+
+    EeSchedulerBoundaryResult
+    EeSchedulerExecutor::processBoundary(
+        EeThreadScheduler &scheduler,
+        IEeSchedulerExecutorHooks &hooks,
+        std::optional<int> priorThreadId,
+        ps2x::timing::EeTickDelta elapsed,
+        EeSchedulerReschedulePolicy initialPolicy)
+    {
+        return processBoundary(
+            scheduler,
+            hooks,
+            EeSchedulerBoundaryInput{
+                priorThreadId,
+                elapsed,
+                initialPolicy,
+                {},
+            });
     }
 
     void EeSchedulerExecutor::applyDebugControl(
@@ -276,5 +414,6 @@ namespace ps2x::ee
             false, std::memory_order_release);
         m_debugStopRequested.store(
             false, std::memory_order_release);
+        m_ownerThreadId = {};
     }
 }

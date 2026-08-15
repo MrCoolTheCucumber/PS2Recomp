@@ -9,14 +9,16 @@
 #include <cstdint>
 #include <optional>
 #include <string_view>
+#include <thread>
 
 namespace ps2x::ee
 {
-    // Values are the deterministic order within one executor boundary.
-    // The guest's explicit syscall mutation (including ready rotation) has
-    // already completed before the boundary begins. Published host wakes
-    // are then made visible, modeled wait deadlines expire, due devices
-    // advance, and only afterward are their interrupt causes delivered.
+    // Values are the deterministic consequence order within one executor
+    // boundary. An owner-local guest transition, when present, is applied
+    // after prior-context commit and before these external consequences.
+    // Published host wakes are then made visible, modeled wait deadlines
+    // expire, due devices advance, and only afterward are interrupt causes
+    // delivered.
     enum class EeSchedulerConsequenceStage : uint8_t
     {
         AsynchronousWake = 0u,
@@ -107,10 +109,22 @@ namespace ps2x::ee
         StopRequested,
     };
 
+    struct EeSchedulerBoundaryInput
+    {
+        std::optional<int> priorThreadId;
+        ps2x::timing::EeTickDelta elapsed{};
+        EeSchedulerReschedulePolicy initialPolicy =
+            EeSchedulerReschedulePolicy::
+                HigherPriorityOnly;
+        EeSchedulerOwnerLocalTransition
+            ownerLocalTransition{};
+    };
+
     struct EeSchedulerBoundaryResult
     {
         ps2x::timing::EeTick tick{};
         std::optional<int> selectedThreadId;
+        size_t ownerLocalTransitionsApplied = 0u;
         size_t consequencesProcessed = 0u;
         size_t contextPublications = 0u;
         bool limitExceeded = false;
@@ -128,6 +142,7 @@ namespace ps2x::ee
     struct EeSchedulerExecutorStatistics
     {
         uint64_t boundaries = 0u;
+        uint64_t ownerLocalTransitionsApplied = 0u;
         uint64_t consequences = 0u;
         uint64_t contextPublications = 0u;
         uint64_t consequenceLimitHits = 0u;
@@ -143,6 +158,15 @@ namespace ps2x::ee
         static constexpr size_t
             kMaximumConsequencesPerBoundary = 1024u;
 
+        [[nodiscard]] EeSchedulerBoundaryResult
+        processBoundary(
+            EeThreadScheduler &scheduler,
+            IEeSchedulerExecutorHooks &hooks,
+            EeSchedulerBoundaryInput input);
+
+        // Compatibility overload for boundaries which have no owner-local
+        // transition. New executor code passes EeSchedulerBoundaryInput
+        // explicitly so a transition cannot be hidden in host publication.
         [[nodiscard]] EeSchedulerBoundaryResult
         processBoundary(
             EeThreadScheduler &scheduler,
@@ -171,6 +195,14 @@ namespace ps2x::ee
         void reset() noexcept;
 
     private:
+        void requireOwner();
+        void validateOwnerLocalTransition(
+            const EeThreadScheduler &scheduler,
+            const EeSchedulerBoundaryInput &input) const;
+        [[nodiscard]] std::optional<int>
+        applyOwnerLocalTransition(
+            EeThreadScheduler &scheduler,
+            const EeSchedulerOwnerLocalTransition &transition);
         [[nodiscard]] std::optional<
             EeSchedulerConsequenceStage>
         nextImmediateStage(
@@ -186,5 +218,6 @@ namespace ps2x::ee
         std::atomic<bool> m_debugStopRequested{false};
         std::atomic<uint64_t>
             m_debugStepBoundariesRemaining{0u};
+        std::thread::id m_ownerThreadId;
     };
 }

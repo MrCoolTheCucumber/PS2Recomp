@@ -835,6 +835,9 @@ namespace ps2x::ee
 
                 std::optional<int> priorThreadId;
                 ps2x::timing::EeTickDelta elapsed{};
+                std::optional<
+                    EeSchedulerOwnerLocalTransition>
+                    pendingOwnerLocalTransition;
                 std::exception_ptr pendingGuestFailure;
                 bool dispatched = false;
                 bool continuationDestroyed = false;
@@ -852,13 +855,31 @@ namespace ps2x::ee
                         break;
                     }
 
+                    EeSchedulerOwnerLocalTransition
+                        ownerLocalTransition;
+                    if (pendingOwnerLocalTransition
+                            .has_value())
+                    {
+                        ownerLocalTransition =
+                            std::exchange(
+                                *pendingOwnerLocalTransition,
+                                EeSchedulerOwnerLocalTransition{});
+                        pendingOwnerLocalTransition.reset();
+                    }
+                    EeSchedulerBoundaryInput boundaryInput{
+                        priorThreadId,
+                        elapsed,
+                        ownerLocalTransition.pending()
+                            ? EeSchedulerReschedulePolicy::
+                                  None
+                            : loop.boundaryPolicy,
+                        std::move(ownerLocalTransition),
+                    };
                     const EeSchedulerBoundaryResult boundary =
                         m_boundaryExecutor.processBoundary(
                             m_scheduler,
                             *this,
-                            priorThreadId,
-                            elapsed,
-                            loop.boundaryPolicy);
+                            std::move(boundaryInput));
                     priorThreadId.reset();
                     elapsed = {};
                     const PublishedBoundaryState published =
@@ -931,7 +952,7 @@ namespace ps2x::ee
                             boundary.tick);
                     }
 
-                    const auto dispatch =
+                    auto dispatch =
                         m_scheduler.dispatchOne(
                             m_backend,
                             m_options.tickBudget);
@@ -947,6 +968,23 @@ namespace ps2x::ee
                     elapsed =
                         ps2x::timing::EeTickDelta::fromRaw(
                             dispatch->result.elapsedTicks);
+                    if (dispatch->result
+                            .ownerLocalTransition.pending())
+                    {
+                        if (pendingOwnerLocalTransition
+                                .has_value())
+                        {
+                            throw std::logic_error(
+                                "EE runtime executor received "
+                                "a duplicate pending owner-"
+                                "local transition");
+                        }
+                        pendingOwnerLocalTransition.emplace(
+                            std::exchange(
+                                dispatch->result
+                                    .ownerLocalTransition,
+                                EeSchedulerOwnerLocalTransition{}));
+                    }
 
                     const bool terminal =
                         dispatch->result.reason ==
