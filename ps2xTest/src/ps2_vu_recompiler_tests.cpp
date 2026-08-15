@@ -3,6 +3,7 @@
 #include "runtime/ps2_vu_recompiler.h"
 
 #include <array>
+#include <cfenv>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -606,6 +607,124 @@ void register_ps2_vu_recompiler_tests()
                         context, VuCompilationMode::Normal,
                         key, &diagnostic),
                     "detached code should not bypass generation tracking");
+            });
+
+        tc.Run(
+            "native floating point mode preserves the complete host environment",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "VU memory fixture should initialize");
+                // MADDA.xyzw ACC, vf1, vf5.x. These operands distinguish
+                // truncation from round-to-nearest in every lane.
+                writePair(
+                    fixture.code, 0u, 0u,
+                    0x01E508BCu);
+                fixture.markCodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                VuRecompilerBackend backend(unit);
+                VuExecutionState state =
+                    initialSyntheticState();
+                const uint32_t vf1Bits[4] = {
+                    0xBED52018u, 0x409A33CEu,
+                    0xBFC2EB57u, 0x3B110CC2u};
+                const uint32_t vf5Bits[4] = {
+                    0xC4454000u, 0x44454000u,
+                    0xC6881A00u, 0x42380000u};
+                const uint32_t accBits[4] = {
+                    0x4A90B980u, 0x4A87EA00u,
+                    0x4B6A2CB4u, 0x4501E920u};
+                const uint32_t expectedBits[4] = {
+                    0x4A90BC10u, 0x4A87CC4Bu,
+                    0x4B6A3165u, 0x4501CD2Fu};
+                for (size_t lane = 0u; lane < 4u; ++lane)
+                {
+                    std::memcpy(
+                        &state.vf[1][lane], &vf1Bits[lane],
+                        sizeof(vf1Bits[lane]));
+                    std::memcpy(
+                        &state.vf[5][lane], &vf5Bits[lane],
+                        sizeof(vf5Bits[lane]));
+                    std::memcpy(
+                        &state.acc[lane], &accBits[lane],
+                        sizeof(accBits[lane]));
+                }
+
+                const int originalRounding =
+                    std::fegetround();
+#if defined(__SSE__)
+                const uint32_t originalMxcsr =
+                    _mm_getcsr();
+#endif
+                struct HostFloatModeRestore
+                {
+                    int rounding = -1;
+#if defined(__SSE__)
+                    uint32_t mxcsr = 0u;
+#endif
+
+                    ~HostFloatModeRestore()
+                    {
+                        if (rounding != -1)
+                            std::fesetround(rounding);
+#if defined(__SSE__)
+                        _mm_setcsr(mxcsr);
+#endif
+                    }
+                };
+                const HostFloatModeRestore restore{
+                    originalRounding,
+#if defined(__SSE__)
+                    originalMxcsr,
+#endif
+                };
+
+                t.Equals(
+                    std::fesetround(FE_UPWARD), 0,
+                    "the upward rounding probe should be supported");
+#if defined(__SSE__)
+                constexpr uint32_t kDenormalsAreZero =
+                    1u << 6u;
+                constexpr uint32_t kFlushToZero =
+                    1u << 15u;
+                const uint32_t probeMxcsr =
+                    _mm_getcsr() &
+                    ~(kDenormalsAreZero | kFlushToZero);
+                _mm_setcsr(probeMxcsr);
+#endif
+
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(state, fixture, effects);
+                const VuRunResult result =
+                    backend.run(context, 1u);
+                t.Equals(
+                    result.executedCycles, uint32_t{1u},
+                    "the native block should execute one pair");
+                for (size_t lane = 0u; lane < 4u; ++lane)
+                {
+                    uint32_t actual = 0u;
+                    std::memcpy(
+                        &actual, &state.acc[lane],
+                        sizeof(actual));
+                    t.Equals(
+                        actual, expectedBits[lane],
+                        "native MADDA should truncate toward zero");
+                }
+                t.Equals(
+                    std::fegetround(), FE_UPWARD,
+                    "native execution should preserve x87 rounding");
+#if defined(__SSE__)
+                t.Equals(
+                    _mm_getcsr(), probeMxcsr,
+                    "native execution should restore exact MXCSR");
+#endif
             });
 
         tc.Run(

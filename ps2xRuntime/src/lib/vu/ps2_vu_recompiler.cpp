@@ -5689,7 +5689,7 @@ VuRunResult VuRecompilerBackend::run(
         return finish(0u, VuExitReason::CycleBudget);
     }
 
-    const ScopedVuFloatMode vuFloatMode;
+    const ScopedVuRecompilerFloatMode vuFloatMode;
     VuProgramKey key;
     const VuCompilationMode compilationMode =
         nativeInstrumentation

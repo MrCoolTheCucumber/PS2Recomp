@@ -130,6 +130,61 @@ private:
 #endif
 };
 
+// The x86-64 recompiler emits SSE-family floating-point instructions and its
+// C++ float helpers are compiled for SSE scalar math.  They observe MXCSR, not
+// the legacy x87 control word.  Keep the full guard above for the portable
+// interpreter, but avoid two serializing x87 control-word transitions at every
+// native run boundary.
+class ScopedVuRecompilerFloatMode
+{
+public:
+    ScopedVuRecompilerFloatMode()
+#if PS2X_VU_DIRECT_X86_FLOAT_MODE && defined(__SSE_MATH__)
+        : m_previousMxcsr(_mm_getcsr())
+    {
+        constexpr uint32_t kMxcsrRoundingMask = 3u << 13u;
+        constexpr uint32_t kMxcsrRoundTowardZero = 3u << 13u;
+        constexpr uint32_t kDenormalsAreZero = 1u << 6u;
+        constexpr uint32_t kFlushToZero = 1u << 15u;
+        const uint32_t vuMxcsr =
+            (m_previousMxcsr & ~kMxcsrRoundingMask) |
+            kMxcsrRoundTowardZero |
+            kDenormalsAreZero |
+            kFlushToZero;
+        if (vuMxcsr != m_previousMxcsr)
+        {
+            _mm_setcsr(vuMxcsr);
+            m_changed = true;
+        }
+    }
+#else
+        : m_fallback()
+    {
+    }
+#endif
+
+    ~ScopedVuRecompilerFloatMode()
+    {
+#if PS2X_VU_DIRECT_X86_FLOAT_MODE && defined(__SSE_MATH__)
+        if (m_changed)
+            _mm_setcsr(m_previousMxcsr);
+#endif
+    }
+
+    ScopedVuRecompilerFloatMode(
+        const ScopedVuRecompilerFloatMode &) = delete;
+    ScopedVuRecompilerFloatMode &operator=(
+        const ScopedVuRecompilerFloatMode &) = delete;
+
+private:
+#if PS2X_VU_DIRECT_X86_FLOAT_MODE && defined(__SSE_MATH__)
+    uint32_t m_previousMxcsr = 0u;
+    bool m_changed = false;
+#else
+    ScopedVuFloatMode m_fallback;
+#endif
+};
+
 #undef PS2X_VU_DIRECT_X86_FLOAT_MODE
 
 #endif
