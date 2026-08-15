@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -192,11 +193,30 @@ namespace
         return true;
     }
 
+    bool parseNonnegativeInt(
+        const std::string &text,
+        int &value)
+    {
+        int parsed = 0;
+        const char *const begin = text.data();
+        const char *const end = begin + text.size();
+        const auto result =
+            std::from_chars(begin, end, parsed, 10);
+        if (begin == end || result.ec != std::errc{} ||
+            result.ptr != end || parsed < 0)
+        {
+            return false;
+        }
+        value = parsed;
+        return true;
+    }
+
     void printUsage(const char *program)
     {
         std::cout
             << "Usage: " << program
             << " [--renderer software|hybrid|verify|gpu-strict]"
+               " [--monitor NONNEGATIVE_INTEGER]"
                " [--gs-execution inline|threaded-sync|threaded-async]"
                " [--gs-command-queue-capacity POSITIVE_INTEGER]"
                " [--vu1-execution inline|threaded-sync|threaded-async|threaded-coarse]"
@@ -208,6 +228,7 @@ namespace
     {
         bool showHelp = false;
         GsRendererMode rendererMode = GsRendererMode::Software;
+        std::optional<int> monitorIndex;
         GsExecutionMode gsExecutionMode = GsExecutionMode::Inline;
         // Absorb short command bursts without relaxing the threaded GS field bound.
         size_t gsCommandQueueCapacity = 512u;
@@ -241,6 +262,18 @@ namespace
                     throw std::invalid_argument(
                         "--renderer requires software, hybrid, verify, or gpu-strict");
                 }
+                continue;
+            }
+            if (!optionsEnded && argument == "--monitor")
+            {
+                int monitorIndex = 0;
+                if (++i >= argc || !argv[i] ||
+                    !parseNonnegativeInt(argv[i], monitorIndex))
+                {
+                    throw std::invalid_argument(
+                        "--monitor requires a nonnegative integer");
+                }
+                options.monitorIndex = monitorIndex;
                 continue;
             }
             if (!optionsEnded && argument == "--gs-execution")
@@ -383,6 +416,8 @@ int main(int argc, char *argv[])
 
         PS2RuntimeConfiguration runtimeConfiguration =
             defaultPs2RuntimeConfiguration();
+        runtimeConfiguration.hostMonitorIndex =
+            options.monitorIndex;
         runtimeConfiguration.gsExecutionMode =
             options.gsExecutionMode;
         runtimeConfiguration.gsCommandQueueCapacity =

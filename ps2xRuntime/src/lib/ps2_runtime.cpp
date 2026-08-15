@@ -1437,6 +1437,13 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
       m_cpuContext(
           R5900Context::InitializationProfile::PostBiosElf)
 {
+    m_hostMonitorIndex = configuration.hostMonitorIndex;
+    if (m_hostMonitorIndex.has_value() &&
+        *m_hostMonitorIndex < 0)
+    {
+        throw std::invalid_argument(
+            "the host monitor index must be nonnegative");
+    }
     m_vu1CommandPayloadCapacityBytes =
         configuration.vu1CommandPayloadCapacityBytes;
     if (g_ps2RecompiledFunctionPairAbiVersion !=
@@ -9670,6 +9677,37 @@ bool PS2Runtime::initialize(const char *title)
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, m_windowTitle.c_str());
+#if defined(PLATFORM_DESKTOP)
+        if (m_hostMonitorIndex.has_value())
+        {
+            const int monitorIndex = *m_hostMonitorIndex;
+            const int monitorCount = GetMonitorCount();
+            if (monitorIndex < monitorCount)
+            {
+                SetWindowMonitor(monitorIndex);
+                const char *const monitorName =
+                    GetMonitorName(monitorIndex);
+                std::cout
+                    << "Host monitor: " << monitorIndex;
+                if (monitorName && monitorName[0] != '\0')
+                {
+                    std::cout << " (" << monitorName << ")";
+                }
+                std::cout
+                    << ", " << GetMonitorWidth(monitorIndex)
+                    << "x" << GetMonitorHeight(monitorIndex)
+                    << std::endl;
+            }
+            else
+            {
+                std::cerr
+                    << "Requested host monitor " << monitorIndex
+                    << " is unavailable (" << monitorCount
+                    << " connected); retaining default window placement"
+                    << std::endl;
+            }
+        }
+#endif
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif

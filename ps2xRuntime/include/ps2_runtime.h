@@ -82,6 +82,9 @@ namespace ps2_stubs
 
 struct PS2RuntimeConfiguration
 {
+    // Desktop monitor index used to place the host window after creation.
+    // An unset value leaves placement to the window manager.
+    std::optional<int> hostMonitorIndex;
     GsExecutionMode gsExecutionMode = GsExecutionMode::Inline;
     size_t gsCommandQueueCapacity = 64u;
     uint64_t gsCommandPayloadCapacityBytes =
@@ -3542,6 +3545,7 @@ private:
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
     void *m_debugUiUserData = nullptr;
     std::string m_windowTitle{"PS2 Game"};
+    std::optional<int> m_hostMonitorIndex;
 
     bool m_debugUiInitialized = false;
 
