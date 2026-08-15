@@ -974,7 +974,7 @@ struct PS2DebugServer::Impl
         const VuProgressSnapshot vu1Progress =
             runtime.vu1ProgressSnapshot();
         const std::shared_ptr<const Vu1Snapshot> vu1Owner =
-            runtime.snapshotVu1Owner();
+            runtime.debugSnapshotVu1Owner();
         const auto vuDiagnostics =
             runtime.debugVuBackendDiagnosticsSnapshot();
         Value result(rapidjson::kObjectType);
@@ -1651,6 +1651,14 @@ struct PS2DebugServer::Impl
             "invocations_published",
             vu1Coarse.invocationsPublished, allocator);
         vu1CoarseValue.AddMember(
+            "invocations_discarded_at_failure",
+            vu1Coarse.invocationsDiscardedAtFailure,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "invocations_discarded_at_shutdown",
+            vu1Coarse.invocationsDiscardedAtShutdown,
+            allocator);
+        vu1CoarseValue.AddMember(
             "results_ready_at_event",
             vu1Coarse.resultsReadyAtEvent, allocator);
         vu1CoarseValue.AddMember(
@@ -1690,6 +1698,51 @@ struct PS2DebugServer::Impl
         vu1CoarseValue.AddMember(
             "forced_barrier_count",
             vu1Coarse.forcedBarrierCount, allocator);
+        Value forcedBarriersByCommandType(
+            rapidjson::kObjectType);
+        for (size_t index = 0u;
+             index < kVu1CommandTypeCount; ++index)
+        {
+            const Vu1CommandType type =
+                static_cast<Vu1CommandType>(index);
+            Value commandName(
+                vu1CommandTypeName(type), allocator);
+            forcedBarriersByCommandType.AddMember(
+                commandName,
+                vu1Coarse.forcedBarriersByCommandType[index],
+                allocator);
+        }
+        vu1CoarseValue.AddMember(
+            "forced_barriers_by_command_type",
+            forcedBarriersByCommandType, allocator);
+        vu1CoarseValue.AddMember(
+            "non_publishing_diagnostic_snapshot_count",
+            vu1Coarse.nonPublishingDiagnosticSnapshotCount,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "non_publishing_diagnostics_update_count",
+            vu1Coarse.nonPublishingDiagnosticsUpdateCount,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "non_publishing_backend_change_count",
+            vu1Coarse.nonPublishingBackendChangeCount,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "non_publishing_vif_state_update_count",
+            vu1Coarse.nonPublishingVifStateUpdateCount,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "non_publishing_diagnostic_snapshot_wait_count",
+            vu1Coarse.nonPublishingDiagnosticSnapshotWaitCount,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "non_publishing_diagnostic_snapshot_wait_ns",
+            vu1Coarse.nonPublishingDiagnosticSnapshotWaitNanoseconds,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "maximum_non_publishing_diagnostic_snapshot_wait_ns",
+            vu1Coarse.maximumNonPublishingDiagnosticSnapshotWaitNanoseconds,
+            allocator);
         vu1CoarseValue.AddMember(
             "forced_wait_count",
             vu1Coarse.forcedWaitCount, allocator);
@@ -1699,6 +1752,26 @@ struct PS2DebugServer::Impl
         vu1CoarseValue.AddMember(
             "maximum_forced_wait_ns",
             vu1Coarse.maximumForcedWaitNanoseconds,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "path1_reservations_started",
+            vu1Coarse.path1ReservationsStarted,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "path1_reservations_released",
+            vu1Coarse.path1ReservationsReleased,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "path1_reservations_invalidated",
+            vu1Coarse.path1ReservationsInvalidated,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "path1_reservations_discarded_at_failure",
+            vu1Coarse.path1ReservationsDiscardedAtFailure,
+            allocator);
+        vu1CoarseValue.AddMember(
+            "path1_reservations_discarded_at_shutdown",
+            vu1Coarse.path1ReservationsDiscardedAtShutdown,
             allocator);
         vu1CoarseValue.AddMember(
             "path1_bytes_published",
@@ -3152,7 +3225,7 @@ struct PS2DebugServer::Impl
     {
         QuiesceGuard guard(runtime);
         const VuExecutionState state =
-            vu1 ? runtime.snapshotVu1Owner()->state
+            vu1 ? runtime.debugSnapshotVu1Owner()->state
                 : runtime.debugVu0ArchitecturalSnapshot();
         return vuRegistersFromState(vu1, state, allocator);
     }
@@ -3802,6 +3875,14 @@ struct PS2DebugServer::Impl
                 PS2Runtime::debugVu1TimingEventKindName(
                     source.kind),
                 allocator);
+            if (source.hasBarrierCommandType)
+            {
+                addString(
+                    entry, "barrier_command_type",
+                    vu1CommandTypeName(
+                        source.barrierCommandType),
+                    allocator);
+            }
             addString(
                 entry, "mode",
                 vu1ExecutionModeName(source.mode), allocator);
@@ -4042,7 +4123,7 @@ struct PS2DebugServer::Impl
         if (unit == VuUnitId::Vu1)
         {
             const std::shared_ptr<const Vu1Snapshot> snapshot =
-                runtime.snapshotVu1Owner();
+                runtime.debugSnapshotVu1Owner();
             addString(
                 result, "requested",
                 vuBackendKindName(snapshot->requestedBackend),
@@ -4592,7 +4673,7 @@ struct PS2DebugServer::Impl
     {
         QuiesceGuard guard(runtime);
         const std::shared_ptr<const Vu1Snapshot> vu1Snapshot =
-            vu1 ? runtime.snapshotVu1Owner() : nullptr;
+            vu1 ? runtime.debugSnapshotVu1Owner() : nullptr;
         const VuExecutionState state =
             vu1 ? vu1Snapshot->state
                 : runtime.debugVu0ArchitecturalSnapshot();

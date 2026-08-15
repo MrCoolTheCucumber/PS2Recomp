@@ -3209,6 +3209,7 @@ namespace
     {
         switch (vu1CommandType(payload))
         {
+        case Vu1CommandType::SetDiagnostics:
         case Vu1CommandType::MicroMemoryWrite:
         case Vu1CommandType::DataMemoryWrite:
         case Vu1CommandType::DecodedUnpack:

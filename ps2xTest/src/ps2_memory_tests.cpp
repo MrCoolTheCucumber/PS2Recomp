@@ -3106,6 +3106,93 @@ void register_ps2_memory_tests()
             t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
         });
 
+        tc.Run("GIF arbiter reservation keeps future PATH1 ahead of later paths", [](TestCase &t)
+        {
+            std::vector<uint8_t> order;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                if (data && sizeBytes >= 16u)
+                    order.push_back(data[8]);
+            });
+            auto makeEmptyPacket = [](uint8_t marker)
+            {
+                std::vector<uint8_t> packet;
+                appendU64(
+                    packet,
+                    makeGifTag(
+                        0u, GIF_FMT_PACKED, 1u, true));
+                appendU64(packet, marker);
+                return packet;
+            };
+            const std::vector<uint8_t> path1 =
+                makeEmptyPacket(0x11u);
+            const std::vector<uint8_t> path2 =
+                makeEmptyPacket(0x22u);
+            const std::vector<uint8_t> path3 =
+                makeEmptyPacket(0x33u);
+
+            const GifArbiter::Path1ReservationToken reservation =
+                arbiter.reservePath1();
+            arbiter.submit(
+                GifPathId::Path3, path3.data(),
+                static_cast<uint32_t>(path3.size()));
+            arbiter.submit(
+                GifPathId::Path2, path2.data(),
+                static_cast<uint32_t>(path2.size()));
+            arbiter.drain();
+            t.IsTrue(order.empty(),
+                     "later paths must remain queued behind future PATH1");
+            t.IsFalse(arbiter.canAcceptPath2(false),
+                      "DIRECT should stall while future PATH1 is unresolved");
+            t.IsFalse(arbiter.canAcceptPath2(true),
+                      "DIRECTHL should stall while future PATH1 is unresolved");
+            t.IsFalse(arbiter.empty(),
+                      "the reservation should be part of arbiter state");
+
+            arbiter.submit(
+                GifPathId::Path1, path1.data(),
+                static_cast<uint32_t>(path1.size()));
+            arbiter.drain();
+            t.IsTrue(order.empty(),
+                     "PATH1 bytes must remain private until reservation release");
+            t.IsTrue(arbiter.releasePath1(reservation),
+                     "the matching future-PATH1 token should release once");
+            t.IsFalse(arbiter.releasePath1(reservation),
+                      "a reservation token must not release twice");
+            arbiter.drain();
+
+            t.Equals(order.size(), size_t{3u},
+                     "release should drain every complete queued packet");
+            t.Equals(order[0], uint8_t{0x11u},
+                     "resolved PATH1 should drain before later PATH2");
+            t.Equals(order[1], uint8_t{0x22u},
+                     "PATH2 should drain before PATH3");
+            t.Equals(order[2], uint8_t{0x33u},
+                     "PATH3 should drain last");
+            t.IsTrue(arbiter.empty(),
+                     "released and drained state should be empty");
+        });
+
+        tc.Run("GIF reset invalidates a future PATH1 reservation", [](TestCase &t)
+        {
+            GifArbiter arbiter;
+            const GifArbiter::Path1ReservationToken reservation =
+                arbiter.reservePath1();
+            t.Equals(arbiter.pendingPath1Reservations(), size_t{1u},
+                     "the fixture should own one future PATH1 token");
+            arbiter.reset();
+            t.Equals(arbiter.pendingPath1Reservations(), size_t{0u},
+                     "GIF reset should discard future path state");
+            t.IsFalse(arbiter.releasePath1(reservation),
+                      "a pre-reset token must be stale after reset");
+            const GifArbiter::Path1ReservationToken next =
+                arbiter.reservePath1();
+            t.IsTrue(next != reservation,
+                     "reset must not recycle a stale reservation identity");
+            t.IsTrue(arbiter.releasePath1(next),
+                     "the post-reset reservation should remain valid");
+        });
+
         tc.Run("GIF arbiter drain batches own bytes and preserve DIRECTHL ordering", [](TestCase &t)
         {
             GifArbiter arbiter;

@@ -1304,7 +1304,7 @@ void register_ps2_vu1_command_stream_tests()
             ThreadedVu1Executor executor(
                 processor,
                 ThreadedVu1ExecutorOptions{
-                    .queueCapacity = 4u,
+                    .queueCapacity = 5u,
                     .payloadCapacityBytes = 4096u,
                     .beforeProcess =
                         [gate](const Vu1Command &command, uint64_t ticket)
@@ -1367,6 +1367,13 @@ void register_ps2_vu1_command_stream_tests()
                             .row = {50u, 60u, 70u, 80u},
                         }},
                     14u, 7u);
+            const Vu1CommandAdmission fifth =
+                executor.submitResultless(
+                    Vu1SetDiagnosticsCommand{
+                        .traceEnabled = true,
+                        .workloadProfileEnabled = true,
+                    },
+                    15u, 7u);
 
             t.Equals(first.identity.sequence, 1ull,
                      "the first admitted command should own sequence one");
@@ -1376,13 +1383,15 @@ void register_ps2_vu1_command_stream_tests()
                      "the data write should retain stream order");
             t.Equals(fourth.identity.sequence, 4ull,
                      "the trailing state should retain stream order");
+            t.Equals(fifth.identity.sequence, 5ull,
+                     "the diagnostics update should retain stream order");
             const ThreadedVu1ExecutorStatistics admitted =
                 executor.statistics();
-            t.Equals(admitted.submittedTickets, 4ull,
+            t.Equals(admitted.submittedTickets, 5ull,
                      "all bounded resultless traffic should be admitted while the owner is held");
             t.Equals(admitted.resultWaitCount, 0ull,
                      "resultless admission must not allocate producer completion waits");
-            t.Equals(admitted.queueDepth, size_t{3u},
+            t.Equals(admitted.queueDepth, size_t{4u},
                      "the blocked owner should leave the admitted suffix in the bounded queue");
 
             gate->release();
@@ -1395,7 +1404,7 @@ void register_ps2_vu1_command_stream_tests()
                      "one explicit observation should drain all preceding resultless work");
             if (!snapshot || !snapshot->snapshot)
                 return;
-            t.Equals(snapshotResult.identity.sequence, 5ull,
+            t.Equals(snapshotResult.identity.sequence, 6ull,
                      "the observation should follow every admitted mutation");
             t.Equals(
                 snapshot->snapshot->vif,
@@ -1420,11 +1429,12 @@ void register_ps2_vu1_command_stream_tests()
 
             const ThreadedVu1ExecutorStatistics drained =
                 executor.statistics();
-            t.Equals(drained.completedTickets, 5ull,
+            t.Equals(drained.completedTickets, 6ull,
                      "the observation should retire the complete ordered prefix");
             t.Equals(drained.resultWaitCount, 1ull,
                      "only the explicit snapshot should consume a result wait");
             for (const Vu1CommandType type : {
+                     Vu1CommandType::SetDiagnostics,
                      Vu1CommandType::DataMemoryWrite,
                      Vu1CommandType::DecodedUnpack,
                      Vu1CommandType::VifStateUpdate})
@@ -4280,6 +4290,69 @@ void register_ps2_vu1_command_stream_tests()
                      "all estimator input output and result streams should be digested");
         });
 
+        tc.Run("runtime coarse BC2 polling observes only published Busy", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse BC2 runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse BC2 runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(2u, 0u, 11),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            R5900Context &context = runtime.cpu();
+            t.IsTrue(runtime.readCop2Condition(&context),
+                     "BC2 should observe Busy immediately after MSCAL");
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1CoarseStatistics();
+                        return statistics.owner.commandTypes[
+                            vu1CommandTypeIndex(
+                                Vu1CommandType::Invocation)]
+                            .completed == 1u;
+                    }),
+                "the BC2 fixture should complete privately");
+            t.IsTrue(runtime.readCop2Condition(&context),
+                     "private host completion must not clear published Busy");
+            const Vu1CoarseRuntimeStatistics privateStatistics =
+                runtime.vu1CoarseStatistics();
+            t.Equals(privateStatistics.invocationsPublished, 0ull,
+                     "BC2 polling must not publish private owner work");
+            t.Equals(privateStatistics.forcedBarrierCount, 0ull,
+                     "BC2 polling must not become an owner barrier");
+
+            const PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            context.advanceEeCycleTicks(
+                timing.eventDeadlineTick - timing.currentTick);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(runtime.readCop2Condition(&context),
+                      "BC2 should observe idle only after scheduled publication");
+            t.Equals(runtime.vu1CoarseStatistics().invocationsPublished,
+                     1ull,
+                     "the scheduled event should publish exactly once");
+        });
+
         tc.Run("runtime VU1 timing trace retains bounded observation order", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -4690,6 +4763,11 @@ void register_ps2_vu1_command_stream_tests()
                      "the observation barrier should publish owner state first");
             t.Equals(statistics.forcedBarrierCount, 1ull,
                      "the pre-event snapshot should record one explicit drain");
+            t.Equals(
+                statistics.forcedBarriersByCommandType[
+                    vu1CommandTypeIndex(Vu1CommandType::Snapshot)],
+                1ull,
+                "the explicit drain should be attributed to its snapshot command");
             t.Equals(statistics.invocationsPublished, 1ull,
                      "the drain should publish the invocation exactly once");
             t.IsFalse(statistics.pendingInvocation,
@@ -4698,6 +4776,557 @@ void register_ps2_vu1_command_stream_tests()
                       "the observation drain should clear Busy");
             t.IsFalse(timing.eventPending,
                       "the observation drain should cancel the old estimate event");
+        });
+
+        tc.Run("runtime coarse mapped memory read drains before exposing owner memory", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse memory runtime should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse memory runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(2u, 0u, 11),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1CoarseStatistics();
+                        return statistics.owner.commandTypes[
+                            vu1CommandTypeIndex(
+                                Vu1CommandType::Invocation)]
+                            .completed == 1u;
+                    }),
+                "the memory fixture should have ready private work");
+
+            t.Equals(
+                runtime.memory().read32(PS2_VU1_DATA_BASE),
+                uint32_t{0u},
+                "the mapped read should return the synchronized owner mirror");
+            const Vu1CoarseRuntimeStatistics statistics =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            t.Equals(statistics.forcedBarrierCount, 1ull,
+                     "the mapped read should force one architectural drain");
+            t.Equals(
+                statistics.forcedBarriersByCommandType[
+                    vu1CommandTypeIndex(Vu1CommandType::Snapshot)],
+                1ull,
+                "the memory mirror drain should use a typed snapshot barrier");
+            t.Equals(statistics.invocationsPublished, 1ull,
+                     "the memory observation should publish owner state once");
+            t.IsFalse(statistics.pendingInvocation,
+                      "the memory observation should consume the pending future");
+            t.IsFalse(timing.active || timing.eventPending,
+                      "the memory observation should clear Busy and its event");
+        });
+
+        tc.Run("runtime coarse mode-2 UNPACK feedback linearizes pending VU work", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 3u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse feedback runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse feedback runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(2u, 0u, 11),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+
+            const std::array<uint32_t, 12u> commands = {
+                makeVifCommand(0x14u, 0u, 0u),
+                makeVifCommand(0x05u, 0u, 2u),
+                makeVifCommand(0x30u, 0u, 0u),
+                1u, 2u, 3u, 4u,
+                makeVifCommand(0x6cu, 1u, 0u),
+                10u, 20u, 30u, 40u,
+            };
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(commands.data()),
+                static_cast<uint32_t>(sizeof(commands)));
+
+            const Vu1CoarseRuntimeStatistics statistics =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            t.Equals(statistics.forcedBarrierCount, 1ull,
+                     "mode-2 row feedback should force one owner linearization");
+            t.Equals(statistics.nonPublishingVifStateUpdateCount, 2ull,
+                     "STMOD and STROW should remain ordered without publishing");
+            std::string observedBarrierType = "none";
+            for (size_t index = 0u;
+                 index < kVu1CommandTypeCount; ++index)
+            {
+                if (statistics.forcedBarriersByCommandType[index] != 0u)
+                {
+                    observedBarrierType = vu1CommandTypeName(
+                        static_cast<Vu1CommandType>(index));
+                    break;
+                }
+            }
+            t.Equals(
+                statistics.forcedBarriersByCommandType[
+                    vu1CommandTypeIndex(
+                        Vu1CommandType::DecodedUnpack)],
+                1ull,
+                std::string(
+                    "the feedback barrier should be attributed to decoded UNPACK; observed ") +
+                    observedBarrierType);
+            t.Equals(statistics.invocationsPublished, 1ull,
+                     "feedback should publish the prior invocation once");
+            t.Equals(statistics.path1ReservationsReleased, 1ull,
+                     "feedback publication should release future PATH1 once");
+            t.IsFalse(statistics.pendingInvocation,
+                      "feedback should leave no pending invocation");
+            t.IsFalse(timing.active || timing.eventPending,
+                      "feedback should clear Busy and cancel its old event");
+            t.Equals(snapshot->state.vi[2], int32_t{11},
+                     "feedback should retain completed VU register state");
+            t.IsTrue(
+                snapshot->vif.row ==
+                    std::array<uint32_t, 4u>{11u, 22u, 33u, 44u},
+                "mode-2 feedback should apply against synchronized row state");
+        });
+
+        tc.Run("runtime chains MSCAL MSCNT and VIF waits through coarse events", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 1u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse chained-VIF runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse chained-VIF runtime subsystems should bind");
+
+            const auto makeVuBranch = [](int16_t immediate)
+            {
+                return (0x20u << 25u) |
+                       (static_cast<uint32_t>(immediate) & 0x07ffu);
+            };
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u, makeVuBranch(2), kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u,
+                makeVuIaddiu(1u, 0u, 1),
+                kVuUpperNop);
+            writeRuntimeVu1InstructionPair(
+                runtime, 24u,
+                makeVuIaddiu(2u, 0u, 7),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 32u, 0u, kVuUpperNop);
+
+            const std::array<uint32_t, 5u> commands = {
+                makeVifCommand(0x14u, 0u, 0u),
+                makeVifCommand(0x11u, 0u, 0u),
+                makeVifCommand(0x17u, 0u, 0u),
+                makeVifCommand(0x11u, 0u, 0u),
+                makeVifCommand(0x05u, 0u, 3u),
+            };
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(commands.data()),
+                static_cast<uint32_t>(sizeof(commands)));
+            t.IsTrue(runtime.memory().vif1WaitingForVu(),
+                     "the first FLUSH should defer MSCNT and STMOD");
+
+            R5900Context &context = runtime.cpu();
+            const auto serviceNextVuEvent =
+                [&runtime, &context, &t](
+                    uint64_t expectedPublished,
+                    const char *description)
+                {
+                    for (uint32_t attempt = 0u;
+                         attempt < 2u; ++attempt)
+                    {
+                        const PS2Runtime::DebugVu1Timing timing =
+                            runtime.debugVu1TimingSnapshot();
+                        if (!timing.eventPending ||
+                            timing.eventDeadlineTick < timing.currentTick)
+                        {
+                            t.Fail(std::string(description) +
+                                   " should retain a future VU event");
+                            return false;
+                        }
+                        context.advanceEeCycleTicks(
+                            timing.eventDeadlineTick - timing.currentTick);
+                        runtime.serviceEeEventsAtBlockBoundary(
+                            runtime.memory().getRDRAM(), &context);
+                        if (runtime.vu1CoarseStatistics()
+                                .invocationsPublished ==
+                            expectedPublished)
+                        {
+                            return true;
+                        }
+                    }
+                    t.Fail(std::string(description) +
+                           " should publish within its bounded causal deadline");
+                    return false;
+                };
+
+            if (!serviceNextVuEvent(1u, "the first invocation"))
+                return;
+            const Vu1CoarseRuntimeStatistics afterFirst =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing resumed =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(resumed.active && resumed.eventPending,
+                     "MSCNT should schedule a fresh coarse invocation");
+            t.IsTrue(runtime.memory().vif1WaitingForVu(),
+                     "the second FLUSH should retain the VIF wait");
+            t.Equals(runtime.memory().vif1_regs.mode, 0u,
+                     "STMOD should remain deferred behind MSCNT");
+            t.Equals(afterFirst.invocationsSubmitted, 2ull,
+                     "VIF resume should submit the MSCNT continuation once");
+            t.Equals(afterFirst.path1ReservationsStarted, 2ull,
+                     "each bounded invocation should reserve future PATH1");
+            t.Equals(afterFirst.path1ReservationsReleased, 1ull,
+                     "only the first invocation should release PATH1 yet");
+            t.Equals(afterFirst.forcedBarrierCount, 0ull,
+                     "ordinary VIF waits should publish only at events");
+
+            if (!serviceNextVuEvent(2u, "the second invocation"))
+                return;
+            const Vu1CoarseRuntimeStatistics completed =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing finalTiming =
+                runtime.debugVu1TimingSnapshot();
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            t.IsFalse(snapshot->state.active,
+                      "the resumed E-bit segment should finish");
+            t.Equals(snapshot->state.vi[1], int32_t{1},
+                     "the first segment should publish its delay slot");
+            t.Equals(snapshot->state.vi[2], int32_t{7},
+                     "MSCNT should resume at the canonical branch target");
+            t.IsFalse(runtime.memory().vif1WaitingForVu(),
+                      "second completion should wake VIF1");
+            t.Equals(runtime.memory().vif1_regs.mode, 3u,
+                     "the deferred STMOD should execute last");
+            t.IsFalse(finalTiming.active || finalTiming.eventPending,
+                      "the complete chain should leave no VU future");
+            t.IsFalse(completed.pendingInvocation,
+                      "the complete chain should retire both invocations");
+            t.Equals(completed.invocationsPublished, 2ull,
+                     "both segments should publish at their own events");
+            t.Equals(completed.path1ReservationsStarted, 2ull,
+                     "the chain should create two PATH1 reservations");
+            t.Equals(completed.path1ReservationsReleased, 2ull,
+                     "the chain should release both PATH1 reservations");
+            t.Equals(completed.forcedBarrierCount, 0ull,
+                     "the final snapshot should not need an extra barrier");
+        });
+
+        tc.Run("runtime coarse debugger snapshot cannot publish a pending future", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse debugger runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse debugger runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(2u, 0u, 11),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1CoarseStatistics();
+                        return statistics.owner.commandTypes[
+                            vu1CommandTypeIndex(
+                                Vu1CommandType::Invocation)]
+                            .completed == 1u;
+                    }),
+                "the debugger fixture should have ready private work");
+
+            const PS2Runtime::DebugVu1Timing before =
+                runtime.debugVu1TimingSnapshot();
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.debugSnapshotVu1Owner();
+            const Vu1CoarseRuntimeStatistics observed =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing after =
+                runtime.debugVu1TimingSnapshot();
+            t.Equals(snapshot->state.vi[2], int32_t{11},
+                     "the debugger may inspect privately completed owner state");
+            t.Equals(observed.forcedBarrierCount, 0ull,
+                     "a debugger snapshot must not become an architectural drain");
+            t.Equals(
+                observed.forcedBarriersByCommandType[
+                    vu1CommandTypeIndex(Vu1CommandType::Snapshot)],
+                0ull,
+                "a debugger snapshot must not enter architectural attribution");
+            t.Equals(
+                observed.nonPublishingDiagnosticSnapshotCount,
+                1ull,
+                "the pending diagnostic snapshot should be attributed explicitly");
+            t.Equals(
+                observed.nonPublishingDiagnosticSnapshotWaitCount,
+                1ull,
+                "the pending diagnostic snapshot should record its owner wait");
+            t.Equals(observed.invocationsPublished, 0ull,
+                     "debugger observation must not publish the pending invocation");
+            t.IsTrue(observed.pendingInvocation,
+                     "debugger observation must retain the scheduled future");
+            t.IsTrue(after.active && after.eventPending,
+                     "debugger observation must retain Busy and its event");
+            t.Equals(after.currentTick, before.currentTick,
+                     "debugger observation must not advance guest time");
+            t.Equals(after.eventDeadlineTick, before.eventDeadlineTick,
+                     "debugger observation must retain the publication deadline");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(
+                after.eventDeadlineTick - after.currentTick);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const Vu1CoarseRuntimeStatistics published =
+                runtime.vu1CoarseStatistics();
+            t.Equals(published.invocationsPublished, 1ull,
+                     "the original event should publish the invocation once");
+            t.IsFalse(published.pendingInvocation,
+                      "the original event should consume the scheduled future");
+            t.IsFalse(runtime.debugVu1TimingSnapshot().active,
+                      "the original event should clear Busy");
+        });
+
+        tc.Run("runtime coarse backend change stays behind a pending future", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse backend runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse backend runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(2u, 0u, 11),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1CoarseStatistics();
+                        return statistics.owner.commandTypes[
+                            vu1CommandTypeIndex(
+                                Vu1CommandType::Invocation)]
+                            .completed == 1u;
+                    }),
+                "the backend fixture should have ready private work");
+
+            const PS2Runtime::DebugVu1Timing before =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(runtime.debugPause(2s, "coarse-backend-test"),
+                     "the backend fixture should reach a guest safe point");
+            std::string diagnostic;
+            t.IsTrue(
+                runtime.debugSetVuBackend(
+                    VuUnitId::Vu1,
+                    VuBackendKind::Interpreter,
+                    &diagnostic, 2s),
+                "the ordered owner should accept the interpreter backend");
+            t.IsTrue(diagnostic.empty(),
+                     "an accepted backend change should have no diagnostic");
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.debugSnapshotVu1Owner();
+            const Vu1CoarseRuntimeStatistics observed =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing after =
+                runtime.debugVu1TimingSnapshot();
+            t.Equals(snapshot->requestedBackend,
+                     VuBackendKind::Interpreter,
+                     "the backend mutation should execute after prior owner work");
+            t.Equals(snapshot->resolvedBackend,
+                     VuBackendKind::Interpreter,
+                     "the owner should resolve the requested backend");
+            t.Equals(observed.nonPublishingBackendChangeCount, 1ull,
+                     "the pending backend mutation should be attributed once");
+            t.Equals(observed.forcedBarrierCount, 0ull,
+                     "a debugger backend mutation must not publish guest work");
+            t.Equals(observed.invocationsPublished, 0ull,
+                     "the backend mutation must retain private invocation state");
+            t.IsTrue(observed.pendingInvocation,
+                     "the backend mutation must retain the scheduled future");
+            t.IsTrue(after.active && after.eventPending,
+                     "the backend mutation must retain Busy and its event");
+            t.Equals(after.currentTick, before.currentTick,
+                     "the backend mutation must not advance guest time");
+            t.Equals(after.eventDeadlineTick, before.eventDeadlineTick,
+                     "the backend mutation must retain the publication deadline");
+
+            runtime.debugResume();
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(
+                after.eventDeadlineTick - after.currentTick);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const Vu1CoarseRuntimeStatistics published =
+                runtime.vu1CoarseStatistics();
+            t.Equals(published.invocationsPublished, 1ull,
+                     "the original event should still publish exactly once");
+            t.IsFalse(published.pendingInvocation,
+                      "the original event should retire the invocation");
+        });
+
+        tc.Run("runtime coarse owner memory mutations stay behind a pending future", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 3u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse mutation runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse mutation runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(2u, 0u, 11),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1CoarseStatistics();
+                        return statistics.owner.commandTypes[
+                            vu1CommandTypeIndex(
+                                Vu1CommandType::Invocation)]
+                            .completed == 1u;
+                    }),
+                "the mutation fixture should have ready private work");
+            const PS2Runtime::DebugVu1Timing before =
+                runtime.debugVu1TimingSnapshot();
+
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE + 0x100u,
+                0x44332211u);
+            runtime.memory().write32(
+                PS2_VU1_DATA_BASE + 0x20u,
+                0xaabbccddu);
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.debugSnapshotVu1Owner();
+            uint32_t codeWord = 0u;
+            uint32_t dataWord = 0u;
+            std::memcpy(
+                &codeWord,
+                snapshot->microMemory.data() + 0x100u,
+                sizeof(codeWord));
+            std::memcpy(
+                &dataWord,
+                snapshot->dataMemory.data() + 0x20u,
+                sizeof(dataWord));
+            const Vu1CoarseRuntimeStatistics observed =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing after =
+                runtime.debugVu1TimingSnapshot();
+            t.Equals(snapshot->state.vi[2], int32_t{11},
+                     "the ordered snapshot should include prior invocation state");
+            t.Equals(codeWord, uint32_t{0x44332211u},
+                     "the owner should apply the ordered micro-memory mutation");
+            t.Equals(dataWord, uint32_t{0xaabbccddu},
+                     "the owner should apply the ordered data-memory mutation");
+            t.Equals(
+                snapshot->codeGeneration,
+                runtime.memory().getVU1CodeGeneration(),
+                "micro-memory mutation should preserve owner cache generation order");
+            t.Equals(observed.forcedBarrierCount, 0ull,
+                     "ordered owner mutations should not publish guest work");
+            t.Equals(observed.invocationsPublished, 0ull,
+                     "ordered owner mutations should retain private invocation state");
+            t.IsTrue(observed.pendingInvocation,
+                     "ordered owner mutations should retain the scheduled future");
+            t.IsTrue(after.active && after.eventPending,
+                     "ordered owner mutations should retain Busy and its event");
+            t.Equals(after.currentTick, before.currentTick,
+                     "ordered owner mutations must not advance guest time");
+            t.Equals(after.eventDeadlineTick, before.eventDeadlineTick,
+                     "ordered owner mutations must retain the publication deadline");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(
+                after.eventDeadlineTick - after.currentTick);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const Vu1CoarseRuntimeStatistics published =
+                runtime.vu1CoarseStatistics();
+            t.Equals(published.invocationsPublished, 1ull,
+                     "the original event should still publish once");
+            t.IsFalse(published.pendingInvocation,
+                      "the original event should retire the invocation");
         });
 
         tc.Run("runtime coarse event reports a forced host wait without moving guest time", [](TestCase &t)
@@ -4786,6 +5415,457 @@ void register_ps2_vu1_command_stream_tests()
             t.Equals(timing.totalAdvancedCycles,
                      static_cast<uint64_t>(statistics.lastActualCycles),
                      "publication should account actual guest VU cycles only");
+        });
+
+        tc.Run("runtime coarse future PATH1 reservation blocks later GIF paths", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse PATH1 runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse PATH1 runtime subsystems should bind");
+
+            std::vector<uint8_t> gifOrder;
+            runtime.gifArbiter().setProcessPacketFn(
+                [&gifOrder](const uint8_t *data, uint32_t sizeBytes)
+                {
+                    if (data && sizeBytes >= 16u)
+                        gifOrder.push_back(data[8]);
+                });
+            const uint64_t gifTag =
+                (1ull << 15u) | (2ull << 58u);
+            std::array<uint8_t, 16u> firstPath1{};
+            std::array<uint8_t, 16u> secondPath1{};
+            std::memcpy(
+                firstPath1.data(), &gifTag, sizeof(gifTag));
+            firstPath1[8] = 0x11u;
+            std::memcpy(
+                secondPath1.data(), &gifTag, sizeof(gifTag));
+            secondPath1[8] = 0x22u;
+            writeRuntimeVu1Qword(runtime, 0u, firstPath1);
+            writeRuntimeVu1Qword(
+                runtime, 4u * 16u, secondPath1);
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(1u, 0u, 0),
+                kVuUpperNop);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u,
+                makeVuLowerSpecial(0x6cu, 1u),
+                kVuUpperNop);
+            writeRuntimeVu1InstructionPair(
+                runtime, 16u,
+                makeVuIaddiu(1u, 0u, 4),
+                kVuUpperNop);
+            writeRuntimeVu1InstructionPair(
+                runtime, 24u,
+                makeVuLowerSpecial(0x6cu, 1u),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 32u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+
+            std::array<uint8_t, 16u> path2{};
+            std::memcpy(path2.data(), &gifTag, sizeof(gifTag));
+            path2[8] = 0x33u;
+            runtime.memory().submitGifPacket(
+                GifPathId::Path2,
+                path2.data(),
+                static_cast<uint32_t>(path2.size()));
+            t.IsTrue(gifOrder.empty(),
+                     "later PATH2 must not overtake unresolved VU PATH1");
+            t.Equals(
+                runtime.gifArbiter().pendingPath1Reservations(),
+                size_t{1u},
+                "one coarse invocation should own one future PATH1 marker");
+            t.IsFalse(runtime.gifArbiter().canAcceptPath2(false),
+                      "VIF DIRECT should stall behind the future PATH1 marker");
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1CoarseStatistics();
+                        return statistics.owner.commandTypes[
+                            vu1CommandTypeIndex(
+                                Vu1CommandType::Invocation)]
+                            .completed == 1u;
+                    }),
+                "the PATH1 invocation should resolve privately");
+            t.IsTrue(gifOrder.empty(),
+                     "owner completion alone must not release future PATH1");
+
+            const PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(
+                timing.eventDeadlineTick - timing.currentTick);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const Vu1CoarseRuntimeStatistics published =
+                runtime.vu1CoarseStatistics();
+            t.Equals(gifOrder.size(), size_t{3u},
+                     "publication should release both PATH1 packets and PATH2");
+            if (gifOrder.size() == 3u)
+            {
+                t.Equals(gifOrder[0], uint8_t{0x11u},
+                         "the first resolved PATH1 packet should lead");
+                t.Equals(gifOrder[1], uint8_t{0x22u},
+                         "the second resolved PATH1 packet should retain order");
+                t.Equals(gifOrder[2], uint8_t{0x33u},
+                         "later PATH2 should drain after PATH1");
+            }
+            t.Equals(published.path1ReservationsStarted, 1ull,
+                     "the invocation should start one PATH1 reservation");
+            t.Equals(published.path1ReservationsReleased, 1ull,
+                     "ordinary publication should release it once");
+            t.Equals(published.path1ReservationsInvalidated, 0ull,
+                     "the ordinary path should not cross a GIF reset");
+            t.Equals(
+                runtime.gifArbiter().pendingPath1Reservations(),
+                size_t{0u},
+                "publication should leave no future PATH1 marker");
+        });
+
+        tc.Run("runtime coarse GIF reset invalidates its future PATH1 token", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse GIF-reset runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse GIF-reset runtime subsystems should bind");
+
+            std::atomic<uint64_t> path1Packets{0u};
+            runtime.gifArbiter().setProcessPacketFn(
+                [&path1Packets](const uint8_t *, uint32_t)
+                {
+                    path1Packets.fetch_add(
+                        1u, std::memory_order_relaxed);
+                });
+            std::array<uint8_t, 16u> path1{};
+            const uint64_t gifTag =
+                (1ull << 15u) | (2ull << 58u);
+            std::memcpy(path1.data(), &gifTag, sizeof(gifTag));
+            writeRuntimeVu1Qword(runtime, 0u, path1);
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuLowerSpecial(0x6cu, 0u),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.Equals(
+                runtime.gifArbiter().pendingPath1Reservations(),
+                size_t{1u},
+                "the invocation should begin with a future PATH1 token");
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    0x10003000u, 1u),
+                "GIF CTRL reset should accept the lifecycle transition");
+            t.Equals(
+                runtime.gifArbiter().pendingPath1Reservations(),
+                size_t{0u},
+                "GIF reset should invalidate the old future PATH1 token");
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1CoarseStatistics();
+                        return statistics.owner.commandTypes[
+                            vu1CommandTypeIndex(
+                                Vu1CommandType::Invocation)]
+                            .completed == 1u;
+                    }),
+                "the post-reset VU invocation should still resolve");
+
+            const PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(
+                timing.eventDeadlineTick - timing.currentTick);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const Vu1CoarseRuntimeStatistics published =
+                runtime.vu1CoarseStatistics();
+            t.Equals(path1Packets.load(std::memory_order_relaxed), 1ull,
+                     "post-reset XGKICK should publish once at VU completion");
+            t.Equals(published.path1ReservationsStarted, 1ull,
+                     "the invocation should start one reservation");
+            t.Equals(published.path1ReservationsReleased, 0ull,
+                     "a reset-invalidated token must not release normally");
+            t.Equals(published.path1ReservationsInvalidated, 1ull,
+                     "publication should classify the stale token once");
+        });
+
+        tc.Run("runtime coarse owner failure discards its pending future", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.vu1BeforeProcess =
+                [](const Vu1Command &command, uint64_t)
+                {
+                    if (command.type == Vu1CommandType::Invocation)
+                    {
+                        throw std::runtime_error(
+                            "injected coarse invocation failure");
+                    }
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse failure runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse failure runtime subsystems should bind");
+
+            std::atomic<uint64_t> publishedPackets{0u};
+            runtime.gifArbiter().setProcessPacketFn(
+                [&publishedPackets](const uint8_t *, uint32_t)
+                {
+                    publishedPackets.fetch_add(
+                        1u, std::memory_order_relaxed);
+                });
+            std::array<uint8_t, 16u> packet{};
+            const uint64_t tag =
+                (1ull << 15u) | (2ull << 58u);
+            std::memcpy(packet.data(), &tag, sizeof(tag));
+            writeRuntimeVu1Qword(runtime, 0u, packet);
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuLowerSpecial(0x6cu, 0u),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+
+            const std::array<uint32_t, 2u> commands = {
+                makeVifCommand(0x14u, 0u, 0u),
+                makeVifCommand(0x11u, 0u, 0u),
+            };
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(commands.data()),
+                static_cast<uint32_t>(sizeof(commands)));
+            t.IsTrue(runtime.memory().vif1WaitingForVu(),
+                     "FLUSH should wait on the failed private future first");
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        return runtime.vu1CoarseStatistics()
+                            .owner.failed;
+                    }),
+                "the injected owner failure should close the transport");
+
+            const PS2Runtime::DebugVu1Timing before =
+                runtime.debugVu1TimingSnapshot();
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(
+                before.eventDeadlineTick - before.currentTick);
+            const std::string error = captureException(
+                [&]()
+                {
+                    runtime.serviceEeEventsAtBlockBoundary(
+                        runtime.memory().getRDRAM(), &context);
+                });
+            const Vu1CoarseRuntimeStatistics statistics =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing after =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(
+                error.find("injected coarse invocation failure") !=
+                    std::string::npos,
+                "the scheduler boundary should surface the owner failure");
+            t.IsFalse(statistics.pendingInvocation,
+                      "a failed invocation must not retain a guest future");
+            t.Equals(statistics.invocationsDiscardedAtFailure, 1ull,
+                     "the failed invocation should be discarded once");
+            t.Equals(
+                statistics.path1ReservationsDiscardedAtFailure,
+                1ull,
+                "the failed invocation should discard its PATH1 token once");
+            t.Equals(statistics.path1ReservationsReleased, 0ull,
+                     "failure must not count as ordinary PATH1 publication");
+            t.Equals(statistics.invocationsPublished, 0ull,
+                     "failure must not publish private VU output");
+            t.Equals(
+                runtime.gifArbiter().pendingPath1Reservations(),
+                size_t{0u},
+                "failure should immediately unblock the GIF arbiter");
+            t.Equals(
+                publishedPackets.load(std::memory_order_relaxed),
+                0ull,
+                "failure should publish no PATH1 packet");
+            t.IsFalse(after.active || after.eventPending,
+                      "failure should clear Busy and the old event");
+            t.IsFalse(runtime.memory().vif1WaitingForVu(),
+                      "failure should cancel the blocked VIF stream");
+        });
+
+        tc.Run("runtime coarse shutdown drains without publishing pending effects", [](TestCase &t)
+        {
+            auto publishedPackets =
+                std::make_shared<std::atomic<uint64_t>>(0u);
+            const auto startedAt = std::chrono::steady_clock::now();
+            {
+                PS2RuntimeConfiguration configuration =
+                    defaultPs2RuntimeConfiguration();
+                configuration.vu1ExecutionMode =
+                    Vu1ExecutionMode::ThreadedCoarse;
+                configuration.vu1CommandQueueCapacity = 2u;
+                configuration.vu1CommandPayloadCapacityBytes =
+                    1024u * 1024u;
+                PS2Runtime runtime(configuration);
+                t.IsTrue(runtime.memory().initialize(),
+                         "coarse shutdown runtime memory should initialize");
+                t.IsTrue(runtime.syncCoreSubsystems(),
+                         "coarse shutdown runtime subsystems should bind");
+                runtime.gifArbiter().setProcessPacketFn(
+                    [publishedPackets](const uint8_t *, uint32_t)
+                    {
+                        publishedPackets->fetch_add(
+                            1u, std::memory_order_relaxed);
+                    });
+
+                std::array<uint8_t, 16u> packet{};
+                const uint64_t tag =
+                    (1ull << 15u) | (2ull << 58u);
+                std::memcpy(packet.data(), &tag, sizeof(tag));
+                writeRuntimeVu1Qword(runtime, 0u, packet);
+                writeRuntimeVu1InstructionPair(
+                    runtime, 0u,
+                    makeVuLowerSpecial(0x6cu, 0u),
+                    kVuUpperEnd);
+                writeRuntimeVu1InstructionPair(
+                    runtime, 8u, 0u, kVuUpperNop);
+                const uint32_t mscal =
+                    makeVifCommand(0x14u, 0u, 0u);
+                runtime.memory().processVIF1Data(
+                    reinterpret_cast<const uint8_t *>(&mscal),
+                    sizeof(mscal));
+                t.IsTrue(
+                    waitUntil(
+                        [&runtime]()
+                        {
+                            const auto statistics =
+                                runtime.vu1CoarseStatistics();
+                            return statistics.owner.commandTypes[
+                                vu1CommandTypeIndex(
+                                    Vu1CommandType::Invocation)]
+                                .completed == 1u;
+                        }),
+                    "shutdown should begin with a privately completed invocation");
+                const Vu1CoarseRuntimeStatistics before =
+                    runtime.vu1CoarseStatistics();
+                t.Equals(before.invocationsPublished, 0ull,
+                         "shutdown fixture effects should still be private");
+                t.Equals(before.path1BytesPublished, 0ull,
+                         "shutdown fixture PATH1 should still be private");
+            }
+            const auto elapsed =
+                std::chrono::steady_clock::now() - startedAt;
+            t.IsTrue(elapsed < 2s,
+                     "coarse shutdown should drain without a lifecycle hang");
+            t.Equals(publishedPackets->load(std::memory_order_relaxed), 0ull,
+                     "shutdown must not publish future PATH1 into a stopped GS");
+        });
+
+        tc.Run("runtime coarse reset linearizes and clears a pending invocation", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "coarse reset runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "coarse reset runtime subsystems should bind");
+            writeRuntimeVu1InstructionPair(
+                runtime, 0u,
+                makeVuIaddiu(2u, 0u, 11),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 8u, 0u, kVuUpperNop);
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(
+                waitUntil(
+                    [&runtime]()
+                    {
+                        const auto statistics =
+                            runtime.vu1CoarseStatistics();
+                        return statistics.owner.commandTypes[
+                            vu1CommandTypeIndex(
+                                Vu1CommandType::Invocation)]
+                            .completed == 1u;
+                    }),
+                "the reset fixture should have ready private work");
+            const PS2Runtime::DebugVu1Timing before =
+                runtime.debugVu1TimingSnapshot();
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    0x10003c10u, 1u),
+                "VIF1 FBRST should accept the coarse reset");
+            const Vu1CoarseRuntimeStatistics reset =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing after =
+                runtime.debugVu1TimingSnapshot();
+            t.Equals(reset.forcedBarrierCount, 1ull,
+                     "reset should linearize one pending invocation");
+            t.Equals(
+                reset.forcedBarriersByCommandType[
+                    vu1CommandTypeIndex(Vu1CommandType::Reset)],
+                1ull,
+                "the lifecycle drain should be attributed to reset");
+            t.Equals(reset.invocationsCompleted, 1ull,
+                     "reset should resolve the owner invocation once");
+            t.Equals(reset.invocationsPublished, 1ull,
+                     "reset should publish the ordered prefix before clearing it");
+            t.IsFalse(reset.pendingInvocation,
+                      "reset should retain no coarse future");
+            t.IsFalse(after.active || after.eventPending,
+                      "reset should clear Busy and cancel the old event");
+            t.IsTrue(after.generation > before.generation,
+                     "reset should invalidate the old execution generation");
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            t.IsFalse(snapshot->state.active,
+                      "the reset owner snapshot should be inactive");
+            t.Equals(snapshot->state.vi[2], int32_t{0},
+                     "reset should clear the completed invocation state");
         });
 
         tc.Run("runtime coarse late estimate cannot publish before actual guest work", [](TestCase &t)

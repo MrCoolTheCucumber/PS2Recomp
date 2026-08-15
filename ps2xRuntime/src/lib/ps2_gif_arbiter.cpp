@@ -2,6 +2,8 @@
 #include "ps2_log.h"
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 
 namespace
 {
@@ -47,6 +49,35 @@ namespace
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
 {
+}
+
+GifArbiter::Path1ReservationToken GifArbiter::reservePath1()
+{
+    if (m_nextPath1ReservationToken == 0u ||
+        m_nextPath1ReservationToken ==
+            std::numeric_limits<Path1ReservationToken>::max())
+    {
+        throw std::overflow_error(
+            "GIF PATH1 reservation token exhausted");
+    }
+    const Path1ReservationToken token =
+        m_nextPath1ReservationToken++;
+    m_path1Reservations.push_back(token);
+    return token;
+}
+
+bool GifArbiter::releasePath1(
+    Path1ReservationToken token) noexcept
+{
+    if (token == 0u)
+        return false;
+    const auto found = std::find(
+        m_path1Reservations.begin(),
+        m_path1Reservations.end(), token);
+    if (found == m_path1Reservations.end())
+        return false;
+    m_path1Reservations.erase(found);
+    return true;
 }
 
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
@@ -142,10 +173,13 @@ void GifArbiter::reset()
         stream = {};
     m_recycledStorage = {};
     m_recycledPackets = {};
+    m_path1Reservations.clear();
 }
 
 bool GifArbiter::empty() const
 {
+    if (!m_path1Reservations.empty())
+        return false;
     if (!m_queue.empty())
         return false;
     for (const PathStream &stream : m_pathStreams)
@@ -158,6 +192,8 @@ bool GifArbiter::empty() const
 
 bool GifArbiter::canAcceptPath2(bool directHl) const
 {
+    if (!m_path1Reservations.empty())
+        return false;
     if (!directHl)
         return true;
 
@@ -173,7 +209,8 @@ bool GifArbiter::canAcceptPath2(bool directHl) const
 void GifArbiter::drain()
 {
     if ((!m_processFn && !m_processBatchFn) ||
-        m_queue.empty())
+        m_queue.empty() ||
+        !m_path1Reservations.empty())
         return;
 
     GifArbiterDrainBatch batch = takeDrainBatch();
@@ -215,7 +252,8 @@ void GifArbiter::drain()
 GifArbiterDrainBatch GifArbiter::takeDrainBatch()
 {
     GifArbiterDrainBatch batch{};
-    if (m_queue.empty())
+    if (m_queue.empty() ||
+        !m_path1Reservations.empty())
         return batch;
 
     std::stable_sort(m_queue.begin(), m_queue.end(),

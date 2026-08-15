@@ -199,6 +199,8 @@ struct Vu1CoarseRuntimeStatistics
     uint64_t invocationsSubmitted = 0u;
     uint64_t invocationsCompleted = 0u;
     uint64_t invocationsPublished = 0u;
+    uint64_t invocationsDiscardedAtFailure = 0u;
+    uint64_t invocationsDiscardedAtShutdown = 0u;
     uint64_t resultsReadyAtEvent = 0u;
     uint64_t resultsLateAtEvent = 0u;
     uint64_t earlyEstimateCount = 0u;
@@ -212,9 +214,23 @@ struct Vu1CoarseRuntimeStatistics
     uint64_t causalDeadlineDeferredCycles = 0u;
     uint64_t maximumCausalDeadlineDeferredCycles = 0u;
     uint64_t forcedBarrierCount = 0u;
+    std::array<uint64_t, kVu1CommandTypeCount>
+        forcedBarriersByCommandType{};
+    uint64_t nonPublishingDiagnosticSnapshotCount = 0u;
+    uint64_t nonPublishingDiagnosticsUpdateCount = 0u;
+    uint64_t nonPublishingBackendChangeCount = 0u;
+    uint64_t nonPublishingVifStateUpdateCount = 0u;
+    uint64_t nonPublishingDiagnosticSnapshotWaitCount = 0u;
+    uint64_t nonPublishingDiagnosticSnapshotWaitNanoseconds = 0u;
+    uint64_t maximumNonPublishingDiagnosticSnapshotWaitNanoseconds = 0u;
     uint64_t forcedWaitCount = 0u;
     uint64_t forcedWaitNanoseconds = 0u;
     uint64_t maximumForcedWaitNanoseconds = 0u;
+    uint64_t path1ReservationsStarted = 0u;
+    uint64_t path1ReservationsReleased = 0u;
+    uint64_t path1ReservationsInvalidated = 0u;
+    uint64_t path1ReservationsDiscardedAtFailure = 0u;
+    uint64_t path1ReservationsDiscardedAtShutdown = 0u;
     uint64_t path1BytesPublished = 0u;
     uint64_t maximumInvocationPath1Bytes = 0u;
     uint32_t lastEstimatedCycles = 0u;
@@ -863,6 +879,12 @@ public:
     vu1CoarseStatistics() const;
     [[nodiscard]] std::shared_ptr<const Vu1Snapshot>
     snapshotVu1Owner();
+    // Debugger observation must not change guest-visible VU timing. In coarse
+    // mode this may inspect owner state after privately completed work while
+    // leaving the scheduled publication, Busy state, VIF wait, and PATH1
+    // effects untouched. Use snapshotVu1Owner for an architectural barrier.
+    [[nodiscard]] std::shared_ptr<const Vu1Snapshot>
+    debugSnapshotVu1Owner();
     [[nodiscard]] VuProgressSnapshot
     vu1ProgressSnapshot() const;
     void setVu1ProgressTrackingEnabled(bool enabled);
@@ -1402,6 +1424,9 @@ public:
         bool observedValue = false;
         bool schedulerEvent = false;
         bool ownerReady = false;
+        bool hasBarrierCommandType = false;
+        Vu1CommandType barrierCommandType =
+            Vu1CommandType::Barrier;
         bool vifWaitingBefore = false;
         bool vifWaitingAfter = false;
     };
@@ -2654,7 +2679,10 @@ private:
         Published,
     };
     [[nodiscard]] Vu1SynchronousCommandBarrier
-    beginVu1SynchronousCommandBarrier();
+    beginVu1SynchronousCommandBarrier(
+        Vu1CommandType commandType);
+    void recordVu1CoarseForcedBarrier(
+        Vu1CommandType commandType);
     void finishVu1SynchronousCommandBarrier(
         const Vu1SynchronousCommandBarrier &barrier);
     void beginVu1SynchronousCommandBatch();
@@ -2707,6 +2735,7 @@ private:
     [[nodiscard]] bool completeVu1CoarseInvocation(
         ps2x::timing::EeTick publicationTick,
         bool schedulerEvent);
+    void discardVu1CoarseInvocationAfterFailure() noexcept;
     void resolveVu1CoarseInvocationForShutdown() noexcept;
     [[nodiscard]] Vu1CommandResult submitVu1Command(
         Vu1CommandPayload payload,
@@ -2742,6 +2771,9 @@ private:
     void synchronizeVu1MemoryMirror();
     [[nodiscard]] std::shared_ptr<const Vu1Snapshot>
     captureVu1OwnerSnapshot(
+        bool includeBackendDiagnostics = false);
+    [[nodiscard]] std::shared_ptr<const Vu1Snapshot>
+    captureVu1OwnerDiagnosticSnapshot(
         bool includeBackendDiagnostics = false);
     void publishVu1SliceEffects(
         const Vu1SliceResult &slice);
@@ -3020,6 +3052,8 @@ private:
         uint32_t estimatedCycles = 0u;
         uint64_t estimatorInputHash = 0u;
         bool ownerReadyAtResolution = false;
+        GifArbiter::Path1ReservationToken
+            path1Reservation = 0u;
         ps2x::timing::EeTick startTick{};
         ps2x::timing::EeTick deadline{};
         uint64_t eventGeneration = 0u;
@@ -3082,6 +3116,10 @@ private:
     std::atomic<uint64_t> m_vu1CoarseInvocationsSubmitted{0u};
     std::atomic<uint64_t> m_vu1CoarseInvocationsCompleted{0u};
     std::atomic<uint64_t> m_vu1CoarseInvocationsPublished{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarseInvocationsDiscardedAtFailure{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarseInvocationsDiscardedAtShutdown{0u};
     std::atomic<uint64_t> m_vu1CoarseResultsReadyAtEvent{0u};
     std::atomic<uint64_t> m_vu1CoarseResultsLateAtEvent{0u};
     std::atomic<uint64_t> m_vu1CoarseEarlyEstimateCount{0u};
@@ -3096,9 +3134,32 @@ private:
     std::atomic<uint64_t>
         m_vu1CoarseMaximumCausalDeadlineDeferredCycles{0u};
     std::atomic<uint64_t> m_vu1CoarseForcedBarrierCount{0u};
+    std::array<std::atomic<uint64_t>, kVu1CommandTypeCount>
+        m_vu1CoarseForcedBarriersByCommandType{};
+    std::atomic<uint64_t>
+        m_vu1CoarseNonPublishingDiagnosticSnapshotCount{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarseNonPublishingDiagnosticsUpdateCount{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarseNonPublishingBackendChangeCount{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarseNonPublishingVifStateUpdateCount{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarseNonPublishingDiagnosticSnapshotWaitCount{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarseNonPublishingDiagnosticSnapshotWaitNanoseconds{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarseMaximumNonPublishingDiagnosticSnapshotWaitNanoseconds{0u};
     std::atomic<uint64_t> m_vu1CoarseForcedWaitCount{0u};
     std::atomic<uint64_t> m_vu1CoarseForcedWaitNanoseconds{0u};
     std::atomic<uint64_t> m_vu1CoarseMaximumForcedWaitNanoseconds{0u};
+    std::atomic<uint64_t> m_vu1CoarsePath1ReservationsStarted{0u};
+    std::atomic<uint64_t> m_vu1CoarsePath1ReservationsReleased{0u};
+    std::atomic<uint64_t> m_vu1CoarsePath1ReservationsInvalidated{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarsePath1ReservationsDiscardedAtFailure{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarsePath1ReservationsDiscardedAtShutdown{0u};
     std::atomic<uint64_t> m_vu1CoarsePath1BytesPublished{0u};
     std::atomic<uint64_t> m_vu1CoarseMaximumInvocationPath1Bytes{0u};
     std::atomic<uint32_t> m_vu1CoarseLastEstimatedCycles{0u};

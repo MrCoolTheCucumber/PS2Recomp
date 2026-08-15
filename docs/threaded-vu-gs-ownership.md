@@ -679,10 +679,68 @@ scheduling.
 `causal_deadline_deferral_count`, `causal_deadline_deferred_cycles`, and
 `maximum_causal_deadline_deferred_cycles` expose this correction. Resolution
 and publication are counted separately, and PATH1 bytes count as published
-only at the final event. Explicit architectural barriers still force immediate
-whole-result publication; classifying and hardening every such observer is a
-remaining Milestone 10 requirement, so this causal floor does not make coarse
-mode production-safe by itself.
+only at the final event.
+
+Coarse mode distinguishes two kinds of observation. A guest-architectural
+observation, such as an EE mapped VU-memory read, is a selected PCSX2-style
+linearization point: it drains the ordered owner prefix, publishes the complete
+invocation once, cancels its estimated event, and only then exposes the owner
+memory mirror. This deliberately relaxes intermediate cycle identity while
+preserving deterministic command order and complete observed values. Every
+such drain is counted by triggering `Vu1CommandType` under
+`forced_barriers_by_command_type`; the aggregate remains
+`forced_barrier_count`.
+
+A debugger-only snapshot is not an architectural observation. While a coarse
+invocation is pending, `debugSnapshotVu1Owner` queues an immutable snapshot
+behind the owner stream and may inspect privately completed owner state, but it
+does not publish the invocation result, clear guest Busy, cancel the scheduled
+event, resume VIF, publish PATH1, or refresh the EE memory mirror. Consequently
+`system.status`, debugger register reads, and diagnostic artifact capture no
+longer perturb coarse guest execution merely by observing it. Their count and
+host wait are reported separately as
+`non_publishing_diagnostic_snapshot_*`. Exact mode remains the debugger
+fallback when an intermediate cycle-exact VU state is required.
+
+Mutations which need no immediate architectural result remain on that same
+bounded owner stream rather than completing the guest future. Micro/data
+memory writes (and their microprogram-cache invalidation), VIF parser-state
+updates, diagnostics changes, and a paused debugger backend change execute
+after the pending invocation but do not publish its state or clear Busy. A
+mode-2 UNPACK, unlike STMOD/STROW themselves, synchronizes because its ROW
+feedback needs the ordered owner result. The first subsequent architectural
+read likewise drains and exposes the complete ordered prefix. Their audit
+counts include `non_publishing_vif_state_update_count`,
+`non_publishing_diagnostics_update_count`, and
+`non_publishing_backend_change_count`.
+
+Every coarse invocation also reserves one unresolved PATH1 position in the
+EE-owned GIF arbiter before the invocation enters the VU owner. Complete PATH2
+and PATH3 packets may be buffered, but neither a drain nor VIF DIRECT/DIRECTHL
+admission can overtake that future PATH1 position. At VU publication all owned
+XGKICK packets enter the arbiter, the reservation is released, and normal
+PATH1/PATH2/PATH3 priority drains the complete queue. This mirrors PCSX2
+MTVU's future-PATH1 marker without moving GIF ownership to the VU thread. GIF
+reset invalidates reservation tokens; shutdown releases the token without
+draining private future effects. An owner failure likewise discards the
+reservation immediately, clears the failed Busy future, and never publishes
+its PATH1 payload. The invocation and reservation lifecycle is reported by
+`invocations_discarded_at_*` and `path1_reservations_*`.
+
+Shutdown drains the accepted owner work only to retire its ticket, then
+discards the private invocation result and PATH1 rather than publishing into a
+GS owner that has already stopped. `invocations_discarded_at_shutdown` records
+that lifecycle path. Reset now has an attributed whole-owner linearization;
+backend, cache/memory, diagnostics, debugger, VIF feedback/waits, BC2 polling,
+multi-packet GIF ordering, failure, and shutdown have focused non-publication
+or ordering fixtures. The current VU core models I/E instruction bits but not
+M/D/T bits or VU D/T interrupts in any mode. Retained RAC1 execution traces
+and VU-code captures contain E bits but no M/D/T bits, while PCSX2 explicitly
+warns that T-bit games may be incompatible with MTVU. A public runtime
+restore/load path does not yet exist, and remaining live DMA/GS-interrupt
+observations plus gameplay deltas still require classification. The causal
+floor plus these observer separations therefore do not make coarse mode
+production-safe by themselves.
 
 The prototype bounds a whole invocation and its estimated lead to 65,536 VU
 cycles, PATH1 ownership to 64 MiB, and pending lead to one invocation. A bound

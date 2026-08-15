@@ -66,6 +66,8 @@ struct GifArbiterDrainBatch
 class GifArbiter
 {
 public:
+    using Path1ReservationToken = uint64_t;
+
     using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
     using DrainBoundaryFn = std::function<void()>;
     using ProcessBatchFn =
@@ -94,6 +96,19 @@ public:
 
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
+    // A threaded VU invocation can contain PATH1 output which is not known
+    // until the owner completes. Reserve its place before allowing later GIF
+    // paths to drain, mirroring the future-PATH1 marker used by MTVU designs.
+    // Reset invalidates outstanding tokens, so lifecycle code can release a
+    // stale reservation without confusing a new GIF generation.
+    [[nodiscard]] Path1ReservationToken reservePath1();
+    [[nodiscard]] bool releasePath1(
+        Path1ReservationToken token) noexcept;
+    [[nodiscard]] size_t pendingPath1Reservations() const noexcept
+    {
+        return m_path1Reservations.size();
+    }
+
     void drain();
     [[nodiscard]] GifArbiterDrainBatch takeDrainBatch();
     void recycleDrainBatch(GifArbiterDrainBatch batch);
@@ -119,6 +134,8 @@ private:
     std::array<PathStream, 4> m_pathStreams;
     GifArbiterDrainBatch::Storage m_recycledStorage;
     std::vector<GifArbiterDrainBatch::Packet> m_recycledPackets;
+    std::vector<Path1ReservationToken> m_path1Reservations;
+    Path1ReservationToken m_nextPath1ReservationToken = 1u;
 
     static uint8_t pathPriority(GifPathId id);
 };

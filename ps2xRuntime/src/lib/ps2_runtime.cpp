@@ -3780,6 +3780,12 @@ PS2Runtime::vu1CoarseStatistics() const
         .invocationsPublished =
             m_vu1CoarseInvocationsPublished.load(
                 std::memory_order_acquire),
+        .invocationsDiscardedAtFailure =
+            m_vu1CoarseInvocationsDiscardedAtFailure.load(
+                std::memory_order_acquire),
+        .invocationsDiscardedAtShutdown =
+            m_vu1CoarseInvocationsDiscardedAtShutdown.load(
+                std::memory_order_acquire),
         .resultsReadyAtEvent =
             m_vu1CoarseResultsReadyAtEvent.load(
                 std::memory_order_acquire),
@@ -3819,6 +3825,27 @@ PS2Runtime::vu1CoarseStatistics() const
         .forcedBarrierCount =
             m_vu1CoarseForcedBarrierCount.load(
                 std::memory_order_acquire),
+        .nonPublishingDiagnosticSnapshotCount =
+            m_vu1CoarseNonPublishingDiagnosticSnapshotCount.load(
+                std::memory_order_acquire),
+        .nonPublishingDiagnosticsUpdateCount =
+            m_vu1CoarseNonPublishingDiagnosticsUpdateCount.load(
+                std::memory_order_acquire),
+        .nonPublishingBackendChangeCount =
+            m_vu1CoarseNonPublishingBackendChangeCount.load(
+                std::memory_order_acquire),
+        .nonPublishingVifStateUpdateCount =
+            m_vu1CoarseNonPublishingVifStateUpdateCount.load(
+                std::memory_order_acquire),
+        .nonPublishingDiagnosticSnapshotWaitCount =
+            m_vu1CoarseNonPublishingDiagnosticSnapshotWaitCount.load(
+                std::memory_order_acquire),
+        .nonPublishingDiagnosticSnapshotWaitNanoseconds =
+            m_vu1CoarseNonPublishingDiagnosticSnapshotWaitNanoseconds.load(
+                std::memory_order_acquire),
+        .maximumNonPublishingDiagnosticSnapshotWaitNanoseconds =
+            m_vu1CoarseMaximumNonPublishingDiagnosticSnapshotWaitNanoseconds.load(
+                std::memory_order_acquire),
         .forcedWaitCount =
             m_vu1CoarseForcedWaitCount.load(
                 std::memory_order_acquire),
@@ -3827,6 +3854,21 @@ PS2Runtime::vu1CoarseStatistics() const
                 std::memory_order_acquire),
         .maximumForcedWaitNanoseconds =
             m_vu1CoarseMaximumForcedWaitNanoseconds.load(
+                std::memory_order_acquire),
+        .path1ReservationsStarted =
+            m_vu1CoarsePath1ReservationsStarted.load(
+                std::memory_order_acquire),
+        .path1ReservationsReleased =
+            m_vu1CoarsePath1ReservationsReleased.load(
+                std::memory_order_acquire),
+        .path1ReservationsInvalidated =
+            m_vu1CoarsePath1ReservationsInvalidated.load(
+                std::memory_order_acquire),
+        .path1ReservationsDiscardedAtFailure =
+            m_vu1CoarsePath1ReservationsDiscardedAtFailure.load(
+                std::memory_order_acquire),
+        .path1ReservationsDiscardedAtShutdown =
+            m_vu1CoarsePath1ReservationsDiscardedAtShutdown.load(
                 std::memory_order_acquire),
         .path1BytesPublished =
             m_vu1CoarsePath1BytesPublished.load(
@@ -3853,6 +3895,13 @@ PS2Runtime::vu1CoarseStatistics() const
             m_vu1CoarseEstimatorResultDigest.load(
                 std::memory_order_acquire),
     };
+    for (size_t index = 0u;
+         index < kVu1CommandTypeCount; ++index)
+    {
+        statistics.forcedBarriersByCommandType[index] =
+            m_vu1CoarseForcedBarriersByCommandType[index].load(
+                std::memory_order_acquire);
+    }
     if (m_threadedVu1Executor)
         statistics.owner =
             m_threadedVu1Executor->statistics();
@@ -3896,6 +3945,24 @@ PS2Runtime::snapshotVu1Owner()
         [this, &result]()
         {
             result = captureVu1OwnerSnapshot();
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+        return result;
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
+    return result;
+}
+
+std::shared_ptr<const Vu1Snapshot>
+PS2Runtime::debugSnapshotVu1Owner()
+{
+    std::shared_ptr<const Vu1Snapshot> result;
+    const auto capture =
+        [this, &result]()
+        {
+            result = captureVu1OwnerDiagnosticSnapshot();
         };
     if (invokeEeExecutorTaskAtBoundary(capture))
         return result;
@@ -6611,7 +6678,8 @@ void PS2Runtime::serviceScratchpadDmaAtEvent(
 }
 
 PS2Runtime::Vu1SynchronousCommandBarrier
-PS2Runtime::beginVu1SynchronousCommandBarrier()
+PS2Runtime::beginVu1SynchronousCommandBarrier(
+    Vu1CommandType commandType)
 {
     Vu1SynchronousCommandBarrier barrier{};
     if (m_vu1SynchronousCommandBatchActive &&
@@ -6654,28 +6722,10 @@ PS2Runtime::beginVu1SynchronousCommandBarrier()
     {
         if (m_pendingVu1CoarseInvocation)
         {
-#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
-            if (m_debugVu1TimingTraceEnabled.load(
-                    std::memory_order_relaxed))
-            {
-                DebugVu1TimingEntry entry =
-                    debugVu1TimingEntry(
-                        DebugVu1TimingEventKind::ForcedBarrier,
-                        m_boundEeContext);
-                entry.observedValue = true;
-                entry.ownerReady =
-                    m_pendingVu1CoarseInvocation->
-                        completedResult.has_value() ||
-                    m_pendingVu1CoarseInvocation->
-                        submission.ready();
-                debugRecordVu1Timing(std::move(entry));
-            }
-#endif
+            recordVu1CoarseForcedBarrier(commandType);
             (void)completeVu1CoarseInvocation(
                 currentEeTick(), false);
             barrier.coarseInvocationCompleted = true;
-            m_vu1CoarseForcedBarrierCount.fetch_add(
-                1u, std::memory_order_relaxed);
         }
         return prepareForBatch(std::move(barrier));
     }
@@ -6763,6 +6813,41 @@ PS2Runtime::beginVu1SynchronousCommandBarrier()
             "VU1 hazard discarded a non-slice result");
     }
     return prepareForBatch(std::move(barrier));
+}
+
+void PS2Runtime::recordVu1CoarseForcedBarrier(
+    Vu1CommandType commandType)
+{
+    if (m_vu1ExecutionMode !=
+            Vu1ExecutionMode::ThreadedCoarse ||
+        !m_pendingVu1CoarseInvocation)
+    {
+        throw std::logic_error(
+            "coarse VU1 barrier attribution has no pending invocation");
+    }
+#if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
+    if (m_debugVu1TimingTraceEnabled.load(
+            std::memory_order_relaxed))
+    {
+        DebugVu1TimingEntry entry =
+            debugVu1TimingEntry(
+                DebugVu1TimingEventKind::ForcedBarrier,
+                m_boundEeContext);
+        entry.observedValue = true;
+        entry.ownerReady =
+            m_pendingVu1CoarseInvocation->
+                completedResult.has_value() ||
+            m_pendingVu1CoarseInvocation->submission.ready();
+        entry.hasBarrierCommandType = true;
+        entry.barrierCommandType = commandType;
+        debugRecordVu1Timing(std::move(entry));
+    }
+#endif
+    m_vu1CoarseForcedBarrierCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_vu1CoarseForcedBarriersByCommandType[
+        vu1CommandTypeIndex(commandType)]
+        .fetch_add(1u, std::memory_order_relaxed);
 }
 
 void PS2Runtime::finishVu1SynchronousCommandBarrier(
@@ -6921,7 +7006,8 @@ void PS2Runtime::flushBatchedVu1DecodedUnpacks()
         takeBatchedVu1DecodedUnpacks();
     const Vu1SynchronousCommandBarrier barrier =
         usesExactVu1Scheduling(m_vu1ExecutionMode)
-            ? beginVu1SynchronousCommandBarrier()
+            ? beginVu1SynchronousCommandBarrier(
+                  Vu1CommandType::DecodedUnpack)
             : Vu1SynchronousCommandBarrier{};
     (void)m_threadedVu1Executor
         ->submitResultlessResolvingSpeculation(
@@ -6951,9 +7037,14 @@ void PS2Runtime::flushBatchedVu1VifStateUpdate()
     Vu1VifStateUpdateCommand command{
         *m_batchedVu1VifState};
     m_batchedVu1VifState.reset();
+    const bool preservesPendingCoarseInvocation =
+        m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedCoarse &&
+        m_pendingVu1CoarseInvocation.has_value();
     const Vu1SynchronousCommandBarrier barrier =
         usesExactVu1Scheduling(m_vu1ExecutionMode)
-            ? beginVu1SynchronousCommandBarrier()
+            ? beginVu1SynchronousCommandBarrier(
+                  Vu1CommandType::VifStateUpdate)
             : Vu1SynchronousCommandBarrier{};
     (void)m_threadedVu1Executor
         ->submitResultlessResolvingSpeculation(
@@ -6964,6 +7055,11 @@ void PS2Runtime::flushBatchedVu1VifStateUpdate()
     // The command's typed result is exactly the immutable input state, so EE
     // can retain that parser-owned value without waiting for owner execution.
     m_knownVu1VifState = command.state;
+    if (preservesPendingCoarseInvocation)
+    {
+        m_vu1CoarseNonPublishingVifStateUpdateCount.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
     finishVu1SynchronousCommandBarrier(barrier);
 }
 
@@ -7701,41 +7797,54 @@ void PS2Runtime::submitVu1CoarseInvocation(
             std::memory_order_acquire);
     const Vu1InvocationKind invocationKind = command.kind;
     const uint32_t invocationStartPc = command.startPc;
-    Vu1CommandSubmission submission =
-        m_threadedVu1Executor->submitAsync(
-            Vu1CommandPayload{std::move(command)},
-            startTick.raw(),
-            m_vu1ExecutionTiming.generation);
+    const GifArbiter::Path1ReservationToken path1Reservation =
+        m_gifArbiter.reservePath1();
     const ps2x::timing::EeTick deadline =
         ps2x::timing::saturatingAdd(
             startTick,
             ps2x::timing::vuCyclesToEeTicks(estimate));
-    scheduleVU1Event(deadline);
-    if (m_vu1ExecutionTiming.eventToken.generation == 0u)
+    try
     {
-        throw std::runtime_error(
-            "coarse VU1 completion event was not scheduled");
-    }
+        Vu1CommandSubmission submission =
+            m_threadedVu1Executor->submitAsync(
+                Vu1CommandPayload{std::move(command)},
+                startTick.raw(),
+                m_vu1ExecutionTiming.generation);
+        scheduleVU1Event(deadline);
+        if (m_vu1ExecutionTiming.eventToken.generation == 0u)
+        {
+            throw std::runtime_error(
+                "coarse VU1 completion event was not scheduled");
+        }
 
-    m_pendingVu1CoarseInvocation =
-        Vu1PendingCoarseInvocation{
-            .submission = std::move(submission),
-            .estimatorIdentity = estimatorIdentity,
-            .estimatedCycles = estimate,
-            .estimatorInputHash = inputHash,
-            .startTick = startTick,
-            .deadline = deadline,
-            .eventGeneration =
-                m_vu1ExecutionTiming.eventToken.generation,
-            .executionGeneration =
-                m_vu1ExecutionTiming.generation,
-        };
+        m_pendingVu1CoarseInvocation =
+            Vu1PendingCoarseInvocation{
+                .submission = std::move(submission),
+                .estimatorIdentity = estimatorIdentity,
+                .estimatedCycles = estimate,
+                .estimatorInputHash = inputHash,
+                .path1Reservation = path1Reservation,
+                .startTick = startTick,
+                .deadline = deadline,
+                .eventGeneration =
+                    m_vu1ExecutionTiming.eventToken.generation,
+                .executionGeneration =
+                    m_vu1ExecutionTiming.generation,
+            };
+    }
+    catch (...)
+    {
+        (void)m_gifArbiter.releasePath1(path1Reservation);
+        throw;
+    }
     m_vu1CoarsePendingInvocation.store(
         true, std::memory_order_release);
     updateAtomicMaximum(
         m_vu1CoarsePendingInvocationHighWater,
         size_t{1u});
     m_vu1CoarseInvocationsSubmitted.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_vu1CoarsePath1ReservationsStarted.fetch_add(
         1u, std::memory_order_relaxed);
     m_vu1CoarseEstimatedCycleSum.fetch_add(
         estimate, std::memory_order_relaxed);
@@ -7782,8 +7891,19 @@ bool PS2Runtime::completeVu1CoarseInvocation(
         const bool ready = pending.submission.ready();
         const auto waitAt = std::chrono::steady_clock::now();
         Vu1CommandResult result =
-            m_threadedVu1Executor->wait(
-                std::move(pending.submission));
+            [&]()
+            {
+                try
+                {
+                    return m_threadedVu1Executor->wait(
+                        std::move(pending.submission));
+                }
+                catch (...)
+                {
+                    discardVu1CoarseInvocationAfterFailure();
+                    throw;
+                }
+            }();
         const uint64_t waitNanoseconds =
             static_cast<uint64_t>(
                 std::chrono::duration_cast<
@@ -7811,6 +7931,7 @@ bool PS2Runtime::completeVu1CoarseInvocation(
                 Vu1CommandDisposition::Completed ||
             result.digest.type != Vu1CommandType::Invocation)
         {
+            discardVu1CoarseInvocationAfterFailure();
             throw std::runtime_error(
                 "coarse VU1 owner rejected an invocation");
         }
@@ -7818,15 +7939,19 @@ bool PS2Runtime::completeVu1CoarseInvocation(
             std::get_if<Vu1SliceResult>(&result.payload);
         if (!invocation)
         {
+            discardVu1CoarseInvocationAfterFailure();
             throw std::runtime_error(
                 "coarse VU1 invocation returned no typed result");
         }
         if (invocation->fault)
         {
-            throw std::runtime_error(*invocation->fault);
+            const std::string fault = *invocation->fault;
+            discardVu1CoarseInvocationAfterFailure();
+            throw std::runtime_error(fault);
         }
         if (result.active || !invocation->vifCanResume)
         {
+            discardVu1CoarseInvocationAfterFailure();
             throw std::runtime_error(
                 "coarse VU1 invocation exceeded its cycle bound");
         }
@@ -8000,6 +8125,28 @@ bool PS2Runtime::completeVu1CoarseInvocation(
     m_pendingVu1CoarseInvocation.reset();
     m_vu1CoarsePendingInvocation.store(
         false, std::memory_order_release);
+    struct Path1ReservationGuard
+    {
+        GifArbiter &arbiter;
+        GifArbiter::Path1ReservationToken token = 0u;
+
+        ~Path1ReservationGuard()
+        {
+            if (token != 0u)
+                (void)arbiter.releasePath1(token);
+        }
+
+        bool release() noexcept
+        {
+            const bool released =
+                arbiter.releasePath1(token);
+            token = 0u;
+            return released;
+        }
+    } path1Reservation{
+        m_gifArbiter,
+        completed.path1Reservation,
+    };
     Vu1CommandResult result =
         std::move(*completed.completedResult);
     const auto *const invocation =
@@ -8024,6 +8171,13 @@ bool PS2Runtime::completeVu1CoarseInvocation(
 
     publishVu1CommandResult(result);
     publishVu1SliceEffects(*invocation);
+    const bool path1ReservationReleased =
+        path1Reservation.release();
+    (path1ReservationReleased
+         ? m_vu1CoarsePath1ReservationsReleased
+         : m_vu1CoarsePath1ReservationsInvalidated)
+        .fetch_add(1u, std::memory_order_relaxed);
+    m_gifArbiter.drain();
     m_vu1ExecutionTiming.totalAdvancedCycles += actual;
     m_vu1ExecutionTiming.lastAdvancedTick = publicationTick;
     setVU1BusyFlag(nullptr, false);
@@ -8049,6 +8203,47 @@ bool PS2Runtime::completeVu1CoarseInvocation(
     return true;
 }
 
+void PS2Runtime::discardVu1CoarseInvocationAfterFailure() noexcept
+{
+    if (!m_pendingVu1CoarseInvocation)
+        return;
+    if (m_vu1ExecutionTiming.eventToken.generation != 0u)
+    {
+        (void)m_eeEventScheduler.cancel(
+            m_vu1ExecutionTiming.eventToken);
+    }
+    m_vu1ExecutionTiming.eventToken = {
+        ps2x::timing::EeEventSource::VifVu1Finish, 0u};
+
+    const GifArbiter::Path1ReservationToken token =
+        m_pendingVu1CoarseInvocation->path1Reservation;
+    if (token != 0u)
+    {
+        if (m_gifArbiter.releasePath1(token))
+        {
+            m_vu1CoarsePath1ReservationsDiscardedAtFailure.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        else
+        {
+            m_vu1CoarsePath1ReservationsInvalidated.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+    }
+    m_pendingVu1CoarseInvocation.reset();
+    m_vu1CoarsePendingInvocation.store(
+        false, std::memory_order_release);
+    m_vu1CoarseInvocationsDiscardedAtFailure.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_publishedVu1Active.store(
+        false, std::memory_order_release);
+    m_publishedVu1ProgressActive.store(
+        false, std::memory_order_release);
+    setVU1BusyFlag(nullptr, false);
+    m_memory.cancelVIF1VuWait();
+    m_memory.finishVif1DmaTrace();
+}
+
 void PS2Runtime::resolveVu1CoarseInvocationForShutdown() noexcept
 {
     if (m_vu1ExecutionMode !=
@@ -8057,13 +8252,51 @@ void PS2Runtime::resolveVu1CoarseInvocationForShutdown() noexcept
     {
         return;
     }
+    const auto discardPath1Reservation = [this]() noexcept
+    {
+        if (!m_pendingVu1CoarseInvocation)
+            return;
+        const GifArbiter::Path1ReservationToken token =
+            m_pendingVu1CoarseInvocation->path1Reservation;
+        if (token == 0u)
+            return;
+        if (m_gifArbiter.releasePath1(token))
+        {
+            m_vu1CoarsePath1ReservationsDiscardedAtShutdown.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        else
+        {
+            m_vu1CoarsePath1ReservationsInvalidated.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+    };
     try
     {
-        (void)completeVu1CoarseInvocation(
-            currentEeTick(), false);
+        if (m_vu1ExecutionTiming.eventToken.generation != 0u)
+        {
+            (void)m_eeEventScheduler.cancel(
+                m_vu1ExecutionTiming.eventToken);
+            m_vu1ExecutionTiming.eventToken = {
+                ps2x::timing::EeEventSource::VifVu1Finish,
+                0u};
+        }
+        if (!m_pendingVu1CoarseInvocation->completedResult)
+        {
+            (void)m_threadedVu1Executor->wait(
+                std::move(
+                    m_pendingVu1CoarseInvocation->submission));
+        }
+        discardPath1Reservation();
+        m_pendingVu1CoarseInvocation.reset();
+        m_vu1CoarsePendingInvocation.store(
+            false, std::memory_order_release);
+        m_vu1CoarseInvocationsDiscardedAtShutdown.fetch_add(
+            1u, std::memory_order_relaxed);
     }
     catch (...)
     {
+        discardPath1Reservation();
         m_pendingVu1CoarseInvocation.reset();
         m_vu1CoarsePendingInvocation.store(
             false, std::memory_order_release);
@@ -8102,7 +8335,8 @@ void PS2Runtime::resolveVu1SpeculationForShutdown() noexcept
     try
     {
         Vu1SynchronousCommandBarrier barrier =
-            beginVu1SynchronousCommandBarrier();
+            beginVu1SynchronousCommandBarrier(
+                Vu1CommandType::Barrier);
         barrier.requeue.reset();
         const Vu1CommandResult result =
             m_threadedVu1Executor->submitResolvingSpeculation(
@@ -8130,10 +8364,10 @@ void PS2Runtime::cancelVU1Execution(bool resetInterpreter)
             Vu1ExecutionMode::ThreadedCoarse &&
         m_pendingVu1CoarseInvocation)
     {
+        recordVu1CoarseForcedBarrier(
+            Vu1CommandType::Reset);
         (void)completeVu1CoarseInvocation(
             currentEeTick(), false);
-        m_vu1CoarseForcedBarrierCount.fetch_add(
-            1u, std::memory_order_relaxed);
     }
     if (m_pendingVu1ExecutionEpoch &&
         m_threadedVu1Executor)
@@ -8235,6 +8469,26 @@ Vu1CommandResult PS2Runtime::submitVu1Command(
         usesBufferedVu1OwnerStream(m_vu1ExecutionMode) &&
         (type == Vu1CommandType::MicroMemoryWrite ||
          type == Vu1CommandType::DataMemoryWrite);
+    if (m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedCoarse &&
+        m_pendingVu1CoarseInvocation &&
+        type == Vu1CommandType::SetBackend)
+    {
+        Vu1CommandResult result =
+            m_threadedVu1Executor->submit(
+                std::move(payload), guestTick,
+                publicationToken);
+        if (result.disposition !=
+                Vu1CommandDisposition::Completed ||
+            result.digest.type != Vu1CommandType::SetBackend)
+        {
+            throw std::runtime_error(
+                "VU1 non-publishing backend command was rejected");
+        }
+        m_vu1CoarseNonPublishingBackendChangeCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        return result;
+    }
     if (resultlessMemoryWrite)
     {
         uint64_t admittedCodeGeneration =
@@ -8253,7 +8507,7 @@ Vu1CommandResult PS2Runtime::submitVu1Command(
             vu1CommandPayloadSize(payload);
         const Vu1SynchronousCommandBarrier barrier =
             usesExactVu1Scheduling(m_vu1ExecutionMode)
-                ? beginVu1SynchronousCommandBarrier()
+                ? beginVu1SynchronousCommandBarrier(type)
                 : Vu1SynchronousCommandBarrier{};
         const Vu1CommandAdmission admission =
             m_threadedVu1Executor
@@ -8283,7 +8537,7 @@ Vu1CommandResult PS2Runtime::submitVu1Command(
         };
     }
     const Vu1SynchronousCommandBarrier barrier =
-        beginVu1SynchronousCommandBarrier();
+        beginVu1SynchronousCommandBarrier(type);
     Vu1CommandResult result =
         usesExactVu1Scheduling(m_vu1ExecutionMode)
             ? m_threadedVu1Executor
@@ -8346,7 +8600,8 @@ Vu1CommandResult PS2Runtime::submitVu1AdvanceSlice(
         flushBatchedVu1VifStateUpdate();
     }
     const Vu1SynchronousCommandBarrier barrier =
-        beginVu1SynchronousCommandBarrier();
+        beginVu1SynchronousCommandBarrier(
+            Vu1CommandType::AdvanceSlice);
     Vu1CommandResult result =
         usesExactVu1Scheduling(m_vu1ExecutionMode)
             ? m_threadedVu1Executor
@@ -8466,7 +8721,8 @@ Vu1CommandResult PS2Runtime::submitVu1DecodedUnpack(
     if (asynchronousBatch)
         flushBatchedVu1DecodedUnpacks();
     const Vu1SynchronousCommandBarrier barrier =
-        beginVu1SynchronousCommandBarrier();
+        beginVu1SynchronousCommandBarrier(
+            Vu1CommandType::DecodedUnpack);
     Vu1CommandResult result =
         usesExactVu1Scheduling(m_vu1ExecutionMode)
             ? m_threadedVu1Executor
@@ -8555,8 +8811,49 @@ Vu1CommandResult PS2Runtime::submitVu1VifStateUpdateImmediate(
     {
         flushBatchedVu1DecodedUnpacks();
     }
+    if (m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedCoarse &&
+        m_pendingVu1CoarseInvocation)
+    {
+        const Vu1VifState state = command.state;
+        const Vu1CommandAdmission admission =
+            m_threadedVu1Executor->submitResultless(
+                Vu1CommandPayload{std::move(command)},
+                guestTick, publicationToken);
+        if (admission.type !=
+                Vu1CommandType::VifStateUpdate)
+        {
+            throw std::runtime_error(
+                "VU1 non-publishing VIF state update was rejected");
+        }
+        m_knownVu1VifState = state;
+        m_vu1CoarseNonPublishingVifStateUpdateCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        return Vu1CommandResult{
+            .identity = admission.identity,
+            .digest = {
+                .sequence = admission.identity.sequence,
+                .generation = admission.identity.generation,
+                .guestTick = admission.identity.guestTick,
+                .type = admission.type,
+                .payloadSize = 12u * sizeof(uint32_t),
+            },
+            .ownerGeneration = admission.identity.generation,
+            .codeGeneration =
+                m_publishedVu1CodeGeneration.load(
+                    std::memory_order_acquire),
+            .programCounter =
+                m_publishedVu1ProgramCounter.load(
+                    std::memory_order_acquire),
+            .active = m_publishedVu1Active.load(
+                std::memory_order_acquire),
+            .progress = vu1ProgressSnapshot(),
+            .payload = Vu1VifStateResult{state},
+        };
+    }
     const Vu1SynchronousCommandBarrier barrier =
-        beginVu1SynchronousCommandBarrier();
+        beginVu1SynchronousCommandBarrier(
+            Vu1CommandType::VifStateUpdate);
     Vu1CommandResult result =
         usesExactVu1Scheduling(m_vu1ExecutionMode)
             ? m_threadedVu1Executor
@@ -8611,14 +8908,28 @@ void PS2Runtime::refreshVu1DiagnosticsConfiguration(
             flushBatchedVu1VifStateUpdate();
     }
 
-    const Vu1SynchronousCommandBarrier barrier =
-        beginVu1SynchronousCommandBarrier();
     Vu1CommandPayload payload =
         Vu1SetDiagnosticsCommand{
             .traceEnabled = traceEnabled,
             .workloadProfileEnabled =
                 workloadProfileEnabled,
         };
+    if (m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedCoarse &&
+        m_pendingVu1CoarseInvocation)
+    {
+        (void)m_threadedVu1Executor->submitResultless(
+            std::move(payload), guestTick, publicationToken);
+        m_publishedVu1TraceEnabled = traceEnabled;
+        m_publishedVu1WorkloadProfileEnabled =
+            workloadProfileEnabled;
+        m_vu1CoarseNonPublishingDiagnosticsUpdateCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        return;
+    }
+    const Vu1SynchronousCommandBarrier barrier =
+        beginVu1SynchronousCommandBarrier(
+            Vu1CommandType::SetDiagnostics);
     Vu1CommandResult result =
         usesExactVu1Scheduling(m_vu1ExecutionMode)
             ? m_threadedVu1Executor
@@ -8713,6 +9024,66 @@ PS2Runtime::captureVu1OwnerSnapshot(
     {
         throw std::runtime_error(
             "VU1 snapshot command returned no state");
+    }
+    return snapshot->snapshot;
+}
+
+std::shared_ptr<const Vu1Snapshot>
+PS2Runtime::captureVu1OwnerDiagnosticSnapshot(
+    bool includeBackendDiagnostics)
+{
+    if (m_vu1ExecutionMode !=
+            Vu1ExecutionMode::ThreadedCoarse ||
+        !m_pendingVu1CoarseInvocation ||
+        !m_threadedVu1Executor)
+    {
+        return captureVu1OwnerSnapshot(
+            includeBackendDiagnostics);
+    }
+    if (m_vu1SynchronousCommandBatchActive ||
+        !m_batchedVu1DecodedUnpacks.empty() ||
+        m_batchedVu1VifState)
+    {
+        throw std::logic_error(
+            "VU1 diagnostic snapshot cannot interleave a command batch");
+    }
+
+    const auto waitAt = std::chrono::steady_clock::now();
+    const Vu1CommandResult result =
+        m_threadedVu1Executor->submit(
+            Vu1SnapshotCommand{
+                .includeBackendDiagnostics =
+                    includeBackendDiagnostics},
+            currentEeTick().raw(),
+            m_vu1ExecutionTiming.generation);
+    const uint64_t waitNanoseconds =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - waitAt)
+                .count());
+    m_vu1CoarseNonPublishingDiagnosticSnapshotCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_vu1CoarseNonPublishingDiagnosticSnapshotWaitCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_vu1CoarseNonPublishingDiagnosticSnapshotWaitNanoseconds.fetch_add(
+        waitNanoseconds, std::memory_order_relaxed);
+    updateAtomicMaximum(
+        m_vu1CoarseMaximumNonPublishingDiagnosticSnapshotWaitNanoseconds,
+        waitNanoseconds);
+
+    if (result.disposition !=
+            Vu1CommandDisposition::Completed ||
+        result.digest.type != Vu1CommandType::Snapshot)
+    {
+        throw std::runtime_error(
+            "VU1 diagnostic snapshot command was rejected");
+    }
+    const auto *const snapshot =
+        std::get_if<Vu1SnapshotResult>(&result.payload);
+    if (!snapshot || !snapshot->snapshot)
+    {
+        throw std::runtime_error(
+            "VU1 diagnostic snapshot command returned no state");
     }
     return snapshot->snapshot;
 }
@@ -14323,7 +14694,7 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
     if (m_threadedVu1Executor)
     {
         const std::shared_ptr<const Vu1Snapshot> snapshot =
-            captureVu1OwnerSnapshot(true);
+            captureVu1OwnerDiagnosticSnapshot(true);
         const Vu1BackendDiagnosticsSnapshot *const backend =
             snapshot->backendDiagnostics
                 ? &*snapshot->backendDiagnostics
