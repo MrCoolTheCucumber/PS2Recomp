@@ -208,6 +208,9 @@ struct Vu1CoarseRuntimeStatistics
     uint64_t actualCycleSum = 0u;
     uint64_t absoluteErrorCycleSum = 0u;
     uint64_t maximumAbsoluteErrorCycles = 0u;
+    uint64_t causalDeadlineDeferralCount = 0u;
+    uint64_t causalDeadlineDeferredCycles = 0u;
+    uint64_t maximumCausalDeadlineDeferredCycles = 0u;
     uint64_t forcedBarrierCount = 0u;
     uint64_t forcedWaitCount = 0u;
     uint64_t forcedWaitNanoseconds = 0u;
@@ -2701,7 +2704,7 @@ private:
     void submitVu1CoarseInvocation(
         Vu1InvocationCommand command,
         ps2x::timing::EeTick startTick);
-    void completeVu1CoarseInvocation(
+    [[nodiscard]] bool completeVu1CoarseInvocation(
         ps2x::timing::EeTick publicationTick,
         bool schedulerEvent);
     void resolveVu1CoarseInvocationForShutdown() noexcept;
@@ -3012,9 +3015,11 @@ private:
     struct Vu1PendingCoarseInvocation
     {
         Vu1CommandSubmission submission;
+        std::optional<Vu1CommandResult> completedResult;
         Vu1CoarseEstimatorIdentity estimatorIdentity{};
         uint32_t estimatedCycles = 0u;
         uint64_t estimatorInputHash = 0u;
+        bool ownerReadyAtResolution = false;
         ps2x::timing::EeTick startTick{};
         ps2x::timing::EeTick deadline{};
         uint64_t eventGeneration = 0u;
@@ -3086,6 +3091,10 @@ private:
     std::atomic<uint64_t> m_vu1CoarseActualCycleSum{0u};
     std::atomic<uint64_t> m_vu1CoarseAbsoluteErrorCycleSum{0u};
     std::atomic<uint64_t> m_vu1CoarseMaximumAbsoluteErrorCycles{0u};
+    std::atomic<uint64_t> m_vu1CoarseCausalDeadlineDeferralCount{0u};
+    std::atomic<uint64_t> m_vu1CoarseCausalDeadlineDeferredCycles{0u};
+    std::atomic<uint64_t>
+        m_vu1CoarseMaximumCausalDeadlineDeferredCycles{0u};
     std::atomic<uint64_t> m_vu1CoarseForcedBarrierCount{0u};
     std::atomic<uint64_t> m_vu1CoarseForcedWaitCount{0u};
     std::atomic<uint64_t> m_vu1CoarseForcedWaitNanoseconds{0u};

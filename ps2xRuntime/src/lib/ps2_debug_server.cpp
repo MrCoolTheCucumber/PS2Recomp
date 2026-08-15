@@ -1678,6 +1678,16 @@ struct PS2DebugServer::Impl
             "maximum_absolute_error_cycles",
             vu1Coarse.maximumAbsoluteErrorCycles, allocator);
         vu1CoarseValue.AddMember(
+            "causal_deadline_deferral_count",
+            vu1Coarse.causalDeadlineDeferralCount, allocator);
+        vu1CoarseValue.AddMember(
+            "causal_deadline_deferred_cycles",
+            vu1Coarse.causalDeadlineDeferredCycles, allocator);
+        vu1CoarseValue.AddMember(
+            "maximum_causal_deadline_deferred_cycles",
+            vu1Coarse.maximumCausalDeadlineDeferredCycles,
+            allocator);
+        vu1CoarseValue.AddMember(
             "forced_barrier_count",
             vu1Coarse.forcedBarrierCount, allocator);
         vu1CoarseValue.AddMember(

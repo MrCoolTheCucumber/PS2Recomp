@@ -4788,6 +4788,122 @@ void register_ps2_vu1_command_stream_tests()
                      "publication should account actual guest VU cycles only");
         });
 
+        tc.Run("runtime coarse late estimate cannot publish before actual guest work", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedCoarse;
+            configuration.vu1CommandQueueCapacity = 2u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "causal-deadline runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "causal-deadline runtime subsystems should bind");
+
+            std::vector<std::vector<uint8_t>> packets;
+            runtime.gifArbiter().setProcessPacketFn(
+                [&packets](const uint8_t *data, uint32_t sizeBytes)
+                {
+                    packets.emplace_back(data, data + sizeBytes);
+                });
+            std::array<uint8_t, 16u> packet{};
+            const uint64_t tag =
+                (1ull << 15u) | (2ull << 58u);
+            const uint64_t marker =
+                0x1122334455667788ull;
+            std::memcpy(packet.data(), &tag, sizeof(tag));
+            std::memcpy(
+                packet.data() + 8u, &marker, sizeof(marker));
+            writeRuntimeVu1Qword(runtime, 0u, packet);
+            for (uint32_t pair = 0u; pair < 32u; ++pair)
+            {
+                writeRuntimeVu1InstructionPair(
+                    runtime, pair * 8u,
+                    makeVuIaddiu(1u, 1u, 1),
+                    kVuUpperNop);
+            }
+            writeRuntimeVu1InstructionPair(
+                runtime, 32u * 8u,
+                makeVuLowerSpecial(0x6cu, 0u),
+                kVuUpperEnd);
+            writeRuntimeVu1InstructionPair(
+                runtime, 33u * 8u, 0u, kVuUpperNop);
+
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            R5900Context &context = runtime.cpu();
+            const PS2Runtime::DebugVu1Timing start =
+                runtime.debugVu1TimingSnapshot();
+            context.advanceEeCycleTicks(
+                start.eventDeadlineTick - start.currentTick);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            const Vu1CoarseRuntimeStatistics deferred =
+                runtime.vu1CoarseStatistics();
+            const PS2Runtime::DebugVu1Timing waiting =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(deferred.lastActualCycles >
+                         deferred.lastEstimatedCycles,
+                     "the fixture must exercise an underestimated invocation");
+            t.Equals(deferred.invocationsPublished, 0ull,
+                     "an underestimated result must remain private");
+            t.Equals(deferred.invocationsCompleted, 1ull,
+                     "the owner result should resolve exactly once");
+            t.Equals(deferred.causalDeadlineDeferralCount, 1ull,
+                     "the underestimate should arm one causal correction");
+            t.Equals(
+                deferred.causalDeadlineDeferredCycles,
+                static_cast<uint64_t>(
+                    deferred.lastActualCycles -
+                    deferred.lastEstimatedCycles),
+                "the correction should cover the underestimated cycles");
+            t.Equals(
+                deferred.maximumCausalDeadlineDeferredCycles,
+                deferred.causalDeadlineDeferredCycles,
+                "the single correction should establish the maximum");
+            t.Equals(deferred.path1BytesPublished, 0ull,
+                     "private PATH1 bytes must not count as published");
+            t.IsTrue(deferred.pendingInvocation,
+                     "the resolved result should remain pending publication");
+            t.IsTrue(waiting.active && waiting.eventPending,
+                     "Busy and a corrected guest event must remain armed");
+            t.IsTrue(
+                waiting.eventDeadlineTick >=
+                    static_cast<uint64_t>(
+                        deferred.lastActualCycles) * 8u,
+                "the corrected deadline must cover actual VU work");
+            t.IsTrue(packets.empty(),
+                     "PATH1 must not publish before its invocation can execute");
+
+            context.advanceEeCycleTicks(
+                waiting.eventDeadlineTick - waiting.currentTick);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            const Vu1CoarseRuntimeStatistics published =
+                runtime.vu1CoarseStatistics();
+            t.Equals(snapshot->state.vi[1], int32_t{32},
+                     "deferred publication should retain exact VU state");
+            t.Equals(packets.size(), size_t{1u},
+                     "the corrected event should publish PATH1 once");
+            t.Equals(published.invocationsPublished, 1ull,
+                     "the corrected event should publish exactly once");
+            t.Equals(published.invocationsCompleted, 1ull,
+                     "publication must not resolve the owner twice");
+            t.Equals(published.path1BytesPublished, 16ull,
+                     "the corrected event should account PATH1 once");
+            t.IsFalse(runtime.debugVu1TimingSnapshot().active,
+                      "the corrected completion should clear Busy");
+        });
+
         tc.Run("runtime checkpoint epochs publish exact ready and late event state", [](TestCase &t)
         {
             struct RunResult

@@ -644,13 +644,13 @@ executed extension cycles, checkpoint wait count/time, and maximum journal
 depth. These counters are observational. They never alter guest time,
 scheduler priority, VU busy publication, VIF wakeup, or XGKICK order.
 
-## Milestone 8 coarse VU1 experiment — non-production
+## Milestone 8 coarse VU1 experiment and Milestone 10 hardening — non-production
 
 `--vu1-execution threaded-coarse` is a separately selected, non-default
 research mode. It submits one owned MSCAL, MSCALF, or MSCNT invocation to the
 persistent VU1 owner and permits at most one invocation of producer lead. VU
 registers, VIF-owned state, micro/data memory, diagnostics, and ordered PATH1
-packets remain private until EE reaches the deterministic estimated completion
+packets remain private until EE reaches a deterministic guest-cycle publication
 event or explicitly requests a barrier. Worker completion and host wall time
 never publish guest state.
 
@@ -662,15 +662,37 @@ and memory rebinding clear estimator state. Input, output, result, hit/miss,
 error, forced-wait, and high-water telemetry is available under
 `system.status.vu1_coarse`.
 
+Milestone 10 adds a causal floor to the estimated event. The first event still
+comes only from the bounded identity/history estimator. When that event
+resolves a result whose deterministic executed-cycle count is greater than the
+guest VU time elapsed since invocation start, EE retains the completed result
+privately, keeps VU Busy asserted, and schedules one corrected event at
+`start_tick + actual_cycles * 8`. The corrected event publishes the stored
+result without resubmission or a second owner wait. Thus ordinary scheduled
+completion is `max(estimated_deadline, actual_completion_deadline)`: an
+overestimate may remain deliberately late, but an underestimate cannot expose
+final VU state, diagnostics, VIF resume, or any invocation-relative PATH1
+packet before the invocation's own modeled work has completed. The actual
+cycle count is deterministic command output and does not depend on host
+scheduling.
+
+`causal_deadline_deferral_count`, `causal_deadline_deferred_cycles`, and
+`maximum_causal_deadline_deferred_cycles` expose this correction. Resolution
+and publication are counted separately, and PATH1 bytes count as published
+only at the final event. Explicit architectural barriers still force immediate
+whole-result publication; classifying and hardening every such observer is a
+remaining Milestone 10 requirement, so this causal floor does not make coarse
+mode production-safe by itself.
+
 The prototype bounds a whole invocation and its estimated lead to 65,536 VU
 cycles, PATH1 ownership to 64 MiB, and pending lead to one invocation. A bound
 failure faults or applies admission backpressure; it never drops work. PATH1
 packets retain owner order and monotonic invocation-relative cycle offsets.
 Focused tests cover typed whole-invocation execution, PATH1 ownership/order and
 bounds, deterministic identity isolation/LRU eviction, estimator publication,
-and owner lifecycle. The mode did not receive the exhaustive observation and
-lifecycle hardening required for production because its live correctness gate
-failed first.
+late-estimate causal deferral, single-publication accounting, and owner
+lifecycle. The mode has not yet received the exhaustive observation and
+lifecycle hardening required for production.
 
 On the canonical RAC1 Veldin interval, the identity-keyed arm retained exact
 gameplay state and exact GS draw/pixel work and reached 19.410318475 fields/s.
