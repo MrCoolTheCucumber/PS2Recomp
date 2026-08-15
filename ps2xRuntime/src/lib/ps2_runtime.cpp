@@ -72,6 +72,9 @@ static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
 static constexpr uint64_t EE_CYCLES_PER_SECOND = 294'912'000u;
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
 static constexpr const char *GS_HISTORY_DUMP_ENV = "PS2X_GS_HISTORY_DUMP";
+static constexpr uint32_t DEBUG_VU0_SYNC_TRACE_PC_ARM = 1u << 0u;
+static constexpr uint32_t DEBUG_VU0_INSTRUCTION_TRACE_PC_ARM = 1u << 1u;
+static constexpr uint32_t DEBUG_EE_EVENT_TRACE_PC_ARM = 1u << 2u;
 static std::atomic<uint64_t> g_nextEeThreadRuntimeGeneration{1u};
 
 static uint64_t debugFnv1a64(const uint8_t *data, size_t size) noexcept
@@ -11041,14 +11044,46 @@ void PS2Runtime::SignalBusError(R5900Context *ctx,
 }
 
 #if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
-void PS2Runtime::debugArmVu0Traces(const R5900Context *ctx)
+void PS2Runtime::debugRefreshTracePcArmMaskLocked() noexcept
 {
-    if (!ctx)
+    uint32_t mask = 0u;
+    if (m_debugVu0SyncTraceEnabled.load(std::memory_order_acquire) &&
+        !m_debugVu0SyncTraceTriggered.load(std::memory_order_acquire) &&
+        m_debugVu0SyncTraceHasTrigger.load(std::memory_order_relaxed))
+    {
+        mask |= DEBUG_VU0_SYNC_TRACE_PC_ARM;
+    }
+    if (m_debugVu0InstructionTraceEnabled.load(
+            std::memory_order_acquire) &&
+        !m_debugVu0InstructionTraceTriggered.load(
+            std::memory_order_acquire) &&
+        m_debugVu0InstructionTraceHasTrigger.load(
+            std::memory_order_relaxed))
+    {
+        mask |= DEBUG_VU0_INSTRUCTION_TRACE_PC_ARM;
+    }
+    if (m_debugEeEventTraceEnabled.load(std::memory_order_acquire) &&
+        !m_debugEeEventTraceTriggered.load(std::memory_order_acquire) &&
+        m_debugEeEventTraceHasTrigger.load(std::memory_order_relaxed))
+    {
+        mask |= DEBUG_EE_EVENT_TRACE_PC_ARM;
+    }
+    m_debugTracePcArmMask.store(mask, std::memory_order_release);
+}
+
+PS2X_EE_OBSERVATION_COLD
+void PS2Runtime::debugArmVu0TracesSlow(const R5900Context *ctx)
+{
+    std::lock_guard<std::mutex> armLock(m_debugTracePcArmMutex);
+    const uint32_t armMask =
+        m_debugTracePcArmMask.load(std::memory_order_relaxed);
+    if (armMask == 0u)
     {
         return;
     }
 
-    if (m_debugVu0SyncTraceEnabled.load(std::memory_order_acquire) &&
+    if ((armMask & DEBUG_VU0_SYNC_TRACE_PC_ARM) != 0u &&
+        m_debugVu0SyncTraceEnabled.load(std::memory_order_acquire) &&
         !m_debugVu0SyncTraceTriggered.load(std::memory_order_acquire) &&
         m_debugVu0SyncTraceHasTrigger.load(std::memory_order_relaxed) &&
         ctx->pc ==
@@ -11080,7 +11115,8 @@ void PS2Runtime::debugArmVu0Traces(const R5900Context *ctx)
         m_debugVu0SyncTraceTriggered.store(true, std::memory_order_release);
     }
 
-    if (m_debugVu0InstructionTraceEnabled.load(
+    if ((armMask & DEBUG_VU0_INSTRUCTION_TRACE_PC_ARM) != 0u &&
+        m_debugVu0InstructionTraceEnabled.load(
             std::memory_order_acquire) &&
         !m_debugVu0InstructionTraceTriggered.load(
             std::memory_order_acquire) &&
@@ -11094,7 +11130,8 @@ void PS2Runtime::debugArmVu0Traces(const R5900Context *ctx)
             true, std::memory_order_release);
     }
 
-    if (m_debugEeEventTraceEnabled.load(
+    if ((armMask & DEBUG_EE_EVENT_TRACE_PC_ARM) != 0u &&
+        m_debugEeEventTraceEnabled.load(
             std::memory_order_acquire) &&
         !m_debugEeEventTraceTriggered.load(
             std::memory_order_acquire) &&
@@ -11110,6 +11147,8 @@ void PS2Runtime::debugArmVu0Traces(const R5900Context *ctx)
         m_debugEeEventTraceTriggered.store(
             true, std::memory_order_release);
     }
+
+    debugRefreshTracePcArmMaskLocked();
 }
 
 void PS2Runtime::beginVu0Invocation()
@@ -11954,8 +11993,27 @@ void PS2Runtime::synchronizeVU0MicroprogramAtTick(
         ctx->pc ==
             m_debugVu0SyncTraceTriggerEePc.load(std::memory_order_relaxed))
     {
-        m_debugVu0SyncTraceTriggered.store(true, std::memory_order_release);
-        traceSync = true;
+        std::lock_guard<std::mutex> armLock(
+            m_debugTracePcArmMutex);
+        if (m_debugVu0SyncTraceEnabled.load(
+                std::memory_order_acquire) &&
+            !m_debugVu0SyncTraceTriggered.load(
+                std::memory_order_acquire) &&
+            m_debugVu0SyncTraceHasTrigger.load(
+                std::memory_order_relaxed) &&
+            ctx->pc ==
+                m_debugVu0SyncTraceTriggerEePc.load(
+                    std::memory_order_relaxed))
+        {
+            m_debugVu0SyncTraceTriggered.store(
+                true, std::memory_order_release);
+        }
+        traceSync =
+            m_debugVu0SyncTraceEnabled.load(
+                std::memory_order_acquire) &&
+            m_debugVu0SyncTraceTriggered.load(
+                std::memory_order_acquire);
+        debugRefreshTracePcArmMaskLocked();
     }
     if (traceSync)
     {
@@ -15551,6 +15609,7 @@ void PS2Runtime::debugStartVu0SyncTrace(
             "VU0 sync trace accepts only one trigger");
     }
     maximumEntries = std::clamp<size_t>(maximumEntries, 1u, 16384u);
+    std::lock_guard<std::mutex> armLock(m_debugTracePcArmMutex);
     std::lock_guard<std::mutex> lock(m_debugVu0SyncTraceMutex);
     m_debugVu0SyncTraceEnabled.store(false, std::memory_order_release);
     m_debugVu0SyncTrace.clear();
@@ -15575,6 +15634,7 @@ void PS2Runtime::debugStartVu0SyncTrace(
         std::memory_order_release);
     m_debugVu0SyncTraceEnabled.store(true, std::memory_order_release);
     m_vu0.setInstructionObserverEnabled(true);
+    debugRefreshTracePcArmMaskLocked();
 }
 
 void PS2Runtime::debugRecordVu0Sync(DebugVu0SyncEntry entry)
@@ -15584,39 +15644,59 @@ void PS2Runtime::debugRecordVu0Sync(DebugVu0SyncEntry entry)
         return;
     }
 
-    std::lock_guard<std::mutex> lock(m_debugVu0SyncTraceMutex);
-    if (!m_debugVu0SyncTraceEnabled.load(std::memory_order_relaxed) ||
-        m_debugVu0SyncTraceCapacity == 0u)
+    bool stoppedOnFull = false;
     {
-        return;
-    }
-
-    entry.sequence = ++m_debugVu0SyncTraceTotal;
-    if (m_debugVu0SyncTrace.size() < m_debugVu0SyncTraceCapacity)
-    {
-        m_debugVu0SyncTrace.push_back(std::move(entry));
-        if (m_debugVu0SyncTraceStopOnFull &&
-            m_debugVu0SyncTrace.size() == m_debugVu0SyncTraceCapacity)
+        std::lock_guard<std::mutex> lock(m_debugVu0SyncTraceMutex);
+        if (!m_debugVu0SyncTraceEnabled.load(std::memory_order_relaxed) ||
+            m_debugVu0SyncTraceCapacity == 0u)
         {
-            m_debugVu0SyncTraceEnabled.store(
-                false, std::memory_order_release);
+            return;
         }
-        return;
+
+        entry.sequence = ++m_debugVu0SyncTraceTotal;
+        if (m_debugVu0SyncTrace.size() < m_debugVu0SyncTraceCapacity)
+        {
+            m_debugVu0SyncTrace.push_back(std::move(entry));
+            if (m_debugVu0SyncTraceStopOnFull &&
+                m_debugVu0SyncTrace.size() == m_debugVu0SyncTraceCapacity)
+            {
+                m_debugVu0SyncTraceEnabled.store(
+                    false, std::memory_order_release);
+                stoppedOnFull = true;
+            }
+        }
+        else
+        {
+            m_debugVu0SyncTrace[m_debugVu0SyncTraceNext] =
+                std::move(entry);
+            m_debugVu0SyncTraceNext =
+                (m_debugVu0SyncTraceNext + 1u) %
+                m_debugVu0SyncTraceCapacity;
+        }
     }
 
-    m_debugVu0SyncTrace[m_debugVu0SyncTraceNext] = std::move(entry);
-    m_debugVu0SyncTraceNext =
-        (m_debugVu0SyncTraceNext + 1u) % m_debugVu0SyncTraceCapacity;
+    if (stoppedOnFull)
+    {
+        std::lock_guard<std::mutex> armLock(
+            m_debugTracePcArmMutex);
+        m_vu0.setInstructionObserverEnabled(
+            m_debugVu0InstructionTraceEnabled.load(
+                std::memory_order_acquire));
+        debugRefreshTracePcArmMaskLocked();
+    }
 }
 
 PS2Runtime::DebugVu0SyncTrace PS2Runtime::debugVu0SyncTraceSnapshot(bool stop)
 {
     if (stop)
     {
+        std::lock_guard<std::mutex> armLock(
+            m_debugTracePcArmMutex);
         m_debugVu0SyncTraceEnabled.store(false, std::memory_order_release);
         m_vu0.setInstructionObserverEnabled(
             m_debugVu0InstructionTraceEnabled.load(
                 std::memory_order_acquire));
+        debugRefreshTracePcArmMaskLocked();
     }
 
     std::lock_guard<std::mutex> lock(m_debugVu0SyncTraceMutex);
@@ -15674,6 +15754,8 @@ void PS2Runtime::debugStartEeEventTrace(
 {
     maximumEntries =
         std::clamp<size_t>(maximumEntries, 1u, 16384u);
+    std::lock_guard<std::mutex> armLock(
+        m_debugTracePcArmMutex);
     std::lock_guard<std::mutex> lock(
         m_debugEeEventTraceMutex);
     m_debugEeEventTraceEnabled.store(
@@ -15692,6 +15774,7 @@ void PS2Runtime::debugStartEeEventTrace(
         !triggerEePc.has_value(), std::memory_order_release);
     m_debugEeEventTraceEnabled.store(
         true, std::memory_order_release);
+    debugRefreshTracePcArmMaskLocked();
 }
 
 void PS2Runtime::debugRecordEeEvent(
@@ -15713,53 +15796,66 @@ void PS2Runtime::debugRecordEeEvent(
         return;
     }
 
-    std::lock_guard<std::mutex> lock(
-        m_debugEeEventTraceMutex);
-    if (!m_debugEeEventTraceEnabled.load(
-            std::memory_order_relaxed) ||
-        m_debugEeEventTraceCapacity == 0u)
+    bool armStateChanged = false;
     {
-        return;
-    }
-
-    if (!m_debugEeEventTraceTriggered.load(
-            std::memory_order_relaxed))
-    {
-        if (!m_debugEeEventTraceHasTrigger.load(
+        std::lock_guard<std::mutex> lock(
+            m_debugEeEventTraceMutex);
+        if (!m_debugEeEventTraceEnabled.load(
                 std::memory_order_relaxed) ||
-            entry.eePc ==
-                m_debugEeEventTraceTriggerEePc.load(
-                    std::memory_order_relaxed))
-        {
-            m_debugEeEventTraceTriggered.store(
-                true, std::memory_order_release);
-        }
-        else
+            m_debugEeEventTraceCapacity == 0u)
         {
             return;
         }
-    }
 
-    entry.sequence = ++m_debugEeEventTraceTotal;
-    if (m_debugEeEventTrace.size() <
-        m_debugEeEventTraceCapacity)
-    {
-        m_debugEeEventTrace.push_back(std::move(entry));
-        if (m_debugEeEventTraceStopOnFull &&
-            m_debugEeEventTrace.size() ==
-                m_debugEeEventTraceCapacity)
+        if (!m_debugEeEventTraceTriggered.load(
+                    std::memory_order_relaxed))
         {
-            m_debugEeEventTraceEnabled.store(
-                false, std::memory_order_release);
+            if (!m_debugEeEventTraceHasTrigger.load(
+                    std::memory_order_relaxed) ||
+                entry.eePc ==
+                    m_debugEeEventTraceTriggerEePc.load(
+                        std::memory_order_relaxed))
+            {
+                m_debugEeEventTraceTriggered.store(
+                    true, std::memory_order_release);
+                armStateChanged = true;
+            }
+            else
+            {
+                return;
+            }
         }
-        return;
+
+        entry.sequence = ++m_debugEeEventTraceTotal;
+        if (m_debugEeEventTrace.size() <
+            m_debugEeEventTraceCapacity)
+        {
+            m_debugEeEventTrace.push_back(std::move(entry));
+            if (m_debugEeEventTraceStopOnFull &&
+                m_debugEeEventTrace.size() ==
+                    m_debugEeEventTraceCapacity)
+            {
+                m_debugEeEventTraceEnabled.store(
+                    false, std::memory_order_release);
+                armStateChanged = true;
+            }
+        }
+        else
+        {
+            m_debugEeEventTrace[m_debugEeEventTraceNext] =
+                std::move(entry);
+            m_debugEeEventTraceNext =
+                (m_debugEeEventTraceNext + 1u) %
+                m_debugEeEventTraceCapacity;
+        }
     }
 
-    m_debugEeEventTrace[m_debugEeEventTraceNext] =
-        std::move(entry);
-    m_debugEeEventTraceNext =
-        (m_debugEeEventTraceNext + 1u) %
-        m_debugEeEventTraceCapacity;
+    if (armStateChanged)
+    {
+        std::lock_guard<std::mutex> armLock(
+            m_debugTracePcArmMutex);
+        debugRefreshTracePcArmMaskLocked();
+    }
 }
 
 PS2Runtime::DebugEeEventTrace
@@ -15767,8 +15863,11 @@ PS2Runtime::debugEeEventTraceSnapshot(bool stop)
 {
     if (stop)
     {
+        std::lock_guard<std::mutex> armLock(
+            m_debugTracePcArmMutex);
         m_debugEeEventTraceEnabled.store(
             false, std::memory_order_release);
+        debugRefreshTracePcArmMaskLocked();
     }
 
     std::lock_guard<std::mutex> lock(
@@ -15824,6 +15923,7 @@ void PS2Runtime::debugStartVu0InstructionTrace(
             "VU0 instruction trace accepts only one trigger");
     }
     maximumEntries = std::clamp<size_t>(maximumEntries, 1u, 8192u);
+    std::lock_guard<std::mutex> armLock(m_debugTracePcArmMutex);
     std::lock_guard<std::mutex> lock(m_debugVu0InstructionTraceMutex);
     m_debugVu0InstructionTraceEnabled.store(
         false, std::memory_order_release);
@@ -15847,6 +15947,7 @@ void PS2Runtime::debugStartVu0InstructionTrace(
     m_debugVu0InstructionTraceEnabled.store(
         true, std::memory_order_release);
     m_vu0.setInstructionObserverEnabled(true);
+    debugRefreshTracePcArmMaskLocked();
 }
 
 void PS2Runtime::debugRecordVu0Instruction(
@@ -15858,34 +15959,51 @@ void PS2Runtime::debugRecordVu0Instruction(
         return;
     }
 
-    std::lock_guard<std::mutex> lock(m_debugVu0InstructionTraceMutex);
-    if (!m_debugVu0InstructionTraceEnabled.load(
-            std::memory_order_relaxed) ||
-        m_debugVu0InstructionTraceCapacity == 0u)
+    bool stoppedOnFull = false;
     {
-        return;
-    }
-
-    entry.sequence = ++m_debugVu0InstructionTraceTotal;
-    if (m_debugVu0InstructionTrace.size() <
-        m_debugVu0InstructionTraceCapacity)
-    {
-        m_debugVu0InstructionTrace.push_back(std::move(entry));
-        if (m_debugVu0InstructionTraceStopOnFull &&
-            m_debugVu0InstructionTrace.size() ==
-                m_debugVu0InstructionTraceCapacity)
+        std::lock_guard<std::mutex> lock(
+            m_debugVu0InstructionTraceMutex);
+        if (!m_debugVu0InstructionTraceEnabled.load(
+                std::memory_order_relaxed) ||
+            m_debugVu0InstructionTraceCapacity == 0u)
         {
-            m_debugVu0InstructionTraceEnabled.store(
-                false, std::memory_order_release);
+            return;
         }
-        return;
+
+        entry.sequence = ++m_debugVu0InstructionTraceTotal;
+        if (m_debugVu0InstructionTrace.size() <
+            m_debugVu0InstructionTraceCapacity)
+        {
+            m_debugVu0InstructionTrace.push_back(std::move(entry));
+            if (m_debugVu0InstructionTraceStopOnFull &&
+                m_debugVu0InstructionTrace.size() ==
+                    m_debugVu0InstructionTraceCapacity)
+            {
+                m_debugVu0InstructionTraceEnabled.store(
+                    false, std::memory_order_release);
+                stoppedOnFull = true;
+            }
+        }
+        else
+        {
+            m_debugVu0InstructionTrace[
+                m_debugVu0InstructionTraceNext] =
+                std::move(entry);
+            m_debugVu0InstructionTraceNext =
+                (m_debugVu0InstructionTraceNext + 1u) %
+                m_debugVu0InstructionTraceCapacity;
+        }
     }
 
-    m_debugVu0InstructionTrace[m_debugVu0InstructionTraceNext] =
-        std::move(entry);
-    m_debugVu0InstructionTraceNext =
-        (m_debugVu0InstructionTraceNext + 1u) %
-        m_debugVu0InstructionTraceCapacity;
+    if (stoppedOnFull)
+    {
+        std::lock_guard<std::mutex> armLock(
+            m_debugTracePcArmMutex);
+        m_vu0.setInstructionObserverEnabled(
+            m_debugVu0SyncTraceEnabled.load(
+                std::memory_order_acquire));
+        debugRefreshTracePcArmMaskLocked();
+    }
 }
 
 PS2Runtime::DebugVu0InstructionTrace
@@ -15893,11 +16011,14 @@ PS2Runtime::debugVu0InstructionTraceSnapshot(bool stop)
 {
     if (stop)
     {
+        std::lock_guard<std::mutex> armLock(
+            m_debugTracePcArmMutex);
         m_debugVu0InstructionTraceEnabled.store(
             false, std::memory_order_release);
         m_vu0.setInstructionObserverEnabled(
             m_debugVu0SyncTraceEnabled.load(
                 std::memory_order_acquire));
+        debugRefreshTracePcArmMaskLocked();
     }
 
     std::lock_guard<std::mutex> lock(m_debugVu0InstructionTraceMutex);

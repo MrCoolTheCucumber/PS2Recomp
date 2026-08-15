@@ -81,6 +81,7 @@ add_library(ps2_test_lib STATIC
     src/ps2_runtime_io_tests.cpp
     src/ps2_runtime_kernel_tests.cpp
     src/ps2_runtime_interrupt_tests.cpp
+    src/ps2_runtime_trace_arm_tests.cpp
     src/ps2_memory_tests.cpp
     src/ps2_perf_jitdump_tests.cpp
     src/ps2_vu_executable_memory_tests.cpp
@@ -160,6 +161,12 @@ add_executable(ps2_gs_command_stream_tests
 add_executable(ps2_vu1_command_stream_tests
     src/ps2_vu1_command_stream_test_main.cpp
     src/ps2_vu1_command_stream_tests.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
+add_executable(ps2_runtime_trace_arm_tests
+    src/ps2_runtime_trace_arm_test_main.cpp
+    src/ps2_runtime_trace_arm_tests.cpp
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
 
@@ -298,6 +305,11 @@ target_include_directories(ps2_vu1_command_stream_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
 )
 
+target_include_directories(ps2_runtime_trace_arm_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
 target_link_libraries(ps2x_tests PRIVATE
     ps2_test_lib
     ps2_recomp_lib
@@ -317,6 +329,10 @@ target_link_libraries(ps2_gs_command_stream_tests PRIVATE
 )
 
 target_link_libraries(ps2_vu1_command_stream_tests PRIVATE
+    ps2_runtime
+)
+
+target_link_libraries(ps2_runtime_trace_arm_tests PRIVATE
     ps2_runtime
 )
 
@@ -404,6 +420,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     EnableFastReleaseMode(ee_runtime_executor_tests)
     EnableFastReleaseMode(ps2_gs_command_stream_tests)
     EnableFastReleaseMode(ps2_vu1_command_stream_tests)
+    EnableFastReleaseMode(ps2_runtime_trace_arm_tests)
     EnableFastReleaseMode(ee_timing_benchmark)
     EnableFastReleaseMode(ee_generated_code_benchmark)
     EnableFastReleaseMode(ee_random_retirement_benchmark)
@@ -421,4 +438,5 @@ ConfigureEeFcontextSuspendedFrames(ps2x_tests)
 ConfigureEeFcontextSuspendedFrames(ee_runtime_executor_tests)
 ConfigureEeFcontextSuspendedFrames(ps2_gs_command_stream_tests)
 ConfigureEeFcontextSuspendedFrames(ps2_vu1_command_stream_tests)
+ConfigureEeFcontextSuspendedFrames(ps2_runtime_trace_arm_tests)
 ConfigureEeFcontextSuspendedFrames(ee_fiber_guard_probe)
