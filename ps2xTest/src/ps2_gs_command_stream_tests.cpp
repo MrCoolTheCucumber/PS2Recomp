@@ -771,6 +771,72 @@ void register_ps2_gs_command_stream_tests()
                      "direct GS SIGNAL should still apply masked low bits");
         });
 
+        tc.Run("quiescent GS progress snapshots drain prior renderer work", [](TestCase &t)
+        {
+            GsFixture fixture;
+            InlineGsExecutor executor(fixture.processor);
+            (void)executor.submit(
+                GsSetProgressTrackingCommand{
+                    .enabled = true,
+                });
+
+            const auto write =
+                [&executor](uint8_t address, uint64_t value)
+                {
+                    (void)executor.submit(
+                        GsWriteRegisterCommand{
+                            .address = address,
+                            .value = value,
+                        });
+                };
+            write(GS_REG_FRAME_1, 1ull << 16u);
+            write(GS_REG_ZBUF_1, 1ull << 32u);
+            write(
+                GS_REG_SCISSOR_1,
+                (63ull << 16u) | (63ull << 48u));
+            write(GS_REG_XYOFFSET_1, 0u);
+            write(GS_REG_TEST_1, 0u);
+            write(
+                GS_REG_PRIM,
+                static_cast<uint64_t>(GS_PRIM_SPRITE));
+            write(GS_REG_RGBAQ, 0x80804020ull);
+            (void)executor.submit(GsBeginRenderBatchCommand{});
+            write(GS_REG_XYZ2, 0u);
+            write(
+                GS_REG_XYZ2,
+                (64ull * 16ull) |
+                    ((64ull * 16ull) << 16u));
+
+            const GSProgressSnapshot pending =
+                takeGsCommandResult<GsProgressSnapshotResult>(
+                    executor.submit(
+                        GsProgressSnapshotCommand{}))
+                    .snapshot;
+            t.Equals(pending.drawsStarted, 0ull,
+                     "a non-quiescent watchdog sample should not drain renderer work");
+
+            const GsCommandResult quiescentResult =
+                executor.submit(
+                    GsProgressSnapshotCommand{
+                        .quiesceRenderer = true,
+                    });
+            const GSProgressSnapshot quiescent =
+                takeGsCommandResult<GsProgressSnapshotResult>(
+                    quiescentResult)
+                    .snapshot;
+            t.Equals(quiescent.drawsStarted, 1ull,
+                     "the ordered progress boundary should start the queued draw");
+            t.Equals(quiescent.drawsCompleted, 1ull,
+                     "the ordered progress boundary should finish the queued draw");
+            t.Equals(quiescent.candidatePixels, 64ull * 64ull,
+                     "the quiescent snapshot should include exact renderer work");
+            t.Equals(quiescent.activeDraws, 0u,
+                     "the quiescent boundary should leave no active draw");
+            t.Equals(quiescentResult.digest.payloadSize, uint64_t{1u},
+                     "the snapshot digest should retain its quiesce policy");
+            (void)executor.submit(GsEndRenderBatchCommand{});
+        });
+
         tc.Run("threaded GS cancellation rejects stale queued generations and admits reset", [](TestCase &t)
         {
             GsFixture fixture;

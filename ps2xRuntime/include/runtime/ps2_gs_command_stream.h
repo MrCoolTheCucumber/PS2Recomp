@@ -149,6 +149,10 @@ struct GsDebugSnapshotCommand
 
 struct GsProgressSnapshotCommand
 {
+    // Ordered benchmark/status boundaries require all already-submitted
+    // renderer work in the snapshot. Periodic watchdog samples leave this
+    // false so observation cannot collapse normal overlap.
+    bool quiesceRenderer = false;
 };
 
 struct GsDebugHistoryCommand

@@ -965,7 +965,9 @@ struct PS2DebugServer::Impl
         const GSProgressSnapshot gsProgress =
             takeGsCommandResult<GsProgressSnapshotResult>(
                 runtime.submitGsCommand(
-                    GsProgressSnapshotCommand{}))
+                    GsProgressSnapshotCommand{
+                        .quiesceRenderer = true,
+                    }))
                 .snapshot;
         const VuProgressSnapshot vu0Progress =
             runtime.vu0().getProgressSnapshot();

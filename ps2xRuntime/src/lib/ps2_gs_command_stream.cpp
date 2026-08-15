@@ -379,6 +379,8 @@ uint64_t gsCommandPayloadSize(
                        sizeof(value.activeContext);
             else if constexpr (std::is_same_v<T, GsReadFifoCommand>)
                 return sizeof(value.maximumBytes);
+            else if constexpr (std::is_same_v<T, GsProgressSnapshotCommand>)
+                return sizeof(value.quiesceRenderer);
             else if constexpr (std::is_same_v<T, GsRestoreReplayStateCommand>)
             {
                 std::vector<uint8_t> encoded;
@@ -473,6 +475,8 @@ uint64_t gsCommandPayloadHash(
             }
             else if constexpr (std::is_same_v<T, GsReadFifoCommand>)
                 hashScalar(hash, value.maximumBytes);
+            else if constexpr (std::is_same_v<T, GsProgressSnapshotCommand>)
+                hashScalar(hash, value.quiesceRenderer);
             else if constexpr (std::is_same_v<T, GsRestoreReplayStateCommand>)
             {
                 const uint64_t stateHash = hashReplayState(value.state);
@@ -806,7 +810,16 @@ GsCommandResult GsCommandProcessor::process(
             else if constexpr (std::is_same_v<T, GsDebugSnapshotCommand>)
                 return GsDebugSnapshotResult{m_gs.getDebugSnapshot()};
             else if constexpr (std::is_same_v<T, GsProgressSnapshotCommand>)
+            {
+                if (value.quiesceRenderer)
+                {
+                    // The existing debug snapshot is an ordered, const GS
+                    // observation that drains resident renderer work without
+                    // copying VRAM. Its state is not needed here.
+                    (void)m_gs.getDebugSnapshot();
+                }
                 return GsProgressSnapshotResult{m_gs.getProgressSnapshot()};
+            }
             else if constexpr (std::is_same_v<T, GsDebugHistoryCommand>)
                 return GsDebugHistoryResult{m_gs.getDebugHistory()};
             else if constexpr (std::is_same_v<T, GsRecentGifPacketsCommand>)
