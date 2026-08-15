@@ -2445,18 +2445,7 @@ private:
     debugEeEventDeviceState(
         ps2x::timing::EeEventSource source) const noexcept;
 #if PS2X_ENABLE_RUNTIME_DIAGNOSTICS
-    void debugArmVu0TracesSlow(const R5900Context *ctx);
-    void debugArmVu0Traces(const R5900Context *ctx)
-    {
-        if (!ctx ||
-            m_debugTracePcArmMask.load(
-                std::memory_order_acquire) == 0u) [[likely]]
-        {
-            return;
-        }
-        debugArmVu0TracesSlow(ctx);
-    }
-    void debugRefreshTracePcArmMaskLocked() noexcept;
+    void debugArmVu0Traces(const R5900Context *ctx);
     void beginVu0Invocation();
 #else
     void debugArmVu0Traces(const R5900Context *ctx)
@@ -3267,8 +3256,6 @@ private:
     mutable std::mutex m_debugFaultMutex;
     DebugFaultInfo m_debugFault{};
     std::atomic<uint64_t> m_debugFaultSequence{0u};
-    mutable std::mutex m_debugTracePcArmMutex;
-    std::atomic<uint32_t> m_debugTracePcArmMask{0u};
     std::atomic<bool> m_debugVu0SyncTraceEnabled{false};
     std::atomic<bool> m_debugVu0SyncTraceTriggered{false};
     std::atomic<bool> m_debugVu0SyncTraceHasTrigger{false};
