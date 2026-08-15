@@ -1980,6 +1980,254 @@ void register_ps2_vu1_command_stream_tests()
                 "command-class wait time should balance the aggregate");
         });
 
+        tc.Run("threaded VU1 epoch journals exact checkpoints without extension tickets", [](TestCase &t)
+        {
+            VuUnit unit(VuUnitId::Vu1);
+            unit.setProgressTrackingEnabled(true);
+            Vu1CommandProcessor processor(
+                unit,
+                Vu1CommandProcessorConfiguration{
+                    .captureCommandDigests = true,
+                    .captureArchitecturalStateHashes = true,
+                });
+            ThreadedVu1Executor executor(
+                processor,
+                ThreadedVu1ExecutorOptions{
+                    .queueCapacity = 2u,
+                    .payloadCapacityBytes = 1024u * 1024u,
+                });
+            (void)executor.submit(Vu1BindMemoryCommand{
+                .microMemory =
+                    std::vector<uint8_t>(PS2_VU1_CODE_SIZE),
+                .dataMemory =
+                    std::vector<uint8_t>(PS2_VU1_DATA_SIZE),
+                .codeGeneration = 1u,
+                .deferredDiagnostics = true,
+            });
+            constexpr uint32_t kWorkPairs = 400u;
+            std::vector<uint8_t> program(kWorkPairs * 8u, 0u);
+            for (uint32_t pair = 0u; pair < kWorkPairs; ++pair)
+            {
+                const auto words = instructionPair(
+                    makeVuIaddiu(1u, 1u, 1),
+                    pair + 1u == kWorkPairs
+                        ? kVuUpperEnd
+                        : kVuUpperNop);
+                std::copy(
+                    words.begin(), words.end(),
+                    program.begin() + pair * 8u);
+            }
+            (void)executor.submit(Vu1MicroMemoryWriteCommand{
+                .offset = 0u,
+                .bytes = std::move(program),
+            });
+            (void)executor.submit(Vu1MscalCommand{}, 16u, 100u);
+
+            Vu1ExecutionEpoch epoch =
+                executor.submitExecutionEpoch(
+                    Vu1ExecutionEpochOptions{
+                        .initialCycles = 16u,
+                        .followupCycles = 128u,
+                        .checkpointCapacity = 3u,
+                        .captureState = true,
+                    },
+                    128u, 101u);
+            t.IsTrue(
+                waitUntil(
+                    [&executor, &epoch]()
+                    {
+                        return executor
+                                   .executionEpochReadyCheckpointCount(
+                                       epoch) >= 3u;
+                    }),
+                "one owner activation should fill a bounded checkpoint journal");
+
+            const Vu1CommandResult first =
+                executor.waitExecutionEpochCheckpoint(
+                    epoch, 16u, 128u, 101u);
+            const Vu1SliceResult *const firstSlice =
+                sliceResult(first);
+            t.IsTrue(
+                firstSlice && firstSlice->state &&
+                    firstSlice->run.executedCycles == 16u &&
+                    firstSlice->state->vi[1] == 16,
+                "the first event should publish the exact startup checkpoint");
+
+            const Vu1CommandResult late =
+                executor.waitExecutionEpochCheckpoint(
+                    epoch, 129u, 1160u, 102u);
+            const Vu1SliceResult *const lateSlice =
+                sliceResult(late);
+            t.IsTrue(
+                lateSlice && lateSlice->state &&
+                    lateSlice->run.executedCycles == 129u &&
+                    lateSlice->state->vi[1] == 145,
+                "late exact demand should rebase only the unpublished suffix");
+
+            const Vu1CommandResult third =
+                executor.waitExecutionEpochCheckpoint(
+                    epoch, 128u, 2184u, 103u);
+            const Vu1SliceResult *const thirdSlice =
+                sliceResult(third);
+            t.IsTrue(
+                thirdSlice && thirdSlice->state &&
+                    thirdSlice->run.executedCycles == 128u &&
+                    thirdSlice->state->vi[1] == 273,
+                "the epoch should continue from the rebased exact checkpoint");
+
+            const Vu1CommandResult snapshotResult =
+                executor.submit(Vu1SnapshotCommand{}, 2184u, 104u);
+            const auto *const snapshot =
+                std::get_if<Vu1SnapshotResult>(
+                    &snapshotResult.payload);
+            t.IsTrue(
+                snapshot && snapshot->snapshot &&
+                    snapshot->snapshot->state.vi[1] == 273,
+                "a later observation should discard lookahead beyond the published prefix");
+
+            const ThreadedVu1ExecutorStatistics statistics =
+                executor.statistics();
+            const ThreadedVu1CommandTypeStatistics &advance =
+                statistics.commandTypes[
+                    vu1CommandTypeIndex(
+                        Vu1CommandType::AdvanceSlice)];
+            t.Equals(advance.submitted, 1ull,
+                     "one epoch should consume one advance transport ticket");
+            t.Equals(advance.completed, 1ull,
+                     "the observation should retire the one epoch ticket");
+            t.Equals(advance.resultWaitCount, 0ull,
+                     "checkpoint publication must not wait on a transport future");
+            t.Equals(
+                statistics.executionEpoch.checkpointsPublished,
+                3ull,
+                "three guest events should publish three exact checkpoints");
+            t.IsTrue(
+                statistics.executionEpoch.checkpointsProduced >
+                    statistics.executionEpoch.checkpointsPublished,
+                "late demand and observation should leave discarded suffix work");
+            t.IsTrue(
+                statistics.executionEpoch.suffixCheckpointsDiscarded >= 1u,
+                "only unpublished suffix checkpoints should be discarded");
+            t.Equals(
+                statistics.executionEpoch.demandRebases, 1ull,
+                "one late event should update the existing epoch horizon");
+            t.IsTrue(
+                statistics.executionEpoch.maximumJournalDepth >= 3u,
+                "the bounded journal should hold multiple future checkpoints");
+        });
+
+        tc.Run("threaded VU1 mutation preserves every published epoch prefix", [](TestCase &t)
+        {
+            for (uint32_t published = 0u; published <= 2u; ++published)
+            {
+                VuUnit unit(VuUnitId::Vu1);
+                unit.setProgressTrackingEnabled(true);
+                Vu1CommandProcessor processor(
+                    unit,
+                    Vu1CommandProcessorConfiguration{
+                        .captureCommandDigests = true,
+                        .captureArchitecturalStateHashes = true,
+                    });
+                ThreadedVu1Executor executor(
+                    processor,
+                    ThreadedVu1ExecutorOptions{
+                        .queueCapacity = 2u,
+                        .payloadCapacityBytes = 1024u * 1024u,
+                    });
+                (void)executor.submit(Vu1BindMemoryCommand{
+                    .microMemory =
+                        std::vector<uint8_t>(PS2_VU1_CODE_SIZE),
+                    .dataMemory =
+                        std::vector<uint8_t>(PS2_VU1_DATA_SIZE),
+                    .codeGeneration = 1u,
+                    .deferredDiagnostics = true,
+                });
+                constexpr uint32_t kWorkPairs = 400u;
+                std::vector<uint8_t> program(kWorkPairs * 8u, 0u);
+                for (uint32_t pair = 0u; pair < kWorkPairs; ++pair)
+                {
+                    const auto words = instructionPair(
+                        makeVuIaddiu(1u, 1u, 1),
+                        pair + 1u == kWorkPairs
+                            ? kVuUpperEnd
+                            : kVuUpperNop);
+                    std::copy(
+                        words.begin(), words.end(),
+                        program.begin() + pair * 8u);
+                }
+                (void)executor.submit(Vu1MicroMemoryWriteCommand{
+                    .offset = 0u,
+                    .bytes = std::move(program),
+                });
+                (void)executor.submit(Vu1MscalCommand{}, 16u, 100u);
+
+                Vu1ExecutionEpoch epoch =
+                    executor.submitExecutionEpoch(
+                        Vu1ExecutionEpochOptions{
+                            .initialCycles = 16u,
+                            .followupCycles = 128u,
+                            .checkpointCapacity = 3u,
+                            .captureState = true,
+                        },
+                        128u, 101u);
+                t.IsTrue(
+                    waitUntil(
+                        [&executor, &epoch]()
+                        {
+                            return executor
+                                       .executionEpochReadyCheckpointCount(
+                                           epoch) >= 3u;
+                        }),
+                    "the mutation fixture should retain three unpublished checkpoints");
+
+                for (uint32_t index = 0u;
+                     index < published; ++index)
+                {
+                    const uint32_t cycles =
+                        index == 0u ? 16u : 128u;
+                    (void)executor.waitExecutionEpochCheckpoint(
+                        epoch, cycles,
+                        128u + static_cast<uint64_t>(index) * 1024u,
+                        101u + index);
+                }
+                const uint8_t marker =
+                    static_cast<uint8_t>(0xa0u + published);
+                (void)executor.submitResultless(
+                    Vu1DataMemoryWriteCommand{
+                        .offset = 0u,
+                        .bytes = {marker},
+                    },
+                    4096u, 200u + published);
+                const Vu1CommandResult snapshotResult =
+                    executor.submit(
+                        Vu1SnapshotCommand{},
+                        4096u, 300u + published);
+                const auto *const snapshot =
+                    std::get_if<Vu1SnapshotResult>(
+                        &snapshotResult.payload);
+                const int32_t expectedVi =
+                    published == 0u
+                        ? 0
+                        : 16 +
+                              static_cast<int32_t>(
+                                  published - 1u) * 128;
+                t.IsTrue(
+                    snapshot && snapshot->snapshot &&
+                        snapshot->snapshot->state.vi[1] == expectedVi &&
+                        snapshot->snapshot->dataMemory[0] == marker,
+                    "an ordered mutation should retain exactly the published prefix");
+                const ThreadedVu1ExecutorStatistics statistics =
+                    executor.statistics();
+                t.Equals(
+                    statistics.executionEpoch.checkpointsPublished,
+                    static_cast<uint64_t>(published),
+                    "the fixture should publish only its requested prefix");
+                t.IsTrue(
+                    statistics.executionEpoch.suffixCheckpointsDiscarded >= 1u,
+                    "the mutation should invalidate an unpublished suffix");
+            }
+        });
+
         tc.Run("threaded VU1 rolls back an unpublished slice before a hazard", [](TestCase &t)
         {
             VuUnit unit(VuUnitId::Vu1);
@@ -3690,6 +3938,389 @@ void register_ps2_vu1_command_stream_tests()
                      "the blocked owner should be classified late");
             t.IsTrue(statistics.eventWaitNanoseconds >= 10'000'000ull,
                      "the event should report its forced host wait");
+        });
+
+        tc.Run("runtime checkpoint epochs publish exact ready and late event state", [](TestCase &t)
+        {
+            struct RunResult
+            {
+                uint64_t architecturalHash = 0u;
+                int32_t vi1 = 0;
+                PS2Runtime::DebugVu1Timing timing{};
+                Vu1AsyncRuntimeStatistics statistics{};
+            };
+            const auto run =
+                [&](Vu1ExecutionMode mode,
+                    bool epochs,
+                    uint32_t workPairs,
+                    const std::vector<uint64_t> &eventDeltas)
+                    -> RunResult
+                {
+                    PS2RuntimeConfiguration configuration =
+                        defaultPs2RuntimeConfiguration();
+                    configuration.vu1ExecutionMode = mode;
+                    configuration.vu1CheckpointEpochs = epochs;
+                    configuration.vu1CheckpointCapacity = 3u;
+                    configuration.vu1CommandQueueCapacity = 2u;
+                    configuration.vu1CommandPayloadCapacityBytes =
+                        1024u * 1024u;
+                    configuration.captureVu1ArchitecturalStateHashes =
+                        true;
+                    PS2Runtime runtime(configuration);
+                    if (!runtime.memory().initialize() ||
+                        !runtime.syncCoreSubsystems())
+                    {
+                        t.Fail("checkpoint-epoch runtime should initialize");
+                        return {};
+                    }
+
+                    for (uint32_t pair = 0u;
+                         pair < workPairs; ++pair)
+                    {
+                        writeRuntimeVu1InstructionPair(
+                            runtime, pair * 8u,
+                            makeVuIaddiu(1u, 1u, 1),
+                            pair + 1u == workPairs
+                                ? kVuUpperEnd
+                                : kVuUpperNop);
+                    }
+                    writeRuntimeVu1InstructionPair(
+                        runtime, workPairs * 8u,
+                        0u, kVuUpperNop);
+                    const uint32_t mscal =
+                        makeVifCommand(0x14u, 0u, 0u);
+                    runtime.memory().processVIF1Data(
+                        reinterpret_cast<const uint8_t *>(&mscal),
+                        sizeof(mscal));
+
+                    if (epochs &&
+                        !waitUntil(
+                            [&runtime]()
+                            {
+                                return runtime
+                                           .vu1AsyncStatistics()
+                                           .owner.executionEpoch
+                                           .maximumJournalDepth >= 3u;
+                            }))
+                    {
+                        t.Fail("the runtime epoch should fill its bounded journal");
+                        return {};
+                    }
+
+                    R5900Context &context = runtime.cpu();
+                    for (const uint64_t delta : eventDeltas)
+                    {
+                        context.advanceEeCycleTicks(delta);
+                        runtime.serviceEeEventsAtBlockBoundary(
+                            runtime.memory().getRDRAM(), &context);
+                    }
+                    if (epochs &&
+                        !waitUntil(
+                            [&runtime]()
+                            {
+                                const auto statistics =
+                                    runtime.vu1AsyncStatistics();
+                                return !statistics.pendingSlice &&
+                                       statistics.owner.executionEpoch
+                                               .epochsCompleted == 1u;
+                            }))
+                    {
+                        t.Fail("the completed runtime epoch should retire");
+                        return {};
+                    }
+
+                    const std::shared_ptr<const Vu1Snapshot> snapshot =
+                        runtime.snapshotVu1Owner();
+                    return RunResult{
+                        .architecturalHash =
+                            vu1ArchitecturalStateHash(
+                                snapshot->state,
+                                snapshot->microMemory,
+                                snapshot->dataMemory,
+                                snapshot->vif,
+                                snapshot->codeGeneration),
+                        .vi1 = snapshot->state.vi[1],
+                        .timing = runtime.debugVu1TimingSnapshot(),
+                        .statistics = runtime.vu1AsyncStatistics(),
+                    };
+                };
+
+            const RunResult readyReference = run(
+                Vu1ExecutionMode::Inline,
+                false, 200u, {128u, 1024u, 1024u});
+            const RunResult readyEpoch = run(
+                Vu1ExecutionMode::ThreadedAsync,
+                true, 200u, {128u, 1024u, 1024u});
+            t.Equals(
+                readyEpoch.architecturalHash,
+                readyReference.architecturalHash,
+                "a multi-checkpoint runtime epoch should match inline architecture");
+            t.Equals(readyEpoch.vi1, int32_t{200},
+                     "all ready epoch work should execute exactly once");
+            t.Equals(
+                readyEpoch.timing.currentTick,
+                readyReference.timing.currentTick,
+                "ready epoch publication must retain guest time");
+            t.Equals(
+                readyEpoch.timing.totalAdvancedCycles,
+                readyReference.timing.totalAdvancedCycles,
+                "ready epoch publication must retain exact VU cycles");
+            t.Equals(
+                readyEpoch.statistics.owner.executionEpoch
+                    .checkpointsPublished,
+                3ull,
+                "three scheduler events should publish three journal entries");
+            t.Equals(
+                readyEpoch.statistics.owner.commandTypes[
+                    vu1CommandTypeIndex(
+                        Vu1CommandType::AdvanceSlice)]
+                    .submitted,
+                1ull,
+                "three ready events should share one advance ticket");
+            t.Equals(
+                readyEpoch.statistics.owner.commandTypes[
+                    vu1CommandTypeIndex(
+                        Vu1CommandType::AdvanceSlice)]
+                    .resultWaitCount,
+                0ull,
+                "runtime checkpoint waits should not be transport waits");
+
+            const RunResult lateReference = run(
+                Vu1ExecutionMode::Inline,
+                false, 144u, {128u, 1032u});
+            const RunResult lateEpoch = run(
+                Vu1ExecutionMode::ThreadedAsync,
+                true, 144u, {128u, 1032u});
+            t.Equals(
+                lateEpoch.architecturalHash,
+                lateReference.architecturalHash,
+                "a late exact horizon update should match inline architecture");
+            t.Equals(lateEpoch.vi1, int32_t{144},
+                     "the late epoch should include the exact one-cycle suffix");
+            t.Equals(
+                lateEpoch.timing.currentTick,
+                lateReference.timing.currentTick,
+                "late epoch publication must not compensate guest time");
+            t.Equals(
+                lateEpoch.timing.totalAdvancedCycles,
+                lateReference.timing.totalAdvancedCycles,
+                "late epoch publication must retain exact VU cycles");
+            t.Equals(
+                lateEpoch.statistics.owner.executionEpoch
+                    .demandRebases,
+                1ull,
+                "one late service should coalesce into one horizon rebase");
+            t.Equals(
+                lateEpoch.statistics.owner.commandTypes[
+                    vu1CommandTypeIndex(
+                        Vu1CommandType::AdvanceSlice)]
+                    .submitted,
+                1ull,
+                "late continuation must not allocate an extension ticket");
+            t.Equals(
+                lateEpoch.statistics.budgetExtensionCount, 0ull,
+                "Phase B should bypass the Phase A extension path");
+        });
+
+        tc.Run("runtime reset cancels an in-flight VU1 checkpoint epoch", [](TestCase &t)
+        {
+            std::mutex gateMutex;
+            std::condition_variable gateCv;
+            bool entered = false;
+            bool release = false;
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedAsync;
+            configuration.vu1CheckpointEpochs = true;
+            configuration.vu1CheckpointCapacity = 2u;
+            configuration.vu1CommandQueueCapacity = 1u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            configuration.vu1BeforeProcess =
+                [&](const Vu1Command &command, uint64_t)
+                {
+                    if (command.type !=
+                        Vu1CommandType::AdvanceSlice)
+                    {
+                        return;
+                    }
+                    std::unique_lock<std::mutex> lock(gateMutex);
+                    if (entered)
+                        return;
+                    entered = true;
+                    gateCv.notify_all();
+                    gateCv.wait(
+                        lock,
+                        [&release]()
+                        {
+                            return release;
+                        });
+                };
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "epoch-reset runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "epoch-reset runtime subsystems should bind");
+            for (uint32_t pair = 0u; pair < 64u; ++pair)
+            {
+                writeRuntimeVu1InstructionPair(
+                    runtime, pair * 8u,
+                    makeVuIaddiu(1u, 1u, 1),
+                    kVuUpperNop);
+            }
+            const uint32_t mscal =
+                makeVifCommand(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            const PS2Runtime::DebugVu1Timing started =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(
+                waitFor(
+                    gateCv, gateMutex,
+                    [&entered]()
+                    {
+                        return entered;
+                    }),
+                "the checkpoint epoch should be owner-active");
+
+            std::atomic<bool> resetDone{false};
+            std::atomic<bool> resetStarted{false};
+            bool resetAccepted = false;
+            std::thread resetter(
+                [&]()
+                {
+                    resetStarted.store(
+                        true, std::memory_order_release);
+                    resetAccepted = runtime.memory().writeIORegister(
+                        0x10003c10u, 1u);
+                    resetDone.store(
+                        true, std::memory_order_release);
+                });
+            t.IsTrue(
+                waitUntil(
+                    [&resetStarted]()
+                    {
+                        return resetStarted.load(
+                            std::memory_order_acquire);
+                    }),
+                "the epoch reset producer should start");
+            std::this_thread::sleep_for(5ms);
+            t.IsFalse(
+                resetDone.load(std::memory_order_acquire),
+                "reset must wait for the epoch to reach its rollback boundary");
+            {
+                std::lock_guard<std::mutex> lock(gateMutex);
+                release = true;
+            }
+            gateCv.notify_all();
+            resetter.join();
+
+            t.IsTrue(resetAccepted,
+                     "VIF1 FBRST should accept the epoch reset");
+            const PS2Runtime::DebugVu1Timing reset =
+                runtime.debugVu1TimingSnapshot();
+            const Vu1AsyncRuntimeStatistics statistics =
+                runtime.vu1AsyncStatistics();
+            t.IsFalse(reset.active,
+                      "epoch reset should clear published VU1 busy");
+            t.IsFalse(reset.eventPending,
+                      "epoch reset should cancel the old scheduler token");
+            t.IsTrue(reset.generation > started.generation,
+                     "epoch reset should invalidate the old execution generation");
+            t.IsFalse(statistics.pendingSlice,
+                      "epoch reset should retain no pending checkpoint horizon");
+            t.Equals(statistics.slicesPublished, 0ull,
+                     "epoch reset must not publish private arithmetic");
+            t.Equals(statistics.hazardBarrierCount, 1ull,
+                     "epoch reset should cross one pending-epoch barrier");
+            t.Equals(
+                statistics.owner.executionEpoch.epochsSubmitted,
+                1ull,
+                "the reset fixture should submit one execution epoch");
+            t.Equals(
+                statistics.owner.executionEpoch.epochsCompleted,
+                1ull,
+                "the stopped epoch should retire before reset completes");
+            t.Equals(
+                statistics.owner.executionEpoch.checkpointsPublished,
+                0ull,
+                "reset must not publish an epoch checkpoint early");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            t.IsFalse(snapshot->state.active,
+                      "the stale epoch event must not reactivate VU1");
+            t.Equals(snapshot->state.vi[1], int32_t{0},
+                     "discarded epoch arithmetic must remain private");
+        });
+
+        tc.Run("runtime shutdown resolves a pending VU1 checkpoint epoch", [](TestCase &t)
+        {
+            auto advanceAttempts =
+                std::make_shared<std::atomic<uint64_t>>(0u);
+            const auto startedAt =
+                std::chrono::steady_clock::now();
+            {
+                PS2RuntimeConfiguration configuration =
+                    defaultPs2RuntimeConfiguration();
+                configuration.vu1ExecutionMode =
+                    Vu1ExecutionMode::ThreadedAsync;
+                configuration.vu1CheckpointEpochs = true;
+                configuration.vu1CheckpointCapacity = 2u;
+                configuration.vu1CommandQueueCapacity = 1u;
+                configuration.vu1CommandPayloadCapacityBytes =
+                    1024u * 1024u;
+                configuration.vu1BeforeProcess =
+                    [advanceAttempts](
+                        const Vu1Command &command, uint64_t)
+                    {
+                        if (command.type !=
+                            Vu1CommandType::AdvanceSlice)
+                        {
+                            return;
+                        }
+                        advanceAttempts->fetch_add(
+                            1u, std::memory_order_release);
+                        std::this_thread::sleep_for(20ms);
+                    };
+                PS2Runtime runtime(configuration);
+                t.IsTrue(runtime.memory().initialize(),
+                         "epoch-shutdown runtime memory should initialize");
+                t.IsTrue(runtime.syncCoreSubsystems(),
+                         "epoch-shutdown runtime subsystems should bind");
+                for (uint32_t pair = 0u; pair < 32u; ++pair)
+                {
+                    writeRuntimeVu1InstructionPair(
+                        runtime, pair * 8u, 0u,
+                        kVuUpperNop);
+                }
+                const uint32_t mscal =
+                    makeVifCommand(0x14u, 0u, 0u);
+                runtime.memory().processVIF1Data(
+                    reinterpret_cast<const uint8_t *>(&mscal),
+                    sizeof(mscal));
+                t.IsTrue(
+                    waitUntil(
+                        [&advanceAttempts]()
+                        {
+                            return advanceAttempts->load(
+                                       std::memory_order_acquire) != 0u;
+                        }),
+                    "destruction should begin with an owner-active epoch");
+            }
+            const auto elapsed =
+                std::chrono::steady_clock::now() - startedAt;
+            t.IsTrue(
+                elapsed < 2s,
+                "pending epoch shutdown should resolve without a lifecycle hang");
+            t.Equals(advanceAttempts->load(std::memory_order_acquire), 1ull,
+                     "shutdown should not submit a replacement epoch ticket");
         });
 
         tc.Run("runtime extends a speculative slice at a late EE service boundary", [](TestCase &t)

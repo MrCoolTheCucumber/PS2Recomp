@@ -2,8 +2,8 @@
 
 Status: Milestone 1 contract, audited against PS2Recomp revision
 `588d9a68d69b8a87a8cd755618502278a10b4ec3` on 2026-08-13 and reconciled
-with the implemented GS owner through the Milestone 5 ownership hardening on
-2026-08-14.
+with the implemented GS owner through Milestone 5 and the VU1 owner through
+Milestone 8 Phase B on 2026-08-15.
 
 This document is the source inventory and publication contract for moving GS
 and VU1 work off the EE executor. It describes current behavior first and the
@@ -572,6 +572,70 @@ resident requests already average 2,248 commands and reach the 6,144-command
 bound. Therefore the service topology is retained for M5. Sampled Vulkan CPU
 share alone would not have established this because the posting owner can be
 sleeping; reprofile fence and transfer behavior after integrated VU overlap.
+
+## Milestone 8 Phase B exact VU1 checkpoint epochs
+
+Threaded-asynchronous VU1 execution retains the 16-cycle startup event and
+128-cycle follow-up cadence. Phase B changes only the host-side work
+granularity: one bounded execution epoch consumes one ordered advance
+transport identity and lets the owner compute several future event results in
+one activation.
+
+```text
+EE start/resume result
+  -> schedule the unchanged first VU event
+  -> enqueue one execution epoch and return
+
+VU1 owner
+  -> capture the last EE-published processor baseline
+  -> execute the exact first-event cycle budget
+  -> append an owned result plus processor checkpoint
+  -> continue with exact 128-cycle checkpoints until inactive or bounded
+
+EE VU event
+  -> wait only if the exact front checkpoint is not ready
+  -> bind that checkpoint to the actual event tick/publication token
+  -> publish exactly one result, including diagnostics and PATH1 packets
+  -> schedule the next unchanged event if the published state is active
+```
+
+The journal capacity is fixed at construction (one through 64, four in the
+production runner). Each entry owns its `Vu1CommandResult` and a complete
+rollback checkpoint: VU architecture and pipeline state, VIF state, progress
+and verification state, code generation and sequence, and a copy of the 16
+KiB VU1 data memory. VU1 micro memory cannot change inside an epoch; any
+ordered micro-memory mutation stops the epoch before it executes. No entry is
+guest-visible until EE consumes it at its corresponding scheduler event.
+
+The exact cycle demand for a late event is an identity-scoped, coalescing
+revision on the existing epoch. If the journal front was predicted for a
+different budget, the owner restores the last published baseline, discards
+only the unpublished suffix, and regenerates the front with the exact demand.
+This does not allocate another transport ticket or wait on a per-command
+future. The following checkpoints resume the unchanged 128-cycle cadence.
+
+Any later ordered VU command requests epoch stop while holding the serialized
+producer admission lock. The owner first absorbs every consumed checkpoint
+into the published baseline, rolls back all remaining private suffix work,
+and only then advances to the later FIFO command. Resultless VIF-state,
+decoded UNPACK, and permitted memory-write commands can therefore be admitted
+behind a stopped epoch without their own completion future. Observations,
+mode-2 UNPACK feedback, reset/restore, cache or backend changes, and shutdown
+remain response or lifecycle barriers. Reset also invalidates the scheduler
+generation, so an old event cannot publish discarded work.
+
+An inactive published checkpoint terminates its epoch after preserving that
+published prefix. Cancellation and fatal owner failure mark the epoch stopped
+and wake every checkpoint waiter. The production runner enables epochs for
+`threaded-async`; `--vu1-checkpoint-epochs off` retains the Phase A one-slice
+path for differential testing and debugger fallback. Inline and
+threaded-synchronous execution are unaffected.
+
+`system.status.vu1_async.owner.execution_epoch` exposes submitted/completed
+epochs, checkpoints produced/published, discarded suffix entries, demand
+rebases, checkpoint wait count/time, and maximum journal depth. These counters
+are observational. They never alter guest time, scheduler priority, VU busy
+publication, VIF wakeup, or XGKICK order.
 
 ## Audit maintenance
 

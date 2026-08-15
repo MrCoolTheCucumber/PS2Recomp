@@ -603,6 +603,8 @@ public:
     void resetVuWorkloadProfileEpoch() override;
 
 private:
+    friend class ThreadedVu1Executor;
+
     struct SpeculativeSliceCheckpoint
     {
         VuExecutionState state{};
@@ -614,14 +616,27 @@ private:
         uint64_t generation = 0u;
         uint64_t nextSequence = 0u;
         uint64_t codeGeneration = 0u;
+        std::vector<uint8_t> dataMemory;
         bool workloadProfileInvocationPending = false;
         bool workloadProfileInvocationActive = false;
     };
 
     void assertOwnerThread() const;
+    [[nodiscard]] SpeculativeSliceCheckpoint
+    captureProcessorCheckpoint();
+    void restoreProcessorCheckpoint(
+        const SpeculativeSliceCheckpoint &checkpoint);
     void captureSpeculativeSliceCheckpoint();
     void rollbackSpeculativeSlice();
     void commitSpeculativeSlice();
+    [[nodiscard]] Vu1CommandResult processAdvanceSliceImpl(
+        Vu1WorkIdentity identity,
+        const Vu1AdvanceSliceCommand &command,
+        bool speculative,
+        bool epochContinuation);
+    [[nodiscard]] Vu1CommandResult processEpochContinuation(
+        Vu1WorkIdentity identity,
+        const Vu1AdvanceSliceCommand &command);
     [[nodiscard]] bool validMemoryRange(
         uint32_t offset, size_t size,
         uint32_t memorySize, bool wrap) const noexcept;
@@ -659,7 +674,6 @@ private:
     bool m_shutdown = false;
     std::optional<SpeculativeSliceCheckpoint>
         m_speculativeSliceCheckpoint;
-    std::vector<uint8_t> m_speculativeDataMemory;
     std::atomic<uint64_t> m_speculativeSlicesCaptured{0u};
     std::atomic<uint64_t> m_speculativeCheckpointBytesCopied{0u};
     std::atomic<uint64_t> m_speculativeCheckpointCaptureNanoseconds{0u};
@@ -772,6 +786,74 @@ struct ThreadedVu1ExecutorOptions
     std::function<void(const Vu1CommandResult &, uint64_t)> beforePublish;
 };
 
+struct Vu1ExecutionEpochOptions
+{
+    uint32_t initialCycles = 0u;
+    uint32_t followupCycles = 128u;
+    size_t checkpointCapacity = 4u;
+    bool captureState = false;
+};
+
+struct Vu1ExecutionEpochStatistics
+{
+    uint64_t epochsSubmitted = 0u;
+    uint64_t epochsCompleted = 0u;
+    uint64_t checkpointsProduced = 0u;
+    uint64_t checkpointsPublished = 0u;
+    uint64_t suffixCheckpointsDiscarded = 0u;
+    uint64_t demandRebases = 0u;
+    uint64_t checkpointWaitCount = 0u;
+    uint64_t checkpointWaitNanoseconds = 0u;
+    size_t maximumJournalDepth = 0u;
+};
+
+struct Vu1ExecutionEpochState;
+
+// One bounded owner activation may compute several exact event checkpoints.
+// The handle carries no per-checkpoint future; EE publishes one result at a
+// time through the executor while ordered commands stop and roll back only
+// the still-unpublished suffix.
+class Vu1ExecutionEpoch
+{
+public:
+    Vu1ExecutionEpoch() = default;
+    Vu1ExecutionEpoch(Vu1ExecutionEpoch &&) noexcept = default;
+    Vu1ExecutionEpoch &operator=(Vu1ExecutionEpoch &&) noexcept = default;
+
+    Vu1ExecutionEpoch(const Vu1ExecutionEpoch &) = delete;
+    Vu1ExecutionEpoch &operator=(const Vu1ExecutionEpoch &) = delete;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return static_cast<bool>(m_state);
+    }
+    [[nodiscard]] uint64_t ticket() const noexcept
+    {
+        return m_ticket;
+    }
+    [[nodiscard]] Vu1WorkIdentity identity() const noexcept
+    {
+        return m_identity;
+    }
+
+private:
+    friend class ThreadedVu1Executor;
+
+    Vu1ExecutionEpoch(
+        uint64_t ticket,
+        Vu1WorkIdentity identity,
+        std::shared_ptr<Vu1ExecutionEpochState> state)
+        : m_ticket(ticket),
+          m_identity(identity),
+          m_state(std::move(state))
+    {
+    }
+
+    uint64_t m_ticket = 0u;
+    Vu1WorkIdentity m_identity{};
+    std::shared_ptr<Vu1ExecutionEpochState> m_state;
+};
+
 struct ThreadedVu1CommandTypeStatistics
 {
     uint64_t submitted = 0u;
@@ -813,6 +895,7 @@ struct ThreadedVu1ExecutorStatistics
                kVu1CommandTypeCount>
         commandTypes{};
     Vu1SpeculationStatistics speculation{};
+    Vu1ExecutionEpochStatistics executionEpoch{};
     bool started = false;
     bool running = false;
     bool accepting = false;
@@ -896,6 +979,23 @@ public:
         Vu1CommandPayload payload,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u);
+    [[nodiscard]] Vu1ExecutionEpoch submitExecutionEpoch(
+        Vu1ExecutionEpochOptions options,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+    [[nodiscard]] size_t executionEpochReadyCheckpointCount(
+        const Vu1ExecutionEpoch &epoch) const;
+    [[nodiscard]] bool executionEpochCheckpointReady(
+        const Vu1ExecutionEpoch &epoch,
+        uint32_t exactCycles) const;
+    [[nodiscard]] Vu1CommandResult
+    waitExecutionEpochCheckpoint(
+        Vu1ExecutionEpoch &epoch,
+        uint32_t exactCycles,
+        uint64_t guestTick,
+        uint64_t publicationToken);
+    void stopExecutionEpoch(
+        Vu1ExecutionEpoch &epoch) noexcept;
     [[nodiscard]] Vu1CommandSubmission submitSpeculativeAdvance(
         Vu1AdvanceSliceCommand command,
         Vu1SpeculationResolution previousResolution,
@@ -956,6 +1056,7 @@ private:
         bool beginsSpeculativeSlice = false;
         bool commitsExtendedSpeculativeAdvance = false;
         uint32_t speculativeExtensionCycles = 0u;
+        std::shared_ptr<Vu1ExecutionEpochState> executionEpoch;
         std::optional<std::promise<Vu1CommandResult>> completion;
     };
 
@@ -978,6 +1079,11 @@ private:
         bool retainCompletion,
         uint64_t guestTick,
         uint64_t publicationToken);
+    void requestActiveExecutionEpochStopLocked() noexcept;
+    void runExecutionEpoch(WorkItem &item);
+    void failExecutionEpoch(
+        const std::shared_ptr<Vu1ExecutionEpochState> &state,
+        const std::exception_ptr &failure) noexcept;
     void ensureStarted();
     [[nodiscard]] AdmissionResult tryEnqueue(WorkItem &item);
     [[noreturn]] void throwSubmissionUnavailable() const;
@@ -1004,6 +1110,8 @@ private:
     uint64_t m_lastGuestTick = 0u;
     std::optional<ProducerSpeculationCheckpoint>
         m_producerSpeculationCheckpoint;
+    std::shared_ptr<Vu1ExecutionEpochState>
+        m_activeExecutionEpoch;
 
     mutable std::mutex m_stateMutex;
     std::thread m_worker;
@@ -1045,6 +1153,17 @@ private:
         m_submittedDecodedUnpackOperations{0u};
     std::atomic<uint64_t>
         m_executedDecodedUnpackOperations{0u};
+    std::atomic<uint64_t> m_executionEpochsSubmitted{0u};
+    std::atomic<uint64_t> m_executionEpochsCompleted{0u};
+    std::atomic<uint64_t> m_epochCheckpointsProduced{0u};
+    std::atomic<uint64_t> m_epochCheckpointsPublished{0u};
+    std::atomic<uint64_t>
+        m_epochSuffixCheckpointsDiscarded{0u};
+    std::atomic<uint64_t> m_epochDemandRebases{0u};
+    std::atomic<uint64_t> m_epochCheckpointWaitCount{0u};
+    std::atomic<uint64_t>
+        m_epochCheckpointWaitNanoseconds{0u};
+    std::atomic<size_t> m_epochMaximumJournalDepth{0u};
     std::array<std::atomic<uint64_t>, kVu1CommandTypeCount>
         m_submittedCommandsByType{};
     std::array<std::atomic<uint64_t>, kVu1CommandTypeCount>

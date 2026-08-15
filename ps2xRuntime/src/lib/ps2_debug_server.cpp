@@ -1480,6 +1480,42 @@ struct PS2DebugServer::Impl
             speculation.rollbackNanoseconds, allocator);
         vu1OwnerValue.AddMember(
             "speculation", speculationValue, allocator);
+        const Vu1ExecutionEpochStatistics &executionEpoch =
+            vu1OwnerStats.executionEpoch;
+        Value executionEpochValue(rapidjson::kObjectType);
+        executionEpochValue.AddMember(
+            "epochs_submitted",
+            executionEpoch.epochsSubmitted, allocator);
+        executionEpochValue.AddMember(
+            "epochs_completed",
+            executionEpoch.epochsCompleted, allocator);
+        executionEpochValue.AddMember(
+            "checkpoints_produced",
+            executionEpoch.checkpointsProduced, allocator);
+        executionEpochValue.AddMember(
+            "checkpoints_published",
+            executionEpoch.checkpointsPublished, allocator);
+        executionEpochValue.AddMember(
+            "suffix_checkpoints_discarded",
+            executionEpoch.suffixCheckpointsDiscarded,
+            allocator);
+        executionEpochValue.AddMember(
+            "demand_rebases",
+            executionEpoch.demandRebases, allocator);
+        executionEpochValue.AddMember(
+            "checkpoint_wait_count",
+            executionEpoch.checkpointWaitCount, allocator);
+        executionEpochValue.AddMember(
+            "checkpoint_wait_ns",
+            executionEpoch.checkpointWaitNanoseconds,
+            allocator);
+        executionEpochValue.AddMember(
+            "maximum_journal_depth",
+            static_cast<uint64_t>(
+                executionEpoch.maximumJournalDepth),
+            allocator);
+        vu1OwnerValue.AddMember(
+            "execution_epoch", executionEpochValue, allocator);
         vu1AsyncValue.AddMember(
             "owner", vu1OwnerValue, allocator);
         result.AddMember(

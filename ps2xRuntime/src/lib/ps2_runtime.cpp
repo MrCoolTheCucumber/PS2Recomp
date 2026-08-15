@@ -1454,6 +1454,19 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     }
 
     m_vu1ExecutionMode = configuration.vu1ExecutionMode;
+    m_vu1CheckpointEpochs =
+        configuration.vu1CheckpointEpochs &&
+        m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedAsync;
+    m_vu1CheckpointCapacity =
+        configuration.vu1CheckpointCapacity;
+    if (m_vu1CheckpointEpochs &&
+        (m_vu1CheckpointCapacity == 0u ||
+         m_vu1CheckpointCapacity > 64u))
+    {
+        throw std::invalid_argument(
+            "VU1 checkpoint capacity must be between one and 64");
+    }
 
     m_memory.installPostBiosTlbState();
     m_hostPresentationUploadState =
@@ -6363,8 +6376,9 @@ PS2Runtime::beginVu1SynchronousCommandBarrier()
 {
     Vu1SynchronousCommandBarrier barrier{};
     if (m_vu1SynchronousCommandBatchActive &&
-        m_batchedVu1SynchronousCommandBarrier.resolution !=
-            Vu1SpeculationResolution::None)
+        (m_batchedVu1SynchronousCommandBarrier.resolution !=
+             Vu1SpeculationResolution::None ||
+         m_batchedVu1SynchronousCommandBarrier.requeue))
     {
         return barrier;
     }
@@ -6372,8 +6386,9 @@ PS2Runtime::beginVu1SynchronousCommandBarrier()
         [this](Vu1SynchronousCommandBarrier prepared)
         {
             if (!m_vu1SynchronousCommandBatchActive ||
-                prepared.resolution ==
-                    Vu1SpeculationResolution::None)
+                (prepared.resolution ==
+                     Vu1SpeculationResolution::None &&
+                 !prepared.requeue))
             {
                 return prepared;
             }
@@ -6392,6 +6407,23 @@ PS2Runtime::beginVu1SynchronousCommandBarrier()
             Vu1ExecutionMode::ThreadedAsync ||
         !m_threadedVu1Executor)
     {
+        return prepareForBatch(std::move(barrier));
+    }
+
+    if (m_vu1CheckpointEpochs)
+    {
+        if (!m_pendingVu1ExecutionEpoch)
+            return prepareForBatch(std::move(barrier));
+        Vu1PendingExecutionEpoch pending =
+            std::move(*m_pendingVu1ExecutionEpoch);
+        m_pendingVu1ExecutionEpoch.reset();
+        m_vu1AsyncPendingSlice.store(
+            false, std::memory_order_release);
+        m_threadedVu1Executor->stopExecutionEpoch(
+            pending.epoch);
+        barrier.requeue = pending.plan;
+        m_vu1AsyncHazardBarrierCount.fetch_add(
+            1u, std::memory_order_relaxed);
         return prepareForBatch(std::move(barrier));
     }
 
@@ -6684,7 +6716,9 @@ void PS2Runtime::requeueOrDeferVu1SpeculativeSlice(
     {
         return;
     }
-    if (m_pendingVu1Slice || m_deferredVu1SlicePlan)
+    if (m_pendingVu1Slice ||
+        m_pendingVu1ExecutionEpoch ||
+        m_deferredVu1SlicePlan)
     {
         throw std::logic_error(
             "VU1 hazard requeue conflicts with retained speculative work");
@@ -6732,6 +6766,7 @@ void PS2Runtime::armDeferredVu1SpeculativeSlice(
         return;
     }
     if (m_pendingVu1Slice ||
+        m_pendingVu1ExecutionEpoch ||
         m_vu1SpeculationPublicationState !=
             Vu1SpeculationPublicationState::None)
     {
@@ -6775,6 +6810,7 @@ void PS2Runtime::enqueueVu1SpeculativeSlice(
         clearDeferredVu1SpeculativeSlice();
     }
     if (m_pendingVu1Slice ||
+        m_pendingVu1ExecutionEpoch ||
         plan.cycleBudget == 0u ||
         plan.eventGeneration == 0u ||
         plan.executionGeneration !=
@@ -6798,8 +6834,9 @@ void PS2Runtime::enqueueVu1SpeculativeSlice(
 
     const bool startsNewBatchSpeculationEpoch =
         m_vu1SynchronousCommandBatchActive &&
-        m_batchedVu1SynchronousCommandBarrier.resolution !=
-            Vu1SpeculationResolution::None;
+        (m_batchedVu1SynchronousCommandBarrier.resolution !=
+             Vu1SpeculationResolution::None ||
+         m_batchedVu1SynchronousCommandBarrier.requeue);
     if (startsNewBatchSpeculationEpoch &&
         m_batchedVu1SynchronousCommandBarrier.requeue)
     {
@@ -6820,21 +6857,51 @@ void PS2Runtime::enqueueVu1SpeculativeSlice(
     const auto submitAt = std::chrono::steady_clock::now();
     try
     {
-        Vu1CommandSubmission submission =
-            m_threadedVu1Executor->submitSpeculativeAdvance(
-                Vu1AdvanceSliceCommand{
-                    .maximumCycles = plan.cycleBudget,
-                },
-                previousResolution,
-                plan.deadline.raw(),
-                plan.eventGeneration);
-        m_pendingVu1Slice.emplace(
-            Vu1PendingSlice{
-                .submission = std::move(submission),
-                .plan = plan,
-            });
-        m_vu1SpeculationPublicationState =
-            Vu1SpeculationPublicationState::Unpublished;
+        if (m_vu1CheckpointEpochs)
+        {
+            if (previousResolution !=
+                Vu1SpeculationResolution::None)
+            {
+                throw std::logic_error(
+                    "checkpoint epochs do not use slice resolutions");
+            }
+            Vu1ExecutionEpoch epoch =
+                m_threadedVu1Executor->submitExecutionEpoch(
+                    Vu1ExecutionEpochOptions{
+                        .initialCycles = plan.cycleBudget,
+                        .followupCycles =
+                            kVu1FollowupEventCycles,
+                        .checkpointCapacity =
+                            m_vu1CheckpointCapacity,
+                    },
+                    plan.deadline.raw(),
+                    plan.eventGeneration);
+            m_pendingVu1ExecutionEpoch.emplace(
+                Vu1PendingExecutionEpoch{
+                    .epoch = std::move(epoch),
+                    .plan = plan,
+                });
+            m_vu1SpeculationPublicationState =
+                Vu1SpeculationPublicationState::None;
+        }
+        else
+        {
+            Vu1CommandSubmission submission =
+                m_threadedVu1Executor->submitSpeculativeAdvance(
+                    Vu1AdvanceSliceCommand{
+                        .maximumCycles = plan.cycleBudget,
+                    },
+                    previousResolution,
+                    plan.deadline.raw(),
+                    plan.eventGeneration);
+            m_pendingVu1Slice.emplace(
+                Vu1PendingSlice{
+                    .submission = std::move(submission),
+                    .plan = plan,
+                });
+            m_vu1SpeculationPublicationState =
+                Vu1SpeculationPublicationState::Unpublished;
+        }
         m_vu1AsyncPendingSlice.store(
             true, std::memory_order_release);
         if (startsNewBatchSpeculationEpoch)
@@ -7125,9 +7192,98 @@ PS2Runtime::consumeVu1SpeculativeSliceAtEvent(
     return result;
 }
 
+Vu1CommandResult
+PS2Runtime::consumeVu1ExecutionEpochAtEvent(
+    const ps2x::timing::EeEventService &service,
+    uint32_t cycleBudget)
+{
+    if (!m_vu1CheckpointEpochs ||
+        !m_pendingVu1ExecutionEpoch ||
+        !m_threadedVu1Executor)
+    {
+        throw std::logic_error(
+            "VU1 event has no checkpoint epoch");
+    }
+    const Vu1PendingSlicePlan &plan =
+        m_pendingVu1ExecutionEpoch->plan;
+    if (plan.eventGeneration != service.generation ||
+        plan.executionGeneration !=
+            m_vu1ExecutionTiming.generation ||
+        plan.deadline != service.scheduledTick)
+    {
+        throw std::logic_error(
+            "VU1 checkpoint epoch does not match its event");
+    }
+
+    const bool ready =
+        m_threadedVu1Executor
+            ->executionEpochCheckpointReady(
+                m_pendingVu1ExecutionEpoch->epoch,
+                cycleBudget);
+    const auto waitAt = std::chrono::steady_clock::now();
+    Vu1CommandResult result =
+        m_threadedVu1Executor
+            ->waitExecutionEpochCheckpoint(
+                m_pendingVu1ExecutionEpoch->epoch,
+                cycleBudget,
+                service.serviceTick.raw(),
+                service.generation);
+    const Vu1WorkIdentity epochIdentity =
+        m_pendingVu1ExecutionEpoch->epoch.identity();
+    if (result.identity.sequence != epochIdentity.sequence ||
+        result.identity.generation != epochIdentity.generation ||
+        result.identity.publicationToken !=
+            service.generation ||
+        result.identity.guestTick !=
+            service.serviceTick.raw() ||
+        result.digest.type !=
+            Vu1CommandType::AdvanceSlice ||
+        !std::holds_alternative<Vu1SliceResult>(
+            result.payload))
+    {
+        throw std::logic_error(
+            "VU1 checkpoint epoch returned an invalid result");
+    }
+
+    const uint64_t waitNanoseconds =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - waitAt)
+                .count());
+    m_vu1AsyncEventWaitCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_vu1AsyncEventWaitNanoseconds.fetch_add(
+        waitNanoseconds, std::memory_order_relaxed);
+    updateAtomicMaximum(
+        m_vu1AsyncMaximumEventWaitNanoseconds,
+        waitNanoseconds);
+    if (ready)
+    {
+        m_vu1AsyncResultsReadyAtEvent.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    else
+    {
+        m_vu1AsyncResultsLateAtEvent.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    return result;
+}
+
 void PS2Runtime::resolveVu1SpeculationForShutdown() noexcept
 {
     clearDeferredVu1SpeculativeSlice();
+    if (m_vu1CheckpointEpochs &&
+        m_pendingVu1ExecutionEpoch &&
+        m_threadedVu1Executor)
+    {
+        m_threadedVu1Executor->stopExecutionEpoch(
+            m_pendingVu1ExecutionEpoch->epoch);
+        m_pendingVu1ExecutionEpoch.reset();
+        m_vu1AsyncPendingSlice.store(
+            false, std::memory_order_release);
+        return;
+    }
     if (m_vu1ExecutionMode !=
             Vu1ExecutionMode::ThreadedAsync ||
         !m_threadedVu1Executor ||
@@ -7164,6 +7320,17 @@ void PS2Runtime::resolveVu1SpeculationForShutdown() noexcept
 void PS2Runtime::cancelVU1Execution(bool resetInterpreter)
 {
     clearDeferredVu1SpeculativeSlice();
+    if (m_pendingVu1ExecutionEpoch &&
+        m_threadedVu1Executor)
+    {
+        m_threadedVu1Executor->stopExecutionEpoch(
+            m_pendingVu1ExecutionEpoch->epoch);
+        m_pendingVu1ExecutionEpoch.reset();
+        m_vu1AsyncPendingSlice.store(
+            false, std::memory_order_release);
+        m_vu1AsyncHazardBarrierCount.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
     if (m_vu1ExecutionTiming.eventToken.generation != 0u)
     {
         (void)m_eeEventScheduler.cancel(
@@ -7885,8 +8052,9 @@ void PS2Runtime::serviceVU1AtEvent(
     {
         if (m_vu1ExecutionMode ==
                 Vu1ExecutionMode::ThreadedAsync &&
-            m_vu1SpeculationPublicationState !=
-                Vu1SpeculationPublicationState::None)
+            (m_vu1SpeculationPublicationState !=
+                 Vu1SpeculationPublicationState::None ||
+             m_pendingVu1ExecutionEpoch))
         {
             throw std::logic_error(
                 "active VU1 speculation has no published busy state");
@@ -7930,14 +8098,28 @@ void PS2Runtime::serviceVU1AtEvent(
     if (m_vu1ExecutionMode ==
         Vu1ExecutionMode::ThreadedAsync)
     {
-        if (!m_pendingVu1Slice)
+        if (m_vu1CheckpointEpochs)
         {
-            throw std::logic_error(
-                "VU1 event has no pending speculative slice");
+            if (!m_pendingVu1ExecutionEpoch)
+            {
+                throw std::logic_error(
+                    "VU1 event has no pending checkpoint epoch");
+            }
+            commandResult =
+                consumeVu1ExecutionEpochAtEvent(
+                    service, cycleBudget);
         }
-        commandResult =
-            consumeVu1SpeculativeSliceAtEvent(
-                service, cycleBudget);
+        else
+        {
+            if (!m_pendingVu1Slice)
+            {
+                throw std::logic_error(
+                    "VU1 event has no pending speculative slice");
+            }
+            commandResult =
+                consumeVu1SpeculativeSliceAtEvent(
+                    service, cycleBudget);
+        }
         publishVu1CommandResult(commandResult);
         m_vu1AsyncSlicesPublished.fetch_add(
             1u, std::memory_order_relaxed);
@@ -7980,9 +8162,6 @@ void PS2Runtime::serviceVU1AtEvent(
         if (m_vu1ExecutionMode ==
             Vu1ExecutionMode::ThreadedAsync)
         {
-            refreshVu1DiagnosticsConfiguration(
-                deadline.raw(),
-                m_vu1ExecutionTiming.eventToken.generation);
             const uint64_t nextElapsedCycles =
                 ps2x::timing::eeTicksToVuCyclesFloor(
                     ps2x::timing::elapsedEeTicks(
@@ -7993,23 +8172,67 @@ void PS2Runtime::serviceVU1AtEvent(
                     std::min<uint64_t>(
                         nextElapsedCycles,
                         kVu1MaximumAdvanceCycles));
-            enqueueVu1SpeculativeSlice(
-                Vu1PendingSlicePlan{
+            const Vu1PendingSlicePlan nextPlan{
                     .cycleBudget = nextCycleBudget,
                     .deadline = deadline,
                     .eventGeneration =
                         m_vu1ExecutionTiming.eventToken.generation,
                     .executionGeneration =
                         m_vu1ExecutionTiming.generation,
-                },
-                m_vu1SpeculationPublicationState ==
-                        Vu1SpeculationPublicationState::Published
-                    ? Vu1SpeculationResolution::Commit
-                    : Vu1SpeculationResolution::None);
+                };
+            if (m_vu1CheckpointEpochs)
+            {
+                if (!m_pendingVu1ExecutionEpoch)
+                {
+                    throw std::logic_error(
+                        "active VU1 epoch lost its checkpoint horizon");
+                }
+                const auto submitAt =
+                    std::chrono::steady_clock::now();
+                m_pendingVu1ExecutionEpoch->plan = nextPlan;
+                refreshVu1DiagnosticsConfiguration(
+                    deadline.raw(),
+                    m_vu1ExecutionTiming.eventToken.generation);
+                const uint64_t submitNanoseconds =
+                    static_cast<uint64_t>(
+                        std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() -
+                            submitAt)
+                            .count());
+                m_vu1AsyncSlicesSubmitted.fetch_add(
+                    1u, std::memory_order_relaxed);
+                m_vu1AsyncSliceSubmitCount.fetch_add(
+                    1u, std::memory_order_relaxed);
+                m_vu1AsyncSliceSubmitNanoseconds.fetch_add(
+                    submitNanoseconds,
+                    std::memory_order_relaxed);
+                updateAtomicMaximum(
+                    m_vu1AsyncMaximumSliceSubmitNanoseconds,
+                    submitNanoseconds);
+            }
+            else
+            {
+                refreshVu1DiagnosticsConfiguration(
+                    deadline.raw(),
+                    m_vu1ExecutionTiming.eventToken.generation);
+                enqueueVu1SpeculativeSlice(
+                    nextPlan,
+                    m_vu1SpeculationPublicationState ==
+                            Vu1SpeculationPublicationState::Published
+                        ? Vu1SpeculationResolution::Commit
+                        : Vu1SpeculationResolution::None);
+            }
         }
         return;
     }
 
+    if (m_pendingVu1ExecutionEpoch)
+    {
+        m_pendingVu1ExecutionEpoch.reset();
+        m_vu1AsyncPendingSlice.store(
+            false, std::memory_order_release);
+    }
     m_vu1ExecutionTiming.lastAdvancedTick =
         service.serviceTick;
     setVU1BusyFlag(ctx, false);

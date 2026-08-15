@@ -158,6 +158,19 @@ namespace
         return true;
     }
 
+    bool parseOnOff(
+        const std::string &text,
+        bool &enabled)
+    {
+        if (text == "on")
+            enabled = true;
+        else if (text == "off")
+            enabled = false;
+        else
+            return false;
+        return true;
+    }
+
     void printUsage(const char *program)
     {
         std::cout
@@ -165,6 +178,7 @@ namespace
             << " [--renderer software|hybrid|verify|gpu-strict]"
                " [--gs-execution inline|threaded-sync|threaded-async]"
                " [--vu1-execution inline|threaded-sync|threaded-async]"
+               " [--vu1-checkpoint-epochs on|off]"
                " [ELF [CD_IMAGE]]\n";
     }
 
@@ -174,6 +188,7 @@ namespace
         GsRendererMode rendererMode = GsRendererMode::Software;
         GsExecutionMode gsExecutionMode = GsExecutionMode::Inline;
         Vu1ExecutionMode vu1ExecutionMode = Vu1ExecutionMode::Inline;
+        bool vu1CheckpointEpochs = true;
         std::vector<std::filesystem::path> positionalPaths;
     };
 
@@ -223,6 +238,19 @@ namespace
                 {
                     throw std::invalid_argument(
                         "--vu1-execution requires inline, threaded-sync, or threaded-async");
+                }
+                continue;
+            }
+            if (!optionsEnded &&
+                argument == "--vu1-checkpoint-epochs")
+            {
+                if (++i >= argc || !argv[i] ||
+                    !parseOnOff(
+                        argv[i],
+                        options.vu1CheckpointEpochs))
+                {
+                    throw std::invalid_argument(
+                        "--vu1-checkpoint-epochs requires on or off");
                 }
                 continue;
             }
@@ -322,6 +350,8 @@ int main(int argc, char *argv[])
             options.gsExecutionMode;
         runtimeConfiguration.vu1ExecutionMode =
             options.vu1ExecutionMode;
+        runtimeConfiguration.vu1CheckpointEpochs =
+            options.vu1CheckpointEpochs;
         PS2Runtime runtime(runtimeConfiguration);
         configureOptionalCdImage(runtime, options);
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)

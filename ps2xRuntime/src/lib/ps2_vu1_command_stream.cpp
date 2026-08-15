@@ -5,12 +5,44 @@
 
 #include <algorithm>
 #include <bit>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <immintrin.h>
 #include <limits>
 #include <smmintrin.h>
 #include <stdexcept>
 #include <type_traits>
+
+struct Vu1ExecutionEpochState
+{
+    struct Checkpoint
+    {
+        uint64_t revision = 0u;
+        uint32_t cycles = 0u;
+        bool active = false;
+        bool consumed = false;
+        Vu1CommandResult result{};
+    };
+
+    explicit Vu1ExecutionEpochState(
+        Vu1ExecutionEpochOptions epochOptions)
+        : options(epochOptions),
+          demandedCycles(epochOptions.initialCycles)
+    {
+    }
+
+    mutable std::mutex mutex;
+    std::condition_variable changed;
+    Vu1ExecutionEpochOptions options{};
+    std::deque<std::shared_ptr<Checkpoint>> journal;
+    std::exception_ptr failure;
+    uint64_t demandRevision = 0u;
+    uint32_t demandedCycles = 0u;
+    bool stopRequested = false;
+    bool workerStarted = false;
+    bool stopped = false;
+};
 
 namespace
 {
@@ -1381,14 +1413,10 @@ void Vu1CommandProcessor::bindInlineDiagnosticsObserver(
     m_diagnosticsObserver = diagnosticsObserver;
 }
 
-void Vu1CommandProcessor::captureSpeculativeSliceCheckpoint()
+Vu1CommandProcessor::SpeculativeSliceCheckpoint
+Vu1CommandProcessor::captureProcessorCheckpoint()
 {
     assertOwnerThread();
-    if (m_speculativeSliceCheckpoint)
-    {
-        throw std::logic_error(
-            "VU1 already has an unresolved speculative slice");
-    }
     if (!m_dataMemory || m_dataMemorySize == 0u)
     {
         throw std::logic_error(
@@ -1407,17 +1435,15 @@ void Vu1CommandProcessor::captureSpeculativeSliceCheckpoint()
         .generation = m_generation,
         .nextSequence = m_nextSequence,
         .codeGeneration = codeGeneration(),
+        .dataMemory = std::vector<uint8_t>(m_dataMemorySize),
         .workloadProfileInvocationPending =
             m_unit.m_workloadProfileInvocationPending,
         .workloadProfileInvocationActive =
             m_unit.m_workloadProfileInvocationActive,
     };
-    m_speculativeDataMemory.resize(m_dataMemorySize);
     std::memcpy(
-        m_speculativeDataMemory.data(),
+        checkpoint.dataMemory.data(),
         m_dataMemory, m_dataMemorySize);
-    m_speculativeSliceCheckpoint.emplace(
-        std::move(checkpoint));
 
     const uint64_t captureNanoseconds =
         static_cast<uint64_t>(
@@ -1430,21 +1456,22 @@ void Vu1CommandProcessor::captureSpeculativeSliceCheckpoint()
         m_dataMemorySize, std::memory_order_relaxed);
     m_speculativeCheckpointCaptureNanoseconds.fetch_add(
         captureNanoseconds, std::memory_order_relaxed);
+    return checkpoint;
 }
 
-void Vu1CommandProcessor::rollbackSpeculativeSlice()
+void Vu1CommandProcessor::restoreProcessorCheckpoint(
+    const SpeculativeSliceCheckpoint &checkpoint)
 {
     assertOwnerThread();
-    if (!m_speculativeSliceCheckpoint)
+    if (!m_dataMemory ||
+        checkpoint.dataMemory.size() != m_dataMemorySize)
     {
         throw std::logic_error(
-            "VU1 has no speculative slice to roll back");
+            "invalid VU1 processor checkpoint");
     }
 
     const auto rollbackAt = std::chrono::steady_clock::now();
-    SpeculativeSliceCheckpoint checkpoint =
-        std::move(*m_speculativeSliceCheckpoint);
-    m_unit.m_state = std::move(checkpoint.state);
+    m_unit.m_state = checkpoint.state;
     m_vifState = checkpoint.vif;
     m_unit.m_progressActive.store(
         checkpoint.progress.active ? 1u : 0u,
@@ -1459,7 +1486,7 @@ void Vu1CommandProcessor::rollbackSpeculativeSlice()
         checkpoint.progress.pc,
         std::memory_order_relaxed);
     m_unit.m_lastExitReason = checkpoint.lastExitReason;
-    m_unit.m_verifyDiagnostics = std::move(checkpoint.verify);
+    m_unit.m_verifyDiagnostics = checkpoint.verify;
     m_unit.m_workloadProfileObserver =
         checkpoint.workloadProfileObserver;
     m_unit.m_workloadProfileInvocationPending =
@@ -1473,10 +1500,9 @@ void Vu1CommandProcessor::rollbackSpeculativeSlice()
         std::memory_order_relaxed);
     std::memcpy(
         m_dataMemory,
-        m_speculativeDataMemory.data(),
+        checkpoint.dataMemory.data(),
         m_dataMemorySize);
     m_pendingDiagnostics.clear();
-    m_speculativeSliceCheckpoint.reset();
 
     const uint64_t rollbackNanoseconds =
         static_cast<uint64_t>(
@@ -1487,6 +1513,33 @@ void Vu1CommandProcessor::rollbackSpeculativeSlice()
         1u, std::memory_order_relaxed);
     m_speculativeRollbackNanoseconds.fetch_add(
         rollbackNanoseconds, std::memory_order_relaxed);
+}
+
+void Vu1CommandProcessor::captureSpeculativeSliceCheckpoint()
+{
+    assertOwnerThread();
+    if (m_speculativeSliceCheckpoint)
+    {
+        throw std::logic_error(
+            "VU1 already has an unresolved speculative slice");
+    }
+    m_speculativeSliceCheckpoint.emplace(
+        captureProcessorCheckpoint());
+}
+
+void Vu1CommandProcessor::rollbackSpeculativeSlice()
+{
+    assertOwnerThread();
+    if (!m_speculativeSliceCheckpoint)
+    {
+        throw std::logic_error(
+            "VU1 has no speculative slice to roll back");
+    }
+
+    SpeculativeSliceCheckpoint checkpoint =
+        std::move(*m_speculativeSliceCheckpoint);
+    m_speculativeSliceCheckpoint.reset();
+    restoreProcessorCheckpoint(checkpoint);
 }
 
 void Vu1CommandProcessor::commitSpeculativeSlice()
@@ -2310,6 +2363,24 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
     const Vu1AdvanceSliceCommand &command,
     bool speculative)
 {
+    return processAdvanceSliceImpl(
+        identity, command, speculative, false);
+}
+
+Vu1CommandResult Vu1CommandProcessor::processEpochContinuation(
+    Vu1WorkIdentity identity,
+    const Vu1AdvanceSliceCommand &command)
+{
+    return processAdvanceSliceImpl(
+        identity, command, false, true);
+}
+
+Vu1CommandResult Vu1CommandProcessor::processAdvanceSliceImpl(
+    Vu1WorkIdentity identity,
+    const Vu1AdvanceSliceCommand &command,
+    bool speculative,
+    bool epochContinuation)
+{
     assertOwnerThread();
     if (!m_pendingDiagnostics.empty())
     {
@@ -2356,7 +2427,12 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
         result.disposition = Vu1CommandDisposition::FutureGeneration;
         return result;
     }
-    if (identity.sequence != m_nextSequence)
+    const bool validSequence = epochContinuation
+        ? identity.sequence !=
+                  std::numeric_limits<uint64_t>::max() &&
+              m_nextSequence == identity.sequence + 1u
+        : identity.sequence == m_nextSequence;
+    if (!validSequence)
     {
         result.disposition = Vu1CommandDisposition::OutOfOrder;
         return result;
@@ -2367,7 +2443,8 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
         result.disposition = Vu1CommandDisposition::Malformed;
         return result;
     }
-    if (m_nextSequence ==
+    if (!epochContinuation &&
+        m_nextSequence ==
         std::numeric_limits<uint64_t>::max())
     {
         throw std::overflow_error(
@@ -2382,7 +2459,8 @@ Vu1CommandResult Vu1CommandProcessor::processAdvanceSlice(
         result.diagnostics = std::move(m_pendingDiagnostics);
         m_pendingDiagnostics.clear();
         result.codeGeneration = codeGeneration();
-        ++m_nextSequence;
+        if (!epochContinuation)
+            ++m_nextSequence;
     }
     catch (...)
     {
@@ -3101,6 +3179,20 @@ void ThreadedVu1Executor::closeAdmissionAndQuiesceProducer() noexcept
     signalSpaceAvailable();
 
     std::lock_guard<std::mutex> submitLock(m_submitMutex);
+    requestActiveExecutionEpochStopLocked();
+}
+
+void ThreadedVu1Executor::requestActiveExecutionEpochStopLocked() noexcept
+{
+    if (!m_activeExecutionEpoch)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(
+            m_activeExecutionEpoch->mutex);
+        m_activeExecutionEpoch->stopRequested = true;
+    }
+    m_activeExecutionEpoch->changed.notify_all();
+    m_activeExecutionEpoch.reset();
 }
 
 [[noreturn]] void
@@ -3130,6 +3222,11 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
     std::unique_lock<std::mutex> submitLock(m_submitMutex);
     if (!m_accepting.load(std::memory_order_acquire))
         throwSubmissionUnavailable();
+
+    // Any later ordered command observes the last EE-published epoch
+    // checkpoint. Ask the owner to discard its unpublished lookahead before
+    // the command reaches the head of the same FIFO.
+    requestActiveExecutionEpochStopLocked();
 
     std::optional<Vu1WorkIdentity> extendedIdentity;
     if (commitsExtendedSpeculativeAdvance)
@@ -3411,6 +3508,319 @@ Vu1CommandAdmission ThreadedVu1Executor::submitResultless(
     };
 }
 
+Vu1ExecutionEpoch ThreadedVu1Executor::submitExecutionEpoch(
+    Vu1ExecutionEpochOptions options,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    constexpr size_t kMaximumCheckpointCapacity = 64u;
+    if (options.initialCycles == 0u ||
+        options.followupCycles == 0u ||
+        options.checkpointCapacity == 0u ||
+        options.checkpointCapacity >
+            kMaximumCheckpointCapacity)
+    {
+        throw std::invalid_argument(
+            "invalid threaded VU1 execution epoch options");
+    }
+
+    std::unique_lock<std::mutex> submitLock(m_submitMutex);
+    if (!m_accepting.load(std::memory_order_acquire))
+        throwSubmissionUnavailable();
+    if (m_producerSpeculationCheckpoint)
+    {
+        throw std::logic_error(
+            "threaded VU1 execution epoch conflicts with slice speculation");
+    }
+    requestActiveExecutionEpochStopLocked();
+    ensureStarted();
+
+    guestTick = std::max(guestTick, m_lastGuestTick);
+    const uint64_t generation = m_generation;
+    const uint64_t sequence = m_nextSequence;
+    if (sequence == 0u ||
+        sequence == std::numeric_limits<uint64_t>::max())
+    {
+        throw std::overflow_error(
+            "VU1 command sequence exhausted");
+    }
+    const uint64_t ticket = checkedVu1Increment(
+        m_nextTicket, "transport ticket");
+    Vu1CommandPayload payload{
+        Vu1AdvanceSliceCommand{
+            .maximumCycles = options.initialCycles,
+            .captureState = options.captureState,
+        }};
+    const uint64_t payloadBytes =
+        vu1CommandPayloadSize(payload);
+    auto state = std::make_shared<Vu1ExecutionEpochState>(
+        options);
+    Vu1Command command{
+        .identity = {
+            .sequence = sequence,
+            .generation = generation,
+            .guestTick = guestTick,
+            .publicationToken = publicationToken,
+        },
+        .type = Vu1CommandType::AdvanceSlice,
+        .payloadSize = payloadBytes,
+        .payload = std::move(payload),
+    };
+    const Vu1WorkIdentity identity = command.identity;
+    WorkItem item{
+        .ticket = ticket,
+        .payloadBytes = payloadBytes,
+        .command = std::move(command),
+        .executionEpoch = state,
+    };
+
+    bool countedBlock = false;
+    std::chrono::steady_clock::time_point blockedAt{};
+    const auto recordBlockedDuration = [&]()
+    {
+        if (!countedBlock)
+            return;
+        const uint64_t nanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - blockedAt)
+                    .count());
+        m_producerBlockedNanoseconds.fetch_add(
+            nanoseconds, std::memory_order_relaxed);
+        countedBlock = false;
+    };
+    for (;;)
+    {
+        if (!m_accepting.load(std::memory_order_acquire))
+        {
+            recordBlockedDuration();
+            throwSubmissionUnavailable();
+        }
+        const uint64_t spaceEpoch = m_spaceEpoch.load(
+            std::memory_order_acquire);
+        const AdmissionResult admission = tryEnqueue(item);
+        if (admission == AdmissionResult::Enqueued)
+            break;
+        if (!countedBlock)
+        {
+            countedBlock = true;
+            blockedAt = std::chrono::steady_clock::now();
+            m_producerBlockCount.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        if (!m_accepting.load(std::memory_order_acquire))
+        {
+            recordBlockedDuration();
+            throwSubmissionUnavailable();
+        }
+        const auto waitAt = std::chrono::steady_clock::now();
+        m_spaceEpoch.wait(
+            spaceEpoch, std::memory_order_acquire);
+        const uint64_t waitNanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - waitAt)
+                    .count());
+        if (admission == AdmissionResult::SlotCapacity)
+        {
+            m_producerSlotWaitCount.fetch_add(
+                1u, std::memory_order_relaxed);
+            m_producerSlotWaitNanoseconds.fetch_add(
+                waitNanoseconds, std::memory_order_relaxed);
+        }
+        else
+        {
+            m_producerPayloadWaitCount.fetch_add(
+                1u, std::memory_order_relaxed);
+            m_producerPayloadWaitNanoseconds.fetch_add(
+                waitNanoseconds, std::memory_order_relaxed);
+        }
+    }
+    recordBlockedDuration();
+
+    m_nextSequence =
+        sequence == std::numeric_limits<uint64_t>::max()
+            ? 0u
+            : sequence + 1u;
+    m_nextTicket = ticket;
+    m_lastGuestTick = guestTick;
+    m_activeExecutionEpoch = state;
+    m_submittedTickets.store(
+        ticket, std::memory_order_release);
+    m_submittedGeneration.store(
+        generation, std::memory_order_release);
+    m_submittedSequence.store(
+        sequence, std::memory_order_release);
+    m_submittedCommandsByType[
+        vu1CommandTypeIndex(Vu1CommandType::AdvanceSlice)]
+        .fetch_add(1u, std::memory_order_relaxed);
+    m_executionEpochsSubmitted.fetch_add(
+        1u, std::memory_order_relaxed);
+    signalWorkAvailable();
+    submitLock.unlock();
+
+    return Vu1ExecutionEpoch(
+        ticket, identity, std::move(state));
+}
+
+size_t ThreadedVu1Executor::executionEpochReadyCheckpointCount(
+    const Vu1ExecutionEpoch &epoch) const
+{
+    if (!epoch.m_state)
+        return 0u;
+    std::lock_guard<std::mutex> lock(epoch.m_state->mutex);
+    size_t ready = 0u;
+    for (const auto &checkpoint : epoch.m_state->journal)
+    {
+        if (!checkpoint->consumed &&
+            checkpoint->revision ==
+                epoch.m_state->demandRevision)
+        {
+            ++ready;
+        }
+    }
+    return ready;
+}
+
+bool ThreadedVu1Executor::executionEpochCheckpointReady(
+    const Vu1ExecutionEpoch &epoch,
+    uint32_t exactCycles) const
+{
+    if (!epoch.m_state || exactCycles == 0u)
+        return false;
+    std::lock_guard<std::mutex> lock(epoch.m_state->mutex);
+    for (const auto &checkpoint : epoch.m_state->journal)
+    {
+        if (checkpoint->consumed)
+            continue;
+        return checkpoint->revision ==
+                   epoch.m_state->demandRevision &&
+               checkpoint->cycles == exactCycles;
+    }
+    return false;
+}
+
+Vu1CommandResult
+ThreadedVu1Executor::waitExecutionEpochCheckpoint(
+    Vu1ExecutionEpoch &epoch,
+    uint32_t exactCycles,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    if (!epoch.m_state || exactCycles == 0u)
+    {
+        throw std::invalid_argument(
+            "invalid threaded VU1 execution epoch checkpoint");
+    }
+    const auto waitAt = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(epoch.m_state->mutex);
+    const auto firstReady = [&]()
+        -> std::shared_ptr<Vu1ExecutionEpochState::Checkpoint>
+    {
+        for (const auto &checkpoint : epoch.m_state->journal)
+        {
+            if (!checkpoint->consumed)
+                return checkpoint;
+        }
+        return {};
+    };
+
+    std::shared_ptr<Vu1ExecutionEpochState::Checkpoint> checkpoint =
+        firstReady();
+    const bool needsRebase = checkpoint
+        ? checkpoint->cycles != exactCycles ||
+              checkpoint->revision !=
+                  epoch.m_state->demandRevision
+        : epoch.m_state->demandedCycles != exactCycles;
+    if (needsRebase)
+    {
+        if (epoch.m_state->demandRevision ==
+            std::numeric_limits<uint64_t>::max())
+        {
+            throw std::overflow_error(
+                "VU1 execution epoch demand revision exhausted");
+        }
+        epoch.m_state->demandedCycles = exactCycles;
+        ++epoch.m_state->demandRevision;
+        m_epochDemandRebases.fetch_add(
+            1u, std::memory_order_relaxed);
+        epoch.m_state->changed.notify_all();
+    }
+
+    epoch.m_state->changed.wait(
+        lock,
+        [&]()
+        {
+            if (epoch.m_state->failure ||
+                epoch.m_state->stopped)
+            {
+                return true;
+            }
+            const auto ready = firstReady();
+            return ready &&
+                   ready->revision ==
+                       epoch.m_state->demandRevision &&
+                   ready->cycles == exactCycles;
+        });
+    if (epoch.m_state->failure)
+        std::rethrow_exception(epoch.m_state->failure);
+    checkpoint = firstReady();
+    if (!checkpoint || checkpoint->cycles != exactCycles ||
+        checkpoint->revision != epoch.m_state->demandRevision)
+    {
+        throw std::runtime_error(
+            "threaded VU1 execution epoch stopped before checkpoint");
+    }
+
+    Vu1CommandResult result = std::move(checkpoint->result);
+    checkpoint->consumed = true;
+    epoch.m_state->demandedCycles =
+        epoch.m_state->options.followupCycles;
+    m_epochCheckpointsPublished.fetch_add(
+        1u, std::memory_order_relaxed);
+    lock.unlock();
+    epoch.m_state->changed.notify_all();
+
+    result.identity = epoch.m_identity;
+    result.identity.guestTick = guestTick;
+    result.identity.publicationToken = publicationToken;
+    result.digest.sequence = epoch.m_identity.sequence;
+    result.digest.generation = epoch.m_identity.generation;
+    result.digest.guestTick = guestTick;
+    const uint64_t waitNanoseconds =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - waitAt)
+                .count());
+    m_epochCheckpointWaitCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_epochCheckpointWaitNanoseconds.fetch_add(
+        waitNanoseconds, std::memory_order_relaxed);
+    if (result.disposition != Vu1CommandDisposition::Completed)
+    {
+        throw std::logic_error(
+            "threaded VU1 epoch checkpoint was rejected");
+    }
+    return result;
+}
+
+void ThreadedVu1Executor::stopExecutionEpoch(
+    Vu1ExecutionEpoch &epoch) noexcept
+{
+    if (!epoch.m_state)
+        return;
+    std::lock_guard<std::mutex> submitLock(m_submitMutex);
+    {
+        std::lock_guard<std::mutex> lock(epoch.m_state->mutex);
+        epoch.m_state->stopRequested = true;
+    }
+    epoch.m_state->changed.notify_all();
+    if (m_activeExecutionEpoch == epoch.m_state)
+        m_activeExecutionEpoch.reset();
+}
+
 Vu1CommandSubmission
 ThreadedVu1Executor::submitSpeculativeAdvance(
     Vu1AdvanceSliceCommand command,
@@ -3591,6 +4001,8 @@ void ThreadedVu1Executor::cancelQueued(
     {
         try
         {
+            if (item->executionEpoch)
+                failExecutionEpoch(item->executionEpoch, reason);
             if (item->completion)
                 item->completion->set_exception(reason);
         }
@@ -3600,6 +4012,262 @@ void ThreadedVu1Executor::cancelQueued(
         releasePayload(item->payloadBytes);
         m_completedTickets.store(
             item->ticket, std::memory_order_release);
+    }
+}
+
+void ThreadedVu1Executor::failExecutionEpoch(
+    const std::shared_ptr<Vu1ExecutionEpochState> &state,
+    const std::exception_ptr &failure) noexcept
+{
+    if (!state)
+        return;
+    try
+    {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->failure)
+                state->failure = failure;
+            state->stopped = true;
+        }
+        state->changed.notify_all();
+    }
+    catch (...)
+    {
+    }
+}
+
+void ThreadedVu1Executor::runExecutionEpoch(WorkItem &item)
+{
+    if (!item.executionEpoch)
+    {
+        throw std::logic_error(
+            "threaded VU1 execution epoch has no state");
+    }
+    const auto *const initialAdvance =
+        std::get_if<Vu1AdvanceSliceCommand>(
+            &item.command.payload);
+    if (!initialAdvance)
+    {
+        throw std::logic_error(
+            "threaded VU1 execution epoch is not an advance");
+    }
+    if (item.command.identity.sequence ==
+        std::numeric_limits<uint64_t>::max())
+    {
+        throw std::overflow_error(
+            "VU1 execution epoch sequence exhausted");
+    }
+
+    struct LocalCheckpoint
+    {
+        std::shared_ptr<
+            Vu1ExecutionEpochState::Checkpoint>
+            shared;
+        Vu1CommandProcessor::SpeculativeSliceCheckpoint
+            processor;
+    };
+
+    auto baseline = m_processor.captureProcessorCheckpoint();
+    // The transport identity is consumed even if no speculative checkpoint
+    // becomes guest-visible. Ordered work behind the epoch therefore keeps a
+    // simple monotonic sequence after rollback to the pre-epoch architecture.
+    baseline.nextSequence = item.command.identity.sequence + 1u;
+    std::deque<LocalCheckpoint> localJournal;
+    uint64_t handledRevision = 0u;
+    bool initialExecution = true;
+    bool reachedInactive = false;
+    {
+        std::lock_guard<std::mutex> lock(
+            item.executionEpoch->mutex);
+        item.executionEpoch->workerStarted = true;
+        handledRevision =
+            item.executionEpoch->demandRevision;
+    }
+    item.executionEpoch->changed.notify_all();
+
+    try
+    {
+        for (;;)
+        {
+            enum class Action : uint8_t
+            {
+                Produce,
+                Rebase,
+                Stop,
+                Finish,
+            };
+            Action action = Action::Produce;
+            uint32_t cycles = 0u;
+            uint64_t revision = handledRevision;
+            uint64_t discarded = 0u;
+            {
+                std::unique_lock<std::mutex> lock(
+                    item.executionEpoch->mutex);
+                for (;;)
+                {
+                    while (!localJournal.empty() &&
+                           localJournal.front().shared->consumed)
+                    {
+                        const bool publishedActive =
+                            localJournal.front().shared->active;
+                        baseline = std::move(
+                            localJournal.front().processor);
+                        if (item.executionEpoch->journal.empty() ||
+                            item.executionEpoch->journal.front() !=
+                                localJournal.front().shared)
+                        {
+                            throw std::logic_error(
+                                "VU1 epoch journal order diverged");
+                        }
+                        item.executionEpoch->journal.pop_front();
+                        localJournal.pop_front();
+                        if (!publishedActive)
+                        {
+                            discarded = localJournal.size();
+                            item.executionEpoch->journal.clear();
+                            localJournal.clear();
+                            action = Action::Finish;
+                            break;
+                        }
+                    }
+                    if (action == Action::Finish)
+                        break;
+                    if (item.executionEpoch->stopRequested)
+                    {
+                        discarded = localJournal.size();
+                        item.executionEpoch->journal.clear();
+                        localJournal.clear();
+                        action = Action::Stop;
+                        break;
+                    }
+                    if (item.executionEpoch->demandRevision !=
+                        handledRevision)
+                    {
+                        discarded = localJournal.size();
+                        item.executionEpoch->journal.clear();
+                        localJournal.clear();
+                        handledRevision =
+                            item.executionEpoch->demandRevision;
+                        revision = handledRevision;
+                        reachedInactive = false;
+                        action = Action::Rebase;
+                        break;
+                    }
+                    if (!reachedInactive &&
+                        localJournal.size() <
+                            item.executionEpoch->options
+                                .checkpointCapacity)
+                    {
+                        cycles = localJournal.empty()
+                            ? item.executionEpoch->demandedCycles
+                            : item.executionEpoch->options
+                                  .followupCycles;
+                        revision = handledRevision;
+                        action = Action::Produce;
+                        break;
+                    }
+
+                    item.executionEpoch->changed.wait(lock);
+                }
+            }
+            item.executionEpoch->changed.notify_all();
+
+            if (discarded != 0u)
+            {
+                m_epochSuffixCheckpointsDiscarded.fetch_add(
+                    discarded, std::memory_order_relaxed);
+            }
+            if (action == Action::Stop ||
+                action == Action::Finish)
+            {
+                m_processor.restoreProcessorCheckpoint(baseline);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        item.executionEpoch->mutex);
+                    item.executionEpoch->stopped = true;
+                }
+                item.executionEpoch->changed.notify_all();
+                return;
+            }
+            if (action == Action::Rebase)
+            {
+                m_processor.restoreProcessorCheckpoint(baseline);
+                initialExecution = false;
+                continue;
+            }
+            if (cycles == 0u)
+            {
+                throw std::logic_error(
+                    "VU1 epoch requested a zero-cycle checkpoint");
+            }
+
+            Vu1AdvanceSliceCommand command{
+                .maximumCycles = cycles,
+                .captureState =
+                    item.executionEpoch->options.captureState,
+            };
+            Vu1CommandResult result = initialExecution
+                ? m_processor.processAdvanceSlice(
+                      item.command.identity, command, false)
+                : m_processor.processEpochContinuation(
+                      item.command.identity, command);
+            initialExecution = false;
+            if (result.disposition !=
+                Vu1CommandDisposition::Completed)
+            {
+                throw std::logic_error(
+                    "VU1 owner rejected execution epoch checkpoint");
+            }
+            auto processorCheckpoint =
+                m_processor.captureProcessorCheckpoint();
+            auto sharedCheckpoint =
+                std::make_shared<
+                    Vu1ExecutionEpochState::Checkpoint>();
+            sharedCheckpoint->revision = revision;
+            sharedCheckpoint->cycles = cycles;
+            sharedCheckpoint->active = result.active;
+            sharedCheckpoint->result = std::move(result);
+            if (m_options.beforePublish)
+            {
+                m_options.beforePublish(
+                    sharedCheckpoint->result,
+                    item.ticket);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    item.executionEpoch->mutex);
+                item.executionEpoch->journal.push_back(
+                    sharedCheckpoint);
+                localJournal.push_back(
+                    LocalCheckpoint{
+                        .shared = sharedCheckpoint,
+                        .processor =
+                            std::move(processorCheckpoint),
+                    });
+                reachedInactive = !sharedCheckpoint->active;
+                updateVu1AtomicMaximum(
+                    m_epochMaximumJournalDepth,
+                    localJournal.size());
+            }
+            m_epochCheckpointsProduced.fetch_add(
+                1u, std::memory_order_relaxed);
+            item.executionEpoch->changed.notify_all();
+        }
+    }
+    catch (...)
+    {
+        const std::exception_ptr failure =
+            std::current_exception();
+        try
+        {
+            m_processor.restoreProcessorCheckpoint(baseline);
+        }
+        catch (...)
+        {
+        }
+        failExecutionEpoch(item.executionEpoch, failure);
+        std::rethrow_exception(failure);
     }
 }
 
@@ -3703,6 +4371,9 @@ void ThreadedVu1Executor::workerMain() noexcept
             {
                 const std::exception_ptr reason =
                     makeVu1ExecutorCancellation();
+                if (item->executionEpoch)
+                    failExecutionEpoch(
+                        item->executionEpoch, reason);
                 if (item->completion)
                     item->completion->set_exception(reason);
                 releasePayload(item->payloadBytes);
@@ -3717,7 +4388,28 @@ void ThreadedVu1Executor::workerMain() noexcept
                 item->command.identity.generation <
                 m_minimumAcceptedGeneration.load(
                     std::memory_order_acquire);
-            if (item->commitsExtendedSpeculativeAdvance)
+            const bool executionEpoch =
+                static_cast<bool>(item->executionEpoch);
+            if (executionEpoch)
+            {
+                m_processor.resolveSpeculativeSlice(
+                    item->speculationResolution);
+                if (stale)
+                {
+                    throw std::logic_error(
+                        "threaded VU1 execution epoch became stale");
+                }
+                runExecutionEpoch(*item);
+                result = Vu1CommandResult{
+                    .identity = item->command.identity,
+                    .digest = vu1CommandDigest(item->command),
+                    .ownerGeneration = m_processor.generation(),
+                    .codeGeneration = m_processor.codeGeneration(),
+                };
+                m_executionEpochsCompleted.fetch_add(
+                    1u, std::memory_order_relaxed);
+            }
+            else if (item->commitsExtendedSpeculativeAdvance)
             {
                 if (stale)
                 {
@@ -3796,7 +4488,7 @@ void ThreadedVu1Executor::workerMain() noexcept
                 result.identity.generation;
             const uint64_t completedSequence =
                 result.identity.sequence;
-            if (m_options.beforePublish)
+            if (!executionEpoch && m_options.beforePublish)
             {
                 m_options.beforePublish(result, item->ticket);
             }
@@ -3819,6 +4511,11 @@ void ThreadedVu1Executor::workerMain() noexcept
                 std::current_exception();
             try
             {
+                if (item->executionEpoch)
+                {
+                    failExecutionEpoch(
+                        item->executionEpoch, failure);
+                }
                 if (item->completion)
                     item->completion->set_exception(failure);
             }
@@ -3966,6 +4663,35 @@ ThreadedVu1Executor::statistics() const
             m_executedDecodedUnpackOperations.load(
                 std::memory_order_acquire),
         .speculation = m_processor.speculationStatistics(),
+        .executionEpoch = {
+            .epochsSubmitted =
+                m_executionEpochsSubmitted.load(
+                    std::memory_order_acquire),
+            .epochsCompleted =
+                m_executionEpochsCompleted.load(
+                    std::memory_order_acquire),
+            .checkpointsProduced =
+                m_epochCheckpointsProduced.load(
+                    std::memory_order_acquire),
+            .checkpointsPublished =
+                m_epochCheckpointsPublished.load(
+                    std::memory_order_acquire),
+            .suffixCheckpointsDiscarded =
+                m_epochSuffixCheckpointsDiscarded.load(
+                    std::memory_order_acquire),
+            .demandRebases =
+                m_epochDemandRebases.load(
+                    std::memory_order_acquire),
+            .checkpointWaitCount =
+                m_epochCheckpointWaitCount.load(
+                    std::memory_order_acquire),
+            .checkpointWaitNanoseconds =
+                m_epochCheckpointWaitNanoseconds.load(
+                    std::memory_order_acquire),
+            .maximumJournalDepth =
+                m_epochMaximumJournalDepth.load(
+                    std::memory_order_acquire),
+        },
         .accepting = m_accepting.load(
             std::memory_order_acquire),
         .drainRequested = m_drainRequested.load(

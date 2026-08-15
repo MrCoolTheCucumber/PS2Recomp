@@ -96,6 +96,11 @@ struct PS2RuntimeConfiguration
     size_t vu1CommandQueueCapacity = 64u;
     uint64_t vu1CommandPayloadCapacityBytes =
         8u * 1024u * 1024u;
+    // Phase A remains available as a differential/debugger fallback. The
+    // production runner explicitly enables bounded Phase B checkpoint
+    // epochs for threaded-async execution.
+    bool vu1CheckpointEpochs = false;
+    size_t vu1CheckpointCapacity = 4u;
     std::function<void(const Vu1Command &, uint64_t)>
         vu1BeforeProcess;
     std::function<void(const Vu1CommandResult &, uint64_t)>
@@ -2494,6 +2499,10 @@ private:
     consumeVu1SpeculativeSliceAtEvent(
         const ps2x::timing::EeEventService &service,
         uint32_t cycleBudget);
+    [[nodiscard]] Vu1CommandResult
+    consumeVu1ExecutionEpochAtEvent(
+        const ps2x::timing::EeEventService &service,
+        uint32_t cycleBudget);
     void resolveVu1SpeculationForShutdown() noexcept;
     [[nodiscard]] Vu1CommandResult submitVu1Command(
         Vu1CommandPayload payload,
@@ -2762,6 +2771,8 @@ private:
     ThreadedVu1Executor *m_threadedVu1Executor = nullptr;
     Vu1ExecutionMode m_vu1ExecutionMode =
         Vu1ExecutionMode::Inline;
+    bool m_vu1CheckpointEpochs = false;
+    size_t m_vu1CheckpointCapacity = 4u;
     uint64_t m_vu1CommandPayloadCapacityBytes =
         8u * 1024u * 1024u;
     std::atomic<bool> m_publishedVu1Active{false};
@@ -2782,6 +2793,13 @@ private:
         Vu1PendingSlicePlan plan{};
     };
     std::optional<Vu1PendingSlice> m_pendingVu1Slice;
+    struct Vu1PendingExecutionEpoch
+    {
+        Vu1ExecutionEpoch epoch;
+        Vu1PendingSlicePlan plan{};
+    };
+    std::optional<Vu1PendingExecutionEpoch>
+        m_pendingVu1ExecutionEpoch;
     std::optional<Vu1PendingSlicePlan>
         m_deferredVu1SlicePlan;
     Vu1SpeculationPublicationState
