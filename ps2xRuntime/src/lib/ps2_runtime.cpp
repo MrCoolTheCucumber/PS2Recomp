@@ -16009,6 +16009,35 @@ void PS2Runtime::recordEeThreadQueueRotation(
 
     m_eeThreadDiagnosticAcceptedRotationRequests.fetch_add(
         1u, std::memory_order_relaxed);
+    const auto hashWord = [](uint64_t hash, int value) noexcept
+    {
+        constexpr uint64_t kFnvPrime = 1099511628211ull;
+        const uint32_t word = static_cast<uint32_t>(value);
+        for (uint32_t shift = 0u; shift < 32u; shift += 8u)
+        {
+            hash ^= static_cast<uint8_t>(word >> shift);
+            hash *= kFnvPrime;
+        }
+        return hash;
+    };
+    uint64_t sequenceHash =
+        m_eeThreadDiagnosticAcceptedRotationSequenceHash.load(
+            std::memory_order_relaxed);
+    while (true)
+    {
+        uint64_t nextHash = hashWord(sequenceHash, threadId);
+        nextHash = hashWord(nextHash, requestedPriority);
+        nextHash = hashWord(nextHash, effectivePriority);
+        if (m_eeThreadDiagnosticAcceptedRotationSequenceHash
+                .compare_exchange_weak(
+                    sequenceHash,
+                    nextHash,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed))
+        {
+            break;
+        }
+    }
     if (effectivePriority >= 0 &&
         static_cast<size_t>(effectivePriority) <
             m_eeThreadDiagnosticAcceptedRotationsByPriority.size())
@@ -16176,6 +16205,9 @@ PS2Runtime::debugEeThreadDiagnosticsSnapshot() const
     result.untrackedThreadRotationRequests =
         m_eeThreadDiagnosticUntrackedThreadRotationRequests.load(
             std::memory_order_relaxed);
+    result.acceptedRotationSequenceHash =
+        m_eeThreadDiagnosticAcceptedRotationSequenceHash.load(
+            std::memory_order_relaxed);
     for (size_t priority = 0u;
          priority < result.acceptedRotationsByPriority.size();
          ++priority)
@@ -16193,6 +16225,16 @@ PS2Runtime::debugEeThreadDiagnosticsSnapshot() const
                 .load(std::memory_order_relaxed);
     }
     return result;
+}
+
+std::optional<ps2x::ee::EeRuntimeExecutorStatistics>
+PS2Runtime::debugEeRuntimeExecutorStatisticsSnapshot() const
+{
+    if (!m_eeRuntimeExecutor)
+    {
+        return std::nullopt;
+    }
+    return m_eeRuntimeExecutor->statistics();
 }
 
 void PS2Runtime::debugRecordBranch(uint32_t pc)

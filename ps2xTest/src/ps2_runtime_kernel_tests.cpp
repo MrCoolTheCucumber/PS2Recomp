@@ -5289,6 +5289,26 @@ void register_ps2_runtime_kernel_tests()
                     size_t{0u},
                     "executor shutdown should destroy "
                     "every runtime-owned continuation");
+                const auto executorStatistics =
+                    runtime
+                        .debugEeRuntimeExecutorStatisticsSnapshot();
+                t.IsTrue(
+                    executorStatistics.has_value(),
+                    "a fiber runtime should expose its dedicated executor statistics");
+                if (executorStatistics.has_value())
+                {
+                    t.Equals(
+                        executorStatistics->starts,
+                        uint64_t{1u},
+                        "the fixture should retain one executor start");
+                    t.IsTrue(
+                        executorStatistics->dispatches >= 2u,
+                        "the executor statistics should retain guest dispatches");
+                    t.Equals(
+                        executorStatistics->publicationsQueued,
+                        executorStatistics->publicationsApplied,
+                        "joined executor statistics should account for every queued publication");
+                }
                 const PS2Runtime::DebugEeThreadDiagnostics
                     diagnostics =
                         runtime

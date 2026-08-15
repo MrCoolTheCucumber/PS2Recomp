@@ -2451,6 +2451,8 @@ struct PS2DebugServer::Impl
         const PS2Runtime::DebugEeThreadDiagnostics
             eeThreadDiagnostics =
                 runtime.debugEeThreadDiagnosticsSnapshot();
+        const auto eeRuntimeExecutor =
+            runtime.debugEeRuntimeExecutorStatisticsSnapshot();
         const PS2Runtime::DebugFaultInfo fault =
             runtime.debugFaultSnapshot();
         const auto branches = runtime.debugBranchHistory(256u);
@@ -2623,6 +2625,12 @@ struct PS2DebugServer::Impl
             "untracked_thread_rotation_requests",
             eeThreadDiagnostics.untrackedThreadRotationRequests,
             allocator);
+        addString(
+            eeThreadValue,
+            "accepted_rotation_sequence_hash",
+            hostAddressString(
+                eeThreadDiagnostics.acceptedRotationSequenceHash),
+            allocator);
 
         Value rotationsByPriority(rapidjson::kArrayType);
         for (size_t priority = 0u;
@@ -2678,6 +2686,86 @@ struct PS2DebugServer::Impl
         result.AddMember(
             "ee_thread_diagnostics",
             eeThreadValue,
+            allocator);
+
+        Value eeRuntimeExecutorValue(rapidjson::kObjectType);
+        eeRuntimeExecutorValue.AddMember(
+            "available",
+            eeRuntimeExecutor.has_value(),
+            allocator);
+        if (eeRuntimeExecutor.has_value())
+        {
+            const ps2x::ee::EeRuntimeExecutorStatistics &statistics =
+                *eeRuntimeExecutor;
+            eeRuntimeExecutorValue.AddMember(
+                "starts", statistics.starts, allocator);
+            eeRuntimeExecutorValue.AddMember(
+                "dispatches", statistics.dispatches, allocator);
+            eeRuntimeExecutorValue.AddMember(
+                "publications_queued",
+                statistics.publicationsQueued,
+                allocator);
+            eeRuntimeExecutorValue.AddMember(
+                "publications_applied",
+                statistics.publicationsApplied,
+                allocator);
+            eeRuntimeExecutorValue.AddMember(
+                "idle_waits", statistics.idleWaits, allocator);
+            eeRuntimeExecutorValue.AddMember(
+                "continuations_destroyed",
+                statistics.continuationsDestroyed,
+                allocator);
+            eeRuntimeExecutorValue.AddMember(
+                "failures", statistics.failures, allocator);
+            eeRuntimeExecutorValue.AddMember(
+                "peak_queued_publications",
+                static_cast<uint64_t>(
+                    statistics.peakQueuedPublications),
+                allocator);
+            eeRuntimeExecutorValue.AddMember(
+                "modeled_tick",
+                statistics.modeledTick.raw(),
+                allocator);
+
+            Value boundary(rapidjson::kObjectType);
+            boundary.AddMember(
+                "boundaries",
+                statistics.boundary.boundaries,
+                allocator);
+            boundary.AddMember(
+                "consequences",
+                statistics.boundary.consequences,
+                allocator);
+            boundary.AddMember(
+                "context_publications",
+                statistics.boundary.contextPublications,
+                allocator);
+            boundary.AddMember(
+                "consequence_limit_hits",
+                statistics.boundary.consequenceLimitHits,
+                allocator);
+            boundary.AddMember(
+                "reentrant_boundary_rejects",
+                statistics.boundary.reentrantBoundaryRejects,
+                allocator);
+            boundary.AddMember(
+                "paused_boundaries",
+                statistics.boundary.pausedBoundaries,
+                allocator);
+            boundary.AddMember(
+                "stopped_boundaries",
+                statistics.boundary.stoppedBoundaries,
+                allocator);
+            boundary.AddMember(
+                "completed_debug_steps",
+                statistics.boundary.completedDebugSteps,
+                allocator);
+            eeRuntimeExecutorValue.AddMember(
+                "boundary", boundary, allocator);
+        }
+        result.AddMember(
+            "ee_runtime_executor",
+            eeRuntimeExecutorValue,
             allocator);
 
         Value faultValue(rapidjson::kObjectType);

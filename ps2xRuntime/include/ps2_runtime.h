@@ -1013,6 +1013,9 @@ public:
         kEeThreadDiagnosticPriorityCount = 128u;
     static constexpr size_t
         kEeThreadDiagnosticThreadCount = 256u;
+    static constexpr uint64_t
+        kEeThreadDiagnosticRotationSequenceHashSeed =
+            14695981039346656037ull;
 
     struct DebugEeThreadDiagnostics
     {
@@ -1040,6 +1043,8 @@ public:
         uint64_t rejectedRotationRequests = 0u;
         uint64_t priorityZeroRotationRequests = 0u;
         uint64_t untrackedThreadRotationRequests = 0u;
+        uint64_t acceptedRotationSequenceHash =
+            kEeThreadDiagnosticRotationSequenceHashSeed;
         std::array<
             uint64_t,
             kEeThreadDiagnosticPriorityCount>
@@ -2165,6 +2170,8 @@ public:
     bool debugCopyGsVram(std::vector<uint8_t> &output);
     DebugRuntimeProgress debugRuntimeProgress() const;
     DebugEeThreadDiagnostics debugEeThreadDiagnosticsSnapshot() const;
+    std::optional<ps2x::ee::EeRuntimeExecutorStatistics>
+    debugEeRuntimeExecutorStatisticsSnapshot() const;
     DebugVu1Timing debugVu1TimingSnapshot();
     std::array<DebugVuBackendDiagnostics, 2u>
     debugVuBackendDiagnosticsSnapshot() const;
@@ -3420,6 +3427,9 @@ private:
         m_eeThreadDiagnosticPriorityZeroRotationRequests{0u};
     std::atomic<uint64_t>
         m_eeThreadDiagnosticUntrackedThreadRotationRequests{0u};
+    std::atomic<uint64_t>
+        m_eeThreadDiagnosticAcceptedRotationSequenceHash{
+            kEeThreadDiagnosticRotationSequenceHashSeed};
     std::array<
         std::atomic<uint64_t>,
         kEeThreadDiagnosticPriorityCount>

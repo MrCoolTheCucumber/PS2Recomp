@@ -2427,6 +2427,16 @@ void register_ps2_runtime_expansion_tests()
                     disabled.guestLockAcquisitions,
                     uint64_t{0u},
                     "disabled scheduler diagnostics must not update lock counters");
+                t.Equals(
+                    disabled.acceptedRotationSequenceHash,
+                    PS2Runtime::
+                        kEeThreadDiagnosticRotationSequenceHashSeed,
+                    "disabled scheduler diagnostics must retain the empty rotation fingerprint");
+                t.IsFalse(
+                    runtime
+                        .debugEeRuntimeExecutorStatisticsSnapshot()
+                        .has_value(),
+                    "a legacy runtime should not report dedicated executor statistics");
             }
 
             PS2RuntimeConfiguration configuration{};
@@ -2503,6 +2513,10 @@ void register_ps2_runtime_expansion_tests()
                 diagnostics.acceptedRotationsByThread[2u],
                 uint64_t{2u},
                 "thread buckets should include both accepted requests");
+            t.Equals(
+                diagnostics.acceptedRotationSequenceHash,
+                uint64_t{0x149c90466717fbb4ull},
+                "the accepted rotation fingerprint should retain thread and priority order");
 
             runtime.recordMpegPictureServed(nullptr, false);
             runtime.recordMpegPictureServed(nullptr, true);
