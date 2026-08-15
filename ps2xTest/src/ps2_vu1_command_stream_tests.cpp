@@ -1108,6 +1108,155 @@ void register_ps2_vu1_command_stream_tests()
             }
         });
 
+        tc.Run("threaded VU1 drains admitted resultless traffic without completion waits", [](TestCase &t)
+        {
+            VuUnit unit(VuUnitId::Vu1);
+            std::vector<uint8_t> code(PS2_VU1_CODE_SIZE);
+            std::vector<uint8_t> data(PS2_VU1_DATA_SIZE);
+            Vu1CommandProcessor processor(unit);
+            processor.bindMemory(
+                code.data(), static_cast<uint32_t>(code.size()),
+                data.data(), static_cast<uint32_t>(data.size()), 1u);
+            const auto gate = std::make_shared<Vu1WorkerGate>();
+            ThreadedVu1Executor executor(
+                processor,
+                ThreadedVu1ExecutorOptions{
+                    .queueCapacity = 4u,
+                    .payloadCapacityBytes = 4096u,
+                    .beforeProcess =
+                        [gate](const Vu1Command &command, uint64_t ticket)
+                        {
+                            gate->beforeProcess(command, ticket);
+                        },
+                });
+
+            t.IsTrue(
+                captureException(
+                    [&executor]()
+                    {
+                        (void)executor.submitResultless(
+                            Vu1SnapshotCommand{});
+                    }).find("requires a completion") !=
+                    std::string::npos,
+                "response-producing commands must retain typed completions");
+
+            const Vu1VifState vif{
+                .cycle = 0x0101u,
+                .mode = 0u,
+                .row = {10u, 20u, 30u, 40u},
+            };
+            const Vu1CommandAdmission first =
+                executor.submitResultless(
+                    Vu1VifStateUpdateCommand{vif}, 11u, 7u);
+            t.IsTrue(gate->waitUntilEntered(),
+                     "the first resultless command should become owner-active");
+
+            std::array<uint32_t, 4u> unpackWords{1u, 2u, 3u, 4u};
+            std::vector<uint8_t> unpackBytes(sizeof(unpackWords));
+            std::memcpy(
+                unpackBytes.data(), unpackWords.data(),
+                unpackBytes.size());
+            const Vu1CommandAdmission second =
+                executor.submitResultless(
+                    Vu1DecodedUnpackCommand{
+                        .immediate = 2u,
+                        .vectorLength = 0u,
+                        .componentCount = 4u,
+                        .writeVectorCount = 1u,
+                        .sourceVectorCount = 1u,
+                        .sourceWordAlignment = 4u,
+                        .bytes = std::move(unpackBytes),
+                    },
+                    12u, 7u);
+            const Vu1CommandAdmission third =
+                executor.submitResultless(
+                    Vu1DataMemoryWriteCommand{
+                        .offset = 0x80u,
+                        .bytes = {0x11u, 0x22u, 0x33u, 0x44u},
+                    },
+                    13u, 7u);
+            const Vu1CommandAdmission fourth =
+                executor.submitResultless(
+                    Vu1VifStateUpdateCommand{
+                        Vu1VifState{
+                            .cycle = 0x0201u,
+                            .mode = 1u,
+                            .row = {50u, 60u, 70u, 80u},
+                        }},
+                    14u, 7u);
+
+            t.Equals(first.identity.sequence, 1ull,
+                     "the first admitted command should own sequence one");
+            t.Equals(second.identity.sequence, 2ull,
+                     "resultless admission should preserve FIFO identity");
+            t.Equals(third.identity.sequence, 3ull,
+                     "the data write should retain stream order");
+            t.Equals(fourth.identity.sequence, 4ull,
+                     "the trailing state should retain stream order");
+            const ThreadedVu1ExecutorStatistics admitted =
+                executor.statistics();
+            t.Equals(admitted.submittedTickets, 4ull,
+                     "all bounded resultless traffic should be admitted while the owner is held");
+            t.Equals(admitted.resultWaitCount, 0ull,
+                     "resultless admission must not allocate producer completion waits");
+            t.Equals(admitted.queueDepth, size_t{3u},
+                     "the blocked owner should leave the admitted suffix in the bounded queue");
+
+            gate->release();
+            const Vu1CommandResult snapshotResult =
+                executor.submit(Vu1SnapshotCommand{});
+            const auto *const snapshot =
+                std::get_if<Vu1SnapshotResult>(
+                    &snapshotResult.payload);
+            t.IsTrue(snapshot && snapshot->snapshot,
+                     "one explicit observation should drain all preceding resultless work");
+            if (!snapshot || !snapshot->snapshot)
+                return;
+            t.Equals(snapshotResult.identity.sequence, 5ull,
+                     "the observation should follow every admitted mutation");
+            t.Equals(
+                snapshot->snapshot->vif,
+                Vu1VifState{
+                    .cycle = 0x0201u,
+                    .mode = 1u,
+                    .row = {50u, 60u, 70u, 80u},
+                },
+                "the observation should see the final ordered VIF state");
+            t.IsTrue(
+                std::memcmp(
+                    snapshot->snapshot->dataMemory.data() + 2u * 16u,
+                    unpackWords.data(), sizeof(unpackWords)) == 0,
+                "the resultless UNPACK should mutate canonical owner memory");
+            t.IsTrue(
+                std::memcmp(
+                    snapshot->snapshot->dataMemory.data() + 0x80u,
+                    std::array<uint8_t, 4u>{
+                        0x11u, 0x22u, 0x33u, 0x44u}.data(),
+                    4u) == 0,
+                "the resultless data write should precede observation");
+
+            const ThreadedVu1ExecutorStatistics drained =
+                executor.statistics();
+            t.Equals(drained.completedTickets, 5ull,
+                     "the observation should retire the complete ordered prefix");
+            t.Equals(drained.resultWaitCount, 1ull,
+                     "only the explicit snapshot should consume a result wait");
+            for (const Vu1CommandType type : {
+                     Vu1CommandType::DataMemoryWrite,
+                     Vu1CommandType::DecodedUnpack,
+                     Vu1CommandType::VifStateUpdate})
+            {
+                t.Equals(
+                    drained.commandTypes[
+                        vu1CommandTypeIndex(type)].resultWaitCount,
+                    0ull,
+                    "ordinary resultless command classes must not wait for completion");
+            }
+            t.IsTrue(
+                drained.workerWakeCount <= 2u,
+                "one owner wake should drain the admitted command run before the observation");
+        });
+
         tc.Run("threaded VU1 cancellation opens reset and restore generations safely", [](TestCase &t)
         {
             VuUnit unit(VuUnitId::Vu1);
@@ -2409,6 +2558,82 @@ void register_ps2_vu1_command_stream_tests()
                      "the EE observation mirror must not be canonical owner storage");
         });
 
+        tc.Run("runtime admits owned VU1 memory writes until explicit observation", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration =
+                defaultPs2RuntimeConfiguration();
+            configuration.vu1ExecutionMode =
+                Vu1ExecutionMode::ThreadedAsync;
+            configuration.vu1CommandQueueCapacity = 4u;
+            configuration.vu1CommandPayloadCapacityBytes =
+                1024u * 1024u;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "resultless-write runtime memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "resultless-write runtime should bind owner memory");
+
+            const Vu1AsyncRuntimeStatistics before =
+                runtime.vu1AsyncStatistics();
+            runtime.memory().write32(
+                PS2_VU1_CODE_BASE + 8u, 0x44332211u);
+            runtime.memory().write32(
+                PS2_VU1_DATA_BASE + 12u, 0xaabbccddu);
+            const Vu1AsyncRuntimeStatistics admitted =
+                runtime.vu1AsyncStatistics();
+            const auto count = [](
+                const Vu1AsyncRuntimeStatistics &statistics,
+                Vu1CommandType type,
+                bool waits)
+                {
+                    const auto &command =
+                        statistics.owner.commandTypes[
+                            vu1CommandTypeIndex(type)];
+                    return waits
+                        ? command.resultWaitCount
+                        : command.submitted;
+                };
+            t.Equals(
+                count(admitted, Vu1CommandType::MicroMemoryWrite, false) -
+                    count(before, Vu1CommandType::MicroMemoryWrite, false),
+                1ull,
+                "the mapped micro write should enter the owner stream");
+            t.Equals(
+                count(admitted, Vu1CommandType::DataMemoryWrite, false) -
+                    count(before, Vu1CommandType::DataMemoryWrite, false),
+                1ull,
+                "the mapped data write should enter the owner stream");
+            t.Equals(
+                count(admitted, Vu1CommandType::MicroMemoryWrite, true) -
+                    count(before, Vu1CommandType::MicroMemoryWrite, true),
+                0ull,
+                "a bounded micro-memory admission should not wait for execution");
+            t.Equals(
+                count(admitted, Vu1CommandType::DataMemoryWrite, true) -
+                    count(before, Vu1CommandType::DataMemoryWrite, true),
+                0ull,
+                "a bounded data-memory admission should not wait for execution");
+
+            const std::shared_ptr<const Vu1Snapshot> snapshot =
+                runtime.snapshotVu1Owner();
+            uint32_t codeWord = 0u;
+            uint32_t dataWord = 0u;
+            std::memcpy(
+                &codeWord, snapshot->microMemory.data() + 8u,
+                sizeof(codeWord));
+            std::memcpy(
+                &dataWord, snapshot->dataMemory.data() + 12u,
+                sizeof(dataWord));
+            t.Equals(codeWord, uint32_t{0x44332211u},
+                     "the observation should drain the admitted micro write");
+            t.Equals(dataWord, uint32_t{0xaabbccddu},
+                     "the observation should drain the admitted data write");
+            t.Equals(
+                snapshot->codeGeneration,
+                runtime.memory().getVU1CodeGeneration(),
+                "the EE and owner code generations should agree after observation");
+        });
+
         tc.Run("runtime publishes an early VU1 slice only at its scheduler event", [](TestCase &t)
         {
             PS2RuntimeConfiguration configuration =
@@ -2668,6 +2893,13 @@ void register_ps2_vu1_command_stream_tests()
                     return statistics.owner.commandTypes[
                         vu1CommandTypeIndex(type)].submitted;
                 };
+            const auto commandWaitCount =
+                [](const Vu1AsyncRuntimeStatistics &statistics,
+                   Vu1CommandType type)
+                {
+                    return statistics.owner.commandTypes[
+                        vu1CommandTypeIndex(type)].resultWaitCount;
+                };
             t.Equals(
                 commandCount(
                     asynchronous.afterPayload,
@@ -2686,6 +2918,24 @@ void register_ps2_vu1_command_stream_tests()
                         Vu1CommandType::VifStateUpdate),
                 1ull,
                 "the pre-UNPACK VIF state should fold into the UNPACK and only the trailing state should remain");
+            t.Equals(
+                commandWaitCount(
+                    asynchronous.afterPayload,
+                    Vu1CommandType::DecodedUnpack) -
+                    commandWaitCount(
+                        asynchronous.beforePayload,
+                        Vu1CommandType::DecodedUnpack),
+                0ull,
+                "row-stable UNPACK batches should return after bounded admission");
+            t.Equals(
+                commandWaitCount(
+                    asynchronous.afterPayload,
+                    Vu1CommandType::VifStateUpdate) -
+                    commandWaitCount(
+                        asynchronous.beforePayload,
+                        Vu1CommandType::VifStateUpdate),
+                0ull,
+                "resultless trailing VIF state should not wait for owner execution");
             t.Equals(
                 asynchronous.afterPayload.hazardBarrierCount, 1ull,
                 "one parser batch should resolve speculation once");
@@ -2708,9 +2958,9 @@ void register_ps2_vu1_command_stream_tests()
                 asynchronous.afterPayload.deferredSliceArmCount, 0ull,
                 "the plan must remain unarmed before VIF1 finalization");
             t.Equals(
-                asynchronous.afterPayload.owner.speculation.rolledBackSlices,
+                asynchronous.afterPublication.owner.speculation.rolledBackSlices,
                 1ull,
-                "the parser batch should roll back one private checkpoint");
+                "the parser batch should roll back one private checkpoint before publication");
             t.Equals(
                 asynchronous.afterEmptyService.hazardBarrierCount,
                 asynchronous.afterPayload.hazardBarrierCount,
@@ -3207,9 +3457,9 @@ void register_ps2_vu1_command_stream_tests()
                 1ull,
                 "the first published epoch should commit before the new MSCAL");
             t.Equals(
-                asynchronous.afterPayload.owner.speculation.rolledBackSlices,
+                asynchronous.afterSecondPublication.owner.speculation.rolledBackSlices,
                 1ull,
-                "the following state command should roll back the new private epoch");
+                "the following state command should eventually roll back the new private epoch before observation");
             t.Equals(
                 asynchronous.afterSecondPublication.slicesPublished, 2ull,
                 "both startup epochs should publish at their own scheduler events");
@@ -3307,10 +3557,8 @@ void register_ps2_vu1_command_stream_tests()
                             runtime.memory().getRDRAM(), &context);
                     });
             t.IsTrue(
-                serviceError.find(
-                    "injected VIF1 batch owner failure") !=
-                    std::string::npos,
-                "the parser service should surface the owner failure");
+                serviceError.empty(),
+                "resultless parser traffic should return after admission rather than waiting for owner failure");
 
             t.IsTrue(
                 waitUntil(
@@ -3340,7 +3588,7 @@ void register_ps2_vu1_command_stream_tests()
                 laterError.find(
                     "injected VIF1 batch owner failure") !=
                     std::string::npos,
-                "later work should observe the retained owner failure");
+                "the next explicit observation should receive the retained owner failure");
             t.IsTrue(
                 laterError.find("synchronous command batch") ==
                     std::string::npos,

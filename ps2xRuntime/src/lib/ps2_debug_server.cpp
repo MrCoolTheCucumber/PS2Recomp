@@ -1394,6 +1394,15 @@ struct PS2DebugServer::Impl
             "worker_idle_ns",
             vu1OwnerStats.workerIdleNanoseconds, allocator);
         vu1OwnerValue.AddMember(
+            "work_notification_count",
+            vu1OwnerStats.workNotificationCount, allocator);
+        vu1OwnerValue.AddMember(
+            "worker_wake_count",
+            vu1OwnerStats.workerWakeCount, allocator);
+        vu1OwnerValue.AddMember(
+            "worker_drain_count",
+            vu1OwnerStats.workerDrainCount, allocator);
+        vu1OwnerValue.AddMember(
             "result_wait_count",
             vu1OwnerStats.resultWaitCount, allocator);
         vu1OwnerValue.AddMember(

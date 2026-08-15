@@ -6600,36 +6600,22 @@ void PS2Runtime::flushBatchedVu1DecodedUnpacks()
     if (m_batchedVu1DecodedUnpacks.empty())
         return;
 
-    const std::optional<Vu1VifState> expectedVifState =
-        m_batchedVu1DecodedUnpackFinalVifState;
     m_batchedVu1DecodedUnpackFinalVifState.reset();
     const std::shared_ptr<const Vu1DecodedUnpackBatch> batch =
         takeBatchedVu1DecodedUnpacks();
     const Vu1SynchronousCommandBarrier barrier =
         beginVu1SynchronousCommandBarrier();
-    Vu1CommandResult result =
-        m_threadedVu1Executor->submitResolvingSpeculation(
+    (void)m_threadedVu1Executor
+        ->submitResultlessResolvingSpeculation(
             Vu1CommandPayload{
                 Vu1DecodedUnpackBatchCommand{batch}},
             barrier.resolution,
             currentEeTick().raw(),
             m_vu1ExecutionTiming.generation);
-    if (result.disposition !=
-        Vu1CommandDisposition::Completed)
-    {
-        throw std::runtime_error(
-            "VU1 command rejected: decoded-unpack batch");
-    }
-    const auto *const vifState =
-        std::get_if<Vu1VifStateResult>(&result.payload);
-    if (!vifState ||
-        (expectedVifState &&
-         vifState->state != *expectedVifState))
-    {
-        throw std::logic_error(
-            "batched VU1 UNPACK changed parser-visible VIF state");
-    }
-    publishVu1CommandResult(result);
+    // Admission is sufficient because this path contains only row-stable
+    // UNPACKs. A later observation command drains the ordered prefix; mode-2
+    // ROW feedback never reaches this resultless path.
+    m_vu1MemoryMirrorDirty = true;
     finishVu1SynchronousCommandBarrier(barrier);
 }
 
@@ -6648,16 +6634,18 @@ void PS2Runtime::flushBatchedVu1VifStateUpdate()
     Vu1VifStateUpdateCommand command{
         *m_batchedVu1VifState};
     m_batchedVu1VifState.reset();
-    const Vu1CommandResult result =
-        submitVu1VifStateUpdateImmediate(
-        std::move(command), currentEeTick().raw(),
-        m_vu1ExecutionTiming.generation);
-    if (const auto *const vifState =
-            std::get_if<Vu1VifStateResult>(
-                &result.payload))
-    {
-        m_knownVu1VifState = vifState->state;
-    }
+    const Vu1SynchronousCommandBarrier barrier =
+        beginVu1SynchronousCommandBarrier();
+    (void)m_threadedVu1Executor
+        ->submitResultlessResolvingSpeculation(
+            Vu1CommandPayload{command},
+            barrier.resolution,
+            currentEeTick().raw(),
+            m_vu1ExecutionTiming.generation);
+    // The command's typed result is exactly the immutable input state, so EE
+    // can retain that parser-owned value without waiting for owner execution.
+    m_knownVu1VifState = command.state;
+    finishVu1SynchronousCommandBarrier(barrier);
 }
 
 bool PS2Runtime::isCurrentVu1PendingSlicePlan(
@@ -7260,6 +7248,56 @@ Vu1CommandResult PS2Runtime::submitVu1Command(
             payload);
         if (!foldedState)
             flushBatchedVu1VifStateUpdate();
+    }
+    const bool resultlessMemoryWrite =
+        m_vu1ExecutionMode ==
+            Vu1ExecutionMode::ThreadedAsync &&
+        (type == Vu1CommandType::MicroMemoryWrite ||
+         type == Vu1CommandType::DataMemoryWrite);
+    if (resultlessMemoryWrite)
+    {
+        uint64_t admittedCodeGeneration =
+            m_memory.getVU1CodeGeneration();
+        if (type == Vu1CommandType::MicroMemoryWrite)
+        {
+            if (admittedCodeGeneration ==
+                std::numeric_limits<uint64_t>::max())
+            {
+                throw std::overflow_error(
+                    "VU1 code generation exhausted");
+            }
+            ++admittedCodeGeneration;
+        }
+        const uint64_t payloadSize =
+            vu1CommandPayloadSize(payload);
+        const Vu1SynchronousCommandBarrier barrier =
+            beginVu1SynchronousCommandBarrier();
+        const Vu1CommandAdmission admission =
+            m_threadedVu1Executor
+                ->submitResultlessResolvingSpeculation(
+                    std::move(payload),
+                    barrier.resolution,
+                    guestTick, publicationToken);
+        m_vu1MemoryMirrorDirty = true;
+        finishVu1SynchronousCommandBarrier(barrier);
+        return Vu1CommandResult{
+            .identity = admission.identity,
+            .digest = {
+                .sequence = admission.identity.sequence,
+                .generation = admission.identity.generation,
+                .guestTick = admission.identity.guestTick,
+                .type = admission.type,
+                .payloadSize = payloadSize,
+            },
+            .ownerGeneration = admission.identity.generation,
+            .codeGeneration = admittedCodeGeneration,
+            .programCounter =
+                m_publishedVu1ProgramCounter.load(
+                    std::memory_order_acquire),
+            .active = m_publishedVu1Active.load(
+                std::memory_order_acquire),
+            .progress = vu1ProgressSnapshot(),
+        };
     }
     const Vu1SynchronousCommandBarrier barrier =
         beginVu1SynchronousCommandBarrier();

@@ -2939,6 +2939,21 @@ namespace
         {
         }
     }
+
+    bool supportsVu1ResultlessAdmission(
+        const Vu1CommandPayload &payload) noexcept
+    {
+        switch (vu1CommandType(payload))
+        {
+        case Vu1CommandType::MicroMemoryWrite:
+        case Vu1CommandType::DataMemoryWrite:
+        case Vu1CommandType::DecodedUnpack:
+        case Vu1CommandType::VifStateUpdate:
+            return true;
+        default:
+            return false;
+        }
+    }
 }
 
 ThreadedVu1Executor::ThreadedVu1Executor(
@@ -3047,38 +3062,19 @@ ThreadedVu1Executor::tryEnqueue(WorkItem &item)
 
 void ThreadedVu1Executor::signalWorkAvailable() noexcept
 {
-    uint64_t signals = m_workSignals.load(
-        std::memory_order_relaxed);
-    for (;;)
+    m_workNotificationCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (m_workSignals.exchange(
+            1u, std::memory_order_release) == 0u)
     {
-        if (signals == std::numeric_limits<uint64_t>::max())
-            std::terminate();
-        if (m_workSignals.compare_exchange_weak(
-                signals, signals + 1u,
-                std::memory_order_release,
-                std::memory_order_relaxed))
-        {
-            break;
-        }
+        m_workSignals.notify_one();
     }
-    m_workSignals.notify_one();
 }
 
 bool ThreadedVu1Executor::tryAcquireWorkSignal() noexcept
 {
-    uint64_t signals = m_workSignals.load(
-        std::memory_order_acquire);
-    while (signals != 0u)
-    {
-        if (m_workSignals.compare_exchange_weak(
-                signals, signals - 1u,
-                std::memory_order_acq_rel,
-                std::memory_order_acquire))
-        {
-            return true;
-        }
-    }
-    return false;
+    return m_workSignals.exchange(
+               0u, std::memory_order_acq_rel) != 0u;
 }
 
 void ThreadedVu1Executor::acquireWorkSignal() noexcept
@@ -3127,6 +3123,7 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
     bool beginsSpeculativeSlice,
     bool commitsExtendedSpeculativeAdvance,
     uint32_t speculativeExtensionCycles,
+    bool retainCompletion,
     uint64_t guestTick,
     uint64_t publicationToken)
 {
@@ -3260,8 +3257,12 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
         .speculativeExtensionCycles =
             speculativeExtensionCycles,
     };
-    std::future<Vu1CommandResult> completion =
-        item.completion.get_future();
+    std::future<Vu1CommandResult> completion;
+    if (retainCompletion)
+    {
+        item.completion.emplace();
+        completion = item.completion->get_future();
+    }
 
     bool countedBlock = false;
     std::chrono::steady_clock::time_point blockedAt{};
@@ -3384,8 +3385,30 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsync(
     return submitAsyncImpl(
         std::move(payload),
         Vu1SpeculationResolution::None,
-        false, false, 0u,
+        false, false, 0u, true,
         guestTick, publicationToken);
+}
+
+Vu1CommandAdmission ThreadedVu1Executor::submitResultless(
+    Vu1CommandPayload payload,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    if (!supportsVu1ResultlessAdmission(payload))
+    {
+        throw std::invalid_argument(
+            "response-producing VU1 command requires a completion");
+    }
+    Vu1CommandSubmission submission = submitAsyncImpl(
+        std::move(payload),
+        Vu1SpeculationResolution::None,
+        false, false, 0u, false,
+        guestTick, publicationToken);
+    return {
+        .ticket = submission.ticket(),
+        .identity = submission.identity(),
+        .type = submission.type(),
+    };
 }
 
 Vu1CommandSubmission
@@ -3397,7 +3420,7 @@ ThreadedVu1Executor::submitSpeculativeAdvance(
 {
     return submitAsyncImpl(
         Vu1CommandPayload{command},
-        previousResolution, true, false, 0u,
+        previousResolution, true, false, 0u, true,
         guestTick, publicationToken);
 }
 
@@ -3410,8 +3433,31 @@ ThreadedVu1Executor::submitResolvingSpeculation(
 {
     return wait(submitAsyncImpl(
         std::move(payload), resolution, false,
-        false, 0u,
+        false, 0u, true,
         guestTick, publicationToken));
+}
+
+Vu1CommandAdmission
+ThreadedVu1Executor::submitResultlessResolvingSpeculation(
+    Vu1CommandPayload payload,
+    Vu1SpeculationResolution resolution,
+    uint64_t guestTick,
+    uint64_t publicationToken)
+{
+    if (!supportsVu1ResultlessAdmission(payload))
+    {
+        throw std::invalid_argument(
+            "response-producing VU1 command requires a completion");
+    }
+    Vu1CommandSubmission submission = submitAsyncImpl(
+        std::move(payload), resolution, false,
+        false, 0u, false,
+        guestTick, publicationToken);
+    return {
+        .ticket = submission.ticket(),
+        .identity = submission.identity(),
+        .type = submission.type(),
+    };
 }
 
 Vu1CommandResult
@@ -3424,7 +3470,7 @@ ThreadedVu1Executor::commitExtendedSpeculativeAdvance(
     return wait(submitAsyncImpl(
         Vu1CommandPayload{publishedCommand},
         Vu1SpeculationResolution::None,
-        false, true, extensionCycles,
+        false, true, extensionCycles, true,
         guestTick, publicationToken));
 }
 
@@ -3545,7 +3591,8 @@ void ThreadedVu1Executor::cancelQueued(
     {
         try
         {
-            item->completion.set_exception(reason);
+            if (item->completion)
+                item->completion->set_exception(reason);
         }
         catch (...)
         {
@@ -3573,22 +3620,50 @@ void ThreadedVu1Executor::workerMain() noexcept
         recordFatalFailure(std::current_exception());
     }
 
+    bool drainingReadyRun = false;
     for (;;)
     {
-        if (!tryAcquireWorkSignal())
+        if (!drainingReadyRun)
         {
-            const auto idleAt =
-                std::chrono::steady_clock::now();
-            acquireWorkSignal();
-            const uint64_t idleNanoseconds =
-                static_cast<uint64_t>(
-                    std::chrono::duration_cast<
-                        std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - idleAt)
-                        .count());
-            m_workerIdleNanoseconds.fetch_add(
-                idleNanoseconds, std::memory_order_relaxed);
+            const bool lifecycleRequested =
+                m_cancelRequested.load(
+                    std::memory_order_acquire) ||
+                m_drainRequested.load(
+                    std::memory_order_acquire);
+            if (m_queue.empty() && !lifecycleRequested &&
+                !tryAcquireWorkSignal())
+            {
+                const auto idleAt =
+                    std::chrono::steady_clock::now();
+                acquireWorkSignal();
+                const uint64_t idleNanoseconds =
+                    static_cast<uint64_t>(
+                        std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - idleAt)
+                            .count());
+                m_workerIdleNanoseconds.fetch_add(
+                    idleNanoseconds, std::memory_order_relaxed);
+                m_workerWakeCount.fetch_add(
+                    1u, std::memory_order_relaxed);
+            }
+            else
+            {
+                // Queue state and lifecycle requests are authoritative even
+                // when an earlier ready run consumed their coalesced signal.
+                (void)tryAcquireWorkSignal();
+            }
+            m_workerDrainCount.fetch_add(
+                1u, std::memory_order_relaxed);
         }
+        else
+        {
+            // Commands admitted while the owner was active leave one latched
+            // notification. Clear it while continuing the same ready run;
+            // the queue itself is the authoritative work source.
+            (void)tryAcquireWorkSignal();
+        }
+        drainingReadyRun = false;
 
         if (m_cancelRequested.load(std::memory_order_acquire))
         {
@@ -3628,7 +3703,8 @@ void ThreadedVu1Executor::workerMain() noexcept
             {
                 const std::exception_ptr reason =
                     makeVu1ExecutorCancellation();
-                item->completion.set_exception(reason);
+                if (item->completion)
+                    item->completion->set_exception(reason);
                 releasePayload(item->payloadBytes);
                 m_completedTickets.store(
                     item->ticket, std::memory_order_release);
@@ -3733,7 +3809,8 @@ void ThreadedVu1Executor::workerMain() noexcept
             m_completedCommandsByType[
                 vu1CommandTypeIndex(commandType)]
                 .fetch_add(1u, std::memory_order_relaxed);
-            item->completion.set_value(std::move(result));
+            if (item->completion)
+                item->completion->set_value(std::move(result));
             releasePayload(item->payloadBytes);
         }
         catch (...)
@@ -3742,7 +3819,8 @@ void ThreadedVu1Executor::workerMain() noexcept
                 std::current_exception();
             try
             {
-                item->completion.set_exception(failure);
+                if (item->completion)
+                    item->completion->set_exception(failure);
             }
             catch (...)
             {
@@ -3771,6 +3849,7 @@ void ThreadedVu1Executor::workerMain() noexcept
                     .count());
         m_workerActiveNanoseconds.fetch_add(
             activeNanoseconds, std::memory_order_relaxed);
+        drainingReadyRun = !m_queue.empty();
     }
 
     {
@@ -3868,6 +3947,13 @@ ThreadedVu1Executor::statistics() const
         .workerIdleNanoseconds =
             m_workerIdleNanoseconds.load(
                 std::memory_order_acquire),
+        .workNotificationCount =
+            m_workNotificationCount.load(
+                std::memory_order_acquire),
+        .workerWakeCount = m_workerWakeCount.load(
+            std::memory_order_acquire),
+        .workerDrainCount = m_workerDrainCount.load(
+            std::memory_order_acquire),
         .resultWaitCount = m_resultWaitCount.load(
             std::memory_order_acquire),
         .resultWaitNanoseconds =

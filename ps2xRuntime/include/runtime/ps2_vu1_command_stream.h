@@ -802,6 +802,9 @@ struct ThreadedVu1ExecutorStatistics
     uint64_t producerPayloadWaitNanoseconds = 0u;
     uint64_t workerActiveNanoseconds = 0u;
     uint64_t workerIdleNanoseconds = 0u;
+    uint64_t workNotificationCount = 0u;
+    uint64_t workerWakeCount = 0u;
+    uint64_t workerDrainCount = 0u;
     uint64_t resultWaitCount = 0u;
     uint64_t resultWaitNanoseconds = 0u;
     uint64_t submittedDecodedUnpackOperations = 0u;
@@ -816,6 +819,17 @@ struct ThreadedVu1ExecutorStatistics
     bool drainRequested = false;
     bool cancelRequested = false;
     bool failed = false;
+};
+
+// A resultless admission proves that immutable command input was accepted by
+// the bounded owner stream. It deliberately carries no future: callers which
+// need to observe owner state must submit a later response-producing command,
+// whose FIFO completion covers every preceding admission.
+struct Vu1CommandAdmission
+{
+    uint64_t ticket = 0u;
+    Vu1WorkIdentity identity{};
+    Vu1CommandType type = Vu1CommandType::Barrier;
 };
 
 class Vu1CommandSubmission
@@ -878,12 +892,22 @@ public:
         Vu1CommandPayload payload,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u);
+    [[nodiscard]] Vu1CommandAdmission submitResultless(
+        Vu1CommandPayload payload,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
     [[nodiscard]] Vu1CommandSubmission submitSpeculativeAdvance(
         Vu1AdvanceSliceCommand command,
         Vu1SpeculationResolution previousResolution,
         uint64_t guestTick = 0u,
         uint64_t publicationToken = 0u);
     [[nodiscard]] Vu1CommandResult submitResolvingSpeculation(
+        Vu1CommandPayload payload,
+        Vu1SpeculationResolution resolution,
+        uint64_t guestTick = 0u,
+        uint64_t publicationToken = 0u);
+    [[nodiscard]] Vu1CommandAdmission
+    submitResultlessResolvingSpeculation(
         Vu1CommandPayload payload,
         Vu1SpeculationResolution resolution,
         uint64_t guestTick = 0u,
@@ -932,7 +956,7 @@ private:
         bool beginsSpeculativeSlice = false;
         bool commitsExtendedSpeculativeAdvance = false;
         uint32_t speculativeExtensionCycles = 0u;
-        std::promise<Vu1CommandResult> completion;
+        std::optional<std::promise<Vu1CommandResult>> completion;
     };
 
     struct ProducerSpeculationCheckpoint
@@ -951,6 +975,7 @@ private:
         bool beginsSpeculativeSlice,
         bool commitsExtendedSpeculativeAdvance,
         uint32_t speculativeExtensionCycles,
+        bool retainCompletion,
         uint64_t guestTick,
         uint64_t publicationToken);
     void ensureStarted();
@@ -1011,6 +1036,9 @@ private:
     std::atomic<uint64_t> m_producerPayloadWaitNanoseconds{0u};
     std::atomic<uint64_t> m_workerActiveNanoseconds{0u};
     std::atomic<uint64_t> m_workerIdleNanoseconds{0u};
+    std::atomic<uint64_t> m_workNotificationCount{0u};
+    std::atomic<uint64_t> m_workerWakeCount{0u};
+    std::atomic<uint64_t> m_workerDrainCount{0u};
     std::atomic<uint64_t> m_resultWaitCount{0u};
     std::atomic<uint64_t> m_resultWaitNanoseconds{0u};
     std::atomic<uint64_t>
