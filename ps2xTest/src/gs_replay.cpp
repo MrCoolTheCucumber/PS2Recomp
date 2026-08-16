@@ -76,6 +76,7 @@ namespace
                "[--vulkan-min-hybrid-source-copy-alpha-pixels COUNT] "
                "[--vulkan-min-hybrid-source-over-pixels COUNT] "
                "[--vulkan-min-hybrid-depth-ct32-pixels COUNT] "
+               "[--vulkan-min-hybrid-aliased-depth-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-alpha-fail-depth-run-pixels COUNT] "
                "[--vulkan-min-hybrid-nearest-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-linear-ct32-pixels COUNT] "
@@ -1080,6 +1081,8 @@ int main(int argc, char **argv)
             argument == "--vulkan-min-hybrid-source-over-pixels" ||
             argument == "--vulkan-min-hybrid-depth-ct32-pixels" ||
             argument ==
+                "--vulkan-min-hybrid-aliased-depth-ct32-pixels" ||
+            argument ==
                 "--vulkan-min-hybrid-alpha-fail-depth-run-pixels" ||
             argument == "--vulkan-min-hybrid-nearest-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-linear-ct32-pixels" ||
@@ -1224,6 +1227,26 @@ int main(int argc, char **argv)
                 }
                 vulkanBackendConfig.minimumHybridDepthCt32SpritePixels =
                     minimum;
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument ==
+                     "--vulkan-min-hybrid-aliased-depth-ct32-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels = 2048ull * 2048ull;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid aliased depth CT32 pixel threshold "
+                           "must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig
+                    .minimumHybridAliasedDepthCt32SpritePixels = minimum;
                 vulkanOptionUsed = true;
                 replayOptionUsed = true;
                 gifReplayOptionUsed = true;

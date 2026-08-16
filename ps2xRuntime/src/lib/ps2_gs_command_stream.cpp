@@ -530,6 +530,7 @@ uint64_t gsCommandPayloadHash(
                 hashScalar(hash, value.backend.minimumHybridSourceCopyAlphaSpritePixels);
                 hashScalar(hash, value.backend.minimumHybridSourceOverSpritePixels);
                 hashScalar(hash, value.backend.minimumHybridDepthCt32SpritePixels);
+                hashScalar(hash, value.backend.minimumHybridAliasedDepthCt32SpritePixels);
                 hashScalar(hash, value.backend.minimumHybridFramebufferOnlyAlphaFailDepthCt32RunPixels);
                 hashScalar(hash, value.backend.minimumHybridNearestCt32SpritePixels);
                 hashScalar(hash, value.backend.minimumHybridLinearCt32SpritePixels);

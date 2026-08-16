@@ -31,6 +31,10 @@ struct GsVulkanRasterBackendConfig
     // Depth work includes one CT32 write plus an exact Z32/Z24 test/write. The
     // default is the conservative isolated-draw crossover across both formats.
     uint64_t minimumHybridDepthCt32SpritePixels = 262'144u;
+    // Exact CT32/Z24 framebuffer/depth overlays replace the just-written RGB
+    // while preserving source alpha. Zero admits this narrow class without a
+    // cost floor; the software path otherwise performs two writes per pixel.
+    uint64_t minimumHybridAliasedDepthCt32SpritePixels = 0u;
     // Framebuffer-only alpha-fail draws perform no depth I/O and are commonly
     // emitted as compatible runs. Admission therefore uses aggregate run work
     // so one resident submission can amortize its queue and fence overhead.

@@ -508,6 +508,9 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
 // source-over use their literal operation values. FIXED_ALPHA additionally
 // stores FIX in bits 8..15 and optional CT32 DATE/DATM state in bits 16..17.
 // Every operation writes source alpha; alpha blending only changes RGB.
+// An exact CT32/Z24 framebuffer/depth overlay is valid only for ALWAYS plus
+// an enabled packed-depth write. In that case Z24 replaces the color RGB and
+// preserves the alpha byte written immediately before it.
 inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_COPY = 0u;
 inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER = 1u;
 inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA = 2u;

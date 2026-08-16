@@ -3715,6 +3715,43 @@ void register_ps2_gs_vulkan_tests()
                     0x01020304u, 7u),
                 GsFallbackReason::ResourceAlias,
                 "framebuffer/depth aliases should remain outside the independent kernel");
+
+            const GsDrawCommand aliasBase =
+                makeDepthCt32SpriteCommand(
+                    27u, 216u, 4u, 216u, GS_PSM_Z24, false, 1u,
+                    {0u, 255u, 0u, 126u}, {0u, 0u},
+                    0u, 0u, 256u * 16u, 127u * 16u,
+                    0xA4000000u, 0u);
+            GSContext aliasContext = aliasBase.context();
+            aliasContext.test |= 3u; // ATE=1, ATST=ALWAYS.
+            const GsDrawCommand exactAlias = buildGsDrawCommand(
+                27u,
+                aliasBase.primitive(),
+                aliasContext,
+                std::span<const GSVertex>(aliasBase.vertices()).first(2u),
+                aliasBase.globalState());
+            t.IsTrue(exactAlias.resources().framebufferDepthAlias,
+                     "the captured CT32/Z24 layout should name its shared surface");
+            const GsBackendDecision aliasDecision =
+                prepareGsVulkanDepthCt32Sprite(exactAlias, sprite);
+            t.IsTrue(aliasDecision.supported,
+                     "an ALWAYS CT32/Z24 write to the exact same surface should be eligible");
+            t.Equals(sprite.framebufferBaseBlock, sprite.depthBaseBlock,
+                     "the prepared alias record should retain one exact base");
+            t.Equals(sprite.depthPsm, static_cast<uint32_t>(GS_PSM_Z24),
+                     "the exact overlay must remain restricted to packed Z24");
+
+            std::vector<uint8_t> actual = makeVramPattern(0x414C4953u);
+            std::vector<uint8_t> expected = actual;
+            applyDepthCt32SpriteCpu(expected, sprite);
+            GS gs;
+            gs.init(actual.data(), static_cast<uint32_t>(actual.size()),
+                    nullptr);
+            gs.setDebugHistoryPaused(true);
+            drawNearestCt32SpriteCommand(gs, exactAlias);
+            gs.flushRenderBatch();
+            t.IsTrue(actual == expected,
+                     "the exact overlay record should match software over all VRAM");
         });
 
         tc.Run("source-copy alpha depth sprites reuse opaque depth records exactly", [](TestCase &t)
@@ -8488,6 +8525,22 @@ void register_ps2_gs_vulkan_tests()
                 makeAlphaBlendCommand(
                     retainedTitle, 39'111u,
                     0x8000000044ull, false, true);
+            const GsDrawCommand exactAliasBase =
+                makeDepthCt32SpriteCommand(
+                    39'112u, 216u, 4u, 216u,
+                    GS_PSM_Z24, false, 1u,
+                    {0u, 255u, 0u, 126u}, {0u, 0u},
+                    0u, 0u, 256u * 16u, 127u * 16u,
+                    0xA4000000u, 0u);
+            GSContext exactAliasContext = exactAliasBase.context();
+            exactAliasContext.test |= 3u; // ATE=1, ATST=ALWAYS.
+            const GsDrawCommand exactAlias = buildGsDrawCommand(
+                39'112u,
+                exactAliasBase.primitive(),
+                exactAliasContext,
+                std::span<const GSVertex>(
+                    exactAliasBase.vertices()).first(2u),
+                exactAliasBase.globalState());
             const std::array<GsDrawCommand, 5> admittedStates{{
                 atThreshold,
                 makeDepthCt32SpriteCommand(
@@ -8606,6 +8659,10 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(config.minimumHybridDepthCt32SpritePixels,
                      thresholdPixels,
                      "depth Hybrid should retain the measured default");
+            t.Equals(
+                config.minimumHybridAliasedDepthCt32SpritePixels,
+                0ull,
+                "exact packed overlays should retain their independent no-floor policy");
             std::unique_ptr<GsVulkanRasterBackend> backend =
                 GsVulkanRasterBackend::createWithExecutor(
                     std::make_unique<FakeCt32Executor>(
@@ -8637,6 +8694,8 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(backend->classify(sourceOverRetainedTitle).reason,
                      GsFallbackReason::CostModel,
                      "retained source-over should stay on CPU after measurement");
+            t.IsTrue(backend->classify(exactAlias).supported,
+                     "the exact packed overlay should use its independent policy");
             t.IsTrue(backend->classify(sourceOverAtThreshold).supported,
                      "measured source-over should meet the depth floor exactly");
             for (const GsDrawCommand &command : admittedStates)
@@ -18237,7 +18296,22 @@ void register_ps2_gs_vulkan_tests()
         tc.Run("Vulkan depth CT32 sprites match Z32 Z24 compare and packed writes", [](TestCase &t)
         {
             GSMem::InitLookupTables();
-            const std::array<GsDrawCommand, 6> commands{{
+            const GsDrawCommand aliasBase =
+                makeDepthCt32SpriteCommand(
+                    30'006u, 216u, 4u, 216u, GS_PSM_Z24,
+                    false, 1u,
+                    {0u, 255u, 0u, 126u}, {0u, 0u},
+                    0u, 0u, 256u * 16u, 127u * 16u,
+                    0xA4000000u, 0u);
+            GSContext aliasContext = aliasBase.context();
+            aliasContext.test |= 3u; // ATE=1, ATST=ALWAYS.
+            const GsDrawCommand exactAlias = buildGsDrawCommand(
+                30'006u,
+                aliasBase.primitive(),
+                aliasContext,
+                std::span<const GSVertex>(aliasBase.vertices()).first(2u),
+                aliasBase.globalState());
+            const std::array<GsDrawCommand, 7> commands{{
                 makeDepthCt32SpriteCommand(
                     30'000u, 511u, 1u, 200u, GS_PSM_Z24, false, 1u,
                     {1u, 16u, 2u, 13u}, {0u, 0u},
@@ -18268,6 +18342,7 @@ void register_ps2_gs_vulkan_tests()
                     {5u, 21u, 3u, 16u}, {0u, 0u},
                     81u, 49u, 353u, 273u,
                     0x60708090u, 0x80000100u),
+                exactAlias,
             }};
 
             std::vector<GsVulkanDepthCt32Sprite> sprites;
@@ -18429,7 +18504,10 @@ void register_ps2_gs_vulkan_tests()
             expectRejected(gpu, invalid, "invalid depth sprite write flag");
             invalid = sprites.front();
             invalid.depthBaseBlock = invalid.framebufferBaseBlock;
-            expectRejected(gpu, invalid, "aliased depth and color surfaces");
+            invalid.depthPsm = GS_PSM_Z32;
+            expectRejected(
+                gpu, invalid,
+                "non-packed aliased depth and color surfaces");
 
             const GsVulkanServiceStatistics statistics =
                 service->statistics();

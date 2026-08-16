@@ -1487,8 +1487,17 @@ GsBackendDecision GsVulkanRasterBackend::classify(
                     depthSprite.boundsX1 - depthSprite.boundsX0) *
                 static_cast<uint64_t>(
                     depthSprite.boundsY1 - depthSprite.boundsY0);
-            if (pixels <
-                m_impl->config.minimumHybridDepthCt32SpritePixels)
+            const bool exactPackedDepthOverlay =
+                depthSprite.framebufferBaseBlock ==
+                    depthSprite.depthBaseBlock &&
+                depthSprite.depthPsm == GS_PSM_Z24 &&
+                depthSprite.depthTestMethod == 1u &&
+                depthSprite.depthWrite == 1u;
+            const uint64_t minimumPixels = exactPackedDepthOverlay
+                ? m_impl->config
+                      .minimumHybridAliasedDepthCt32SpritePixels
+                : m_impl->config.minimumHybridDepthCt32SpritePixels;
+            if (pixels < minimumPixels)
             {
                 return {false, GsFallbackReason::CostModel};
             }

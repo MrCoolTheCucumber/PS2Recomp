@@ -126,7 +126,8 @@ namespace
     }
 
     const char *depthCt32SpriteShapeValidationError(
-        const GsVulkanDepthCt32Sprite &sprite) noexcept
+        const GsVulkanDepthCt32Sprite &sprite,
+        bool allowExactPackedDepthOverlay = false) noexcept
     {
         const bool usesDepth = sprite.depthTestMethod != 0u;
         if (sprite.framebufferBaseBlock > 0x3FFFu ||
@@ -192,8 +193,21 @@ namespace
                     sprite.boundsY0,
                     width,
                     height);
-            if (framebufferPages.intersects(depthPages))
+            // CT32 and Z24 use the same word layout. For an ALWAYS depth
+            // write to the exact same surface, the color exchange followed
+            // by the packed-Z CAS reproduces the GS color-then-depth order:
+            // Z24 replaces RGB while preserving the just-written alpha.
+            const bool exactPackedDepthOverlay =
+                allowExactPackedDepthOverlay &&
+                sprite.framebufferBaseBlock == sprite.depthBaseBlock &&
+                sprite.depthPsm == GS_PSM_Z24 &&
+                sprite.depthTestMethod == 1u &&
+                sprite.depthWrite == 1u;
+            if (framebufferPages.intersects(depthPages) &&
+                !exactPackedDepthOverlay)
+            {
                 return "Vulkan depth CT32 sprite framebuffer aliases depth";
+            }
         }
         return nullptr;
     }
@@ -228,7 +242,7 @@ namespace
         {
             return "Vulkan depth CT32 sprite has color parameters for a literal operation";
         }
-        return depthCt32SpriteShapeValidationError(sprite);
+        return depthCt32SpriteShapeValidationError(sprite, true);
     }
 
     struct DepthCt32SpriteAccessPages

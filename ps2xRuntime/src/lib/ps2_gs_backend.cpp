@@ -1199,6 +1199,7 @@ namespace
     enum class AliasRequirement : uint8_t
     {
         Disallowed,
+        DisallowedOrExactFramebufferDepthZ24,
         ExactFramebufferTextureFeedback,
     };
 
@@ -1256,7 +1257,8 @@ namespace
         AliasRequirement aliasRequirement =
             AliasRequirement::Disallowed,
         ShadingRequirement shadingRequirement =
-            ShadingRequirement::Flat) noexcept
+            ShadingRequirement::Flat,
+        bool allowAlwaysAlphaTest = false) noexcept
     {
         const GSPrimReg &primitive = command.primitive();
         const GSContext &context = command.context();
@@ -1343,7 +1345,9 @@ namespace
                 return {false, GsFallbackReason::AlphaTest};
             }
         }
-        else if ((context.test & 1u) != 0u)
+        else if ((context.test & 1u) != 0u &&
+                 !(allowAlwaysAlphaTest &&
+                   ((context.test >> 1u) & 0x7u) == 1u))
         {
             return {false, GsFallbackReason::AlphaTest};
         }
@@ -1517,6 +1521,24 @@ namespace
             if (!exactFeedbackSurface)
                 return {false, GsFallbackReason::ResourceAlias};
         }
+        else if (aliasRequirement ==
+                 AliasRequirement::DisallowedOrExactFramebufferDepthZ24)
+        {
+            const bool exactFramebufferDepthSurface =
+                resources.framebufferDepthAlias &&
+                !resources.framebufferTextureAlias &&
+                !resources.framebufferClutAlias &&
+                context.zbuf.zbp == context.frame.fbp &&
+                context.zbuf.psm == GS_PSM_Z24 &&
+                ((context.test >> 16u) & 1u) != 0u &&
+                ((context.test >> 17u) & 0x3u) == 1u &&
+                !context.zbuf.zmask;
+            if (resources.aliasesAnotherView() &&
+                !exactFramebufferDepthSurface)
+            {
+                return {false, GsFallbackReason::ResourceAlias};
+            }
+        }
         else if (resources.aliasesAnotherView())
         {
             return {false, GsFallbackReason::ResourceAlias};
@@ -1552,7 +1574,10 @@ GsBackendDecision classifyGsDepthCt32Sprite(
         command, GS_PRIM_SPRITE, 2u,
         TextureRequirement::Disabled,
         DepthRequirement::Z32OrZ24,
-        AlphaRequirement::DisabledOrSourceCopy);
+        AlphaRequirement::DisabledOrSourceCopy,
+        AliasRequirement::DisallowedOrExactFramebufferDepthZ24,
+        ShadingRequirement::Flat,
+        true);
 }
 
 GsBackendDecision classifyGsSourceOverDepthCt32Sprite(
