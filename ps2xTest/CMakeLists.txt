@@ -151,6 +151,11 @@ add_executable(ee_runtime_executor_tests
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
 
+add_executable(ee_scheduler_transition_tests
+    src/ee_scheduler_transition_test_main.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
 add_executable(ps2_gs_command_stream_tests
     src/ps2_gs_command_stream_test_main.cpp
     src/ps2_gs_command_stream_tests.cpp
@@ -176,6 +181,8 @@ target_link_libraries(ee_fiber_guard_probe PRIVATE
 )
 
 add_dependencies(ps2x_tests ee_fiber_guard_probe)
+add_dependencies(ee_scheduler_transition_tests
+    ee_fiber_guard_probe)
 target_compile_definitions(ps2_test_lib PRIVATE
     PS2X_TEST_EE_FIBER_GUARD_PROBE="$<TARGET_FILE:ee_fiber_guard_probe>"
 )
@@ -288,6 +295,13 @@ target_include_directories(ee_runtime_executor_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
 )
 
+target_include_directories(ee_scheduler_transition_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
+    ${CMAKE_SOURCE_DIR}/ps2xAnalyzer/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
 target_include_directories(ps2_gs_command_stream_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
@@ -306,6 +320,13 @@ target_link_libraries(ps2x_tests PRIVATE
 )
 
 target_link_libraries(ee_runtime_executor_tests PRIVATE
+    ps2_test_lib
+    ps2_recomp_lib
+    ps2_analyzer_lib
+    ps2_runtime
+)
+
+target_link_libraries(ee_scheduler_transition_tests PRIVATE
     ps2_test_lib
     ps2_recomp_lib
     ps2_analyzer_lib
@@ -402,6 +423,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     EnableFastReleaseMode(ps2_test_lib)
     EnableFastReleaseMode(ps2x_tests)
     EnableFastReleaseMode(ee_runtime_executor_tests)
+    EnableFastReleaseMode(ee_scheduler_transition_tests)
     EnableFastReleaseMode(ps2_gs_command_stream_tests)
     EnableFastReleaseMode(ps2_vu1_command_stream_tests)
     EnableFastReleaseMode(ee_timing_benchmark)
@@ -419,6 +441,7 @@ endif()
 ConfigureEeFcontextSuspendedFrames(ps2_test_lib)
 ConfigureEeFcontextSuspendedFrames(ps2x_tests)
 ConfigureEeFcontextSuspendedFrames(ee_runtime_executor_tests)
+ConfigureEeFcontextSuspendedFrames(ee_scheduler_transition_tests)
 ConfigureEeFcontextSuspendedFrames(ps2_gs_command_stream_tests)
 ConfigureEeFcontextSuspendedFrames(ps2_vu1_command_stream_tests)
 ConfigureEeFcontextSuspendedFrames(ee_fiber_guard_probe)

@@ -1221,6 +1221,7 @@ void register_ee_thread_scheduler_tests()
             EeSchedulerExecutor executor;
             ScriptedBoundaryHooks hooks;
             bool consequenceObservedTransition = false;
+            bool laterConsequencesObservedTransition = true;
             t.IsTrue(
                 scheduler.addRunningThread(1, 1u, 40) &&
                     scheduler.addDormantThread(2, 1u, 40) &&
@@ -1258,6 +1259,72 @@ void register_ee_thread_scheduler_tests()
                             "external wake could not start its target");
                     }
                 });
+            hooks.queue(
+                EeSchedulerConsequenceStage::
+                    AsynchronousWake,
+                [&laterConsequencesObservedTransition](
+                    EeThreadScheduler &target,
+                    ScriptedBoundaryHooks &targetHooks)
+                {
+                    laterConsequencesObservedTransition =
+                        laterConsequencesObservedTransition &&
+                        target.currentThreadId()
+                                .value_or(0) == 4 &&
+                        equals(
+                            target.readyOrder(40),
+                            {3, 1, 2});
+                    targetHooks.eventOrder.push_back(5);
+                });
+            hooks.queue(
+                EeSchedulerConsequenceStage::WaitTimeout,
+                [&laterConsequencesObservedTransition](
+                    EeThreadScheduler &target,
+                    ScriptedBoundaryHooks &targetHooks)
+                {
+                    laterConsequencesObservedTransition =
+                        laterConsequencesObservedTransition &&
+                        target.currentThreadId()
+                                .value_or(0) == 4 &&
+                        equals(
+                            target.readyOrder(40),
+                            {3, 1, 2});
+                    targetHooks.eventOrder.push_back(6);
+                });
+            hooks.queue(
+                EeSchedulerConsequenceStage::HardwareEvent,
+                [&laterConsequencesObservedTransition](
+                    EeThreadScheduler &target,
+                    ScriptedBoundaryHooks &targetHooks)
+                {
+                    laterConsequencesObservedTransition =
+                        laterConsequencesObservedTransition &&
+                        target.currentThreadId()
+                                .value_or(0) == 4 &&
+                        equals(
+                            target.readyOrder(40),
+                            {3, 1, 2});
+                    targetHooks.eventOrder.push_back(7);
+                });
+            hooks.queue(
+                EeSchedulerConsequenceStage::InterruptCause,
+                [&laterConsequencesObservedTransition](
+                    EeThreadScheduler &target,
+                    ScriptedBoundaryHooks &targetHooks)
+                {
+                    laterConsequencesObservedTransition =
+                        laterConsequencesObservedTransition &&
+                        target.currentThreadId()
+                                .value_or(0) == 4 &&
+                        equals(
+                            target.readyOrder(40),
+                            {3, 1, 2});
+                    targetHooks.eventOrder.push_back(8);
+                    if (!target.rotateReadyQueue(40))
+                    {
+                        throw std::logic_error(
+                            "interrupt consequence could not rotate its ready queue");
+                    }
+                });
 
             const EeSchedulerOwnerLocalTransition transition{
                 EeSchedulerOwnerLocalTransitionKind::
@@ -1282,23 +1349,40 @@ void register_ee_thread_scheduler_tests()
                 result.tick.raw() == 8u &&
                     result.ownerLocalTransitionsApplied ==
                         1u &&
-                    result.consequencesProcessed == 1u &&
+                    result.consequencesProcessed == 5u &&
                     result.contextPublications == 2u &&
                     result.selectedThreadId.value_or(0) ==
                         4,
-                "one boundary should apply one direct transition and then its queued external wake");
+                "one boundary should apply one direct transition before all queued external consequence stages");
             t.IsTrue(
                 consequenceObservedTransition &&
+                    laterConsequencesObservedTransition &&
                     equals(
                         hooks.publishedThreads,
                         {2, 4}) &&
                     hooks.eventOrder ==
-                        std::vector<int>({1, 2, 3, 4, 2}),
-                "commit and the transition-selected context must precede the external consequence");
+                        std::vector<int>({
+                            1, 2, 3, 4, 2, 3, 5,
+                            3, 6, 3, 7, 3, 8}) &&
+                    hooks.appliedStages ==
+                        std::vector<
+                            EeSchedulerConsequenceStage>({
+                            EeSchedulerConsequenceStage::
+                                AsynchronousWake,
+                            EeSchedulerConsequenceStage::
+                                AsynchronousWake,
+                            EeSchedulerConsequenceStage::
+                                WaitTimeout,
+                            EeSchedulerConsequenceStage::
+                                HardwareEvent,
+                            EeSchedulerConsequenceStage::
+                                InterruptCause,
+                        }),
+                "commit and the transition-selected context must precede queued wake, timeout, hardware, and interrupt consequences");
             t.IsTrue(
                 equals(
                     scheduler.readyOrder(40),
-                    {3, 1, 2}) &&
+                    {1, 2, 3}) &&
                     executor.statistics()
                             .ownerLocalTransitionsApplied ==
                         1u &&
@@ -1410,6 +1494,47 @@ void register_ee_thread_scheduler_tests()
                 staleRejected = true;
             }
 
+            EeThreadScheduler recycledScheduler;
+            EeSchedulerExecutor recycledExecutor;
+            ScriptedBoundaryHooks recycledHooks;
+            t.IsTrue(
+                recycledScheduler.addRunningThread(
+                    1, 1u, 40),
+                "the recycled transition fixture should create its first generation");
+            const EeSchedulerThreadHandle recycledStale =
+                recycledScheduler.threadHandle(1)
+                    .value_or(EeSchedulerThreadHandle{});
+            t.IsTrue(
+                recycledScheduler.terminateThread(
+                    recycledStale) &&
+                    recycledScheduler.deleteThread(
+                        recycledStale) &&
+                    recycledScheduler.addRunningThread(
+                        1, 2u, 40),
+                "termination and deletion should permit a replacement numeric ID with a new generation");
+            EeSchedulerOwnerLocalTransition recycled =
+                transition;
+            recycled.originatingThread = recycledStale;
+            bool recycledRejected = false;
+            try
+            {
+                static_cast<void>(
+                    recycledExecutor.processBoundary(
+                        recycledScheduler,
+                        recycledHooks,
+                        EeSchedulerBoundaryInput{
+                            1,
+                            ps2x::timing::
+                                eeTickDeltaFromRaw(9u),
+                            EeSchedulerReschedulePolicy::None,
+                            recycled,
+                        }));
+            }
+            catch (const std::logic_error &)
+            {
+                recycledRejected = true;
+            }
+
             bool wrongOwnerRejected = false;
             std::thread wrongOwner([&]()
             {
@@ -1432,11 +1557,22 @@ void register_ee_thread_scheduler_tests()
             });
             wrongOwner.join();
             t.IsTrue(
-                staleRejected && wrongOwnerRejected &&
+                staleRejected && recycledRejected &&
+                    wrongOwnerRejected &&
                     rejectedExecutor.now().raw() == 0u &&
                     rejectedHooks.commits.empty() &&
-                    rejectedScheduler.validate(),
-                "stale handles and non-owner boundary calls must fail deterministically without partial application");
+                    recycledExecutor.now().raw() == 0u &&
+                    recycledHooks.commits.empty() &&
+                    recycledScheduler.threadHandle(1)
+                            .value_or(
+                                EeSchedulerThreadHandle{}) ==
+                        EeSchedulerThreadHandle{1, 2u} &&
+                    recycledExecutor.statistics()
+                            .ownerLocalTransitionsApplied ==
+                        0u &&
+                    rejectedScheduler.validate() &&
+                    recycledScheduler.validate(),
+                "stale and recycled handles plus non-owner boundary calls must fail deterministically without partial application");
         });
 
         tc.Run("executor rejects recursion and bounds consequence storms", [](TestCase &t)
@@ -1575,17 +1711,32 @@ void register_ee_thread_scheduler_tests()
             t.IsTrue(
                 scheduler.addRunningThread(1, 1u, 40),
                 "the debugger fixture should have one selected guest");
+            const EeSchedulerOwnerLocalTransition transition{
+                EeSchedulerOwnerLocalTransitionKind::
+                    RotateReadyQueue,
+                {1, 1u},
+                40,
+                EeSchedulerReschedulePolicy::
+                    EqualOrHigherPriority,
+            };
+            const auto processTransitionBoundary =
+                [&]()
+                {
+                    return executor.processBoundary(
+                        scheduler,
+                        hooks,
+                        EeSchedulerBoundaryInput{
+                            1,
+                            ps2x::timing::
+                                eeTickDeltaFromRaw(1u),
+                            EeSchedulerReschedulePolicy::None,
+                            transition,
+                        });
+                };
 
             executor.debugRequestPause();
             const EeSchedulerBoundaryResult paused =
-                executor.processBoundary(
-                    scheduler,
-                    hooks,
-                    1,
-                    ps2x::timing::
-                        eeTickDeltaFromRaw(1u),
-                    EeSchedulerReschedulePolicy::
-                        HigherPriorityOnly);
+                processTransitionBoundary();
             t.IsTrue(
                 paused.disposition ==
                         EeSchedulerExecutorDisposition::
@@ -1606,14 +1757,7 @@ void register_ee_thread_scheduler_tests()
                 });
             const EeSchedulerBoundaryResult
                 consequencePause =
-                    executor.processBoundary(
-                        scheduler,
-                        hooks,
-                        1,
-                        ps2x::timing::
-                            eeTickDeltaFromRaw(1u),
-                        EeSchedulerReschedulePolicy::
-                            HigherPriorityOnly);
+                    processTransitionBoundary();
             t.IsTrue(
                 consequencePause.consequencesProcessed ==
                         1u &&
@@ -1627,23 +1771,9 @@ void register_ee_thread_scheduler_tests()
                 executor.debugStepBoundaries(2u),
                 "a positive debugger step should arm the executor");
             const EeSchedulerBoundaryResult stepOne =
-                executor.processBoundary(
-                    scheduler,
-                    hooks,
-                    1,
-                    ps2x::timing::
-                        eeTickDeltaFromRaw(1u),
-                    EeSchedulerReschedulePolicy::
-                        HigherPriorityOnly);
+                processTransitionBoundary();
             const EeSchedulerBoundaryResult stepTwo =
-                executor.processBoundary(
-                    scheduler,
-                    hooks,
-                    1,
-                    ps2x::timing::
-                        eeTickDeltaFromRaw(1u),
-                    EeSchedulerReschedulePolicy::
-                        HigherPriorityOnly);
+                processTransitionBoundary();
             t.IsTrue(
                 stepOne.disposition ==
                         EeSchedulerExecutorDisposition::
@@ -1660,25 +1790,11 @@ void register_ee_thread_scheduler_tests()
             executor.debugResume();
             executor.debugRequestStop();
             const EeSchedulerBoundaryResult stopped =
-                executor.processBoundary(
-                    scheduler,
-                    hooks,
-                    1,
-                    ps2x::timing::
-                        eeTickDeltaFromRaw(1u),
-                    EeSchedulerReschedulePolicy::
-                        HigherPriorityOnly);
+                processTransitionBoundary();
             executor.debugResume();
             const EeSchedulerBoundaryResult
                 stillStopped =
-                    executor.processBoundary(
-                        scheduler,
-                        hooks,
-                        1,
-                        ps2x::timing::
-                            eeTickDeltaFromRaw(1u),
-                        EeSchedulerReschedulePolicy::
-                            HigherPriorityOnly);
+                    processTransitionBoundary();
             t.IsTrue(
                 stopped.disposition ==
                         EeSchedulerExecutorDisposition::
@@ -1696,8 +1812,11 @@ void register_ee_thread_scheduler_tests()
                     executor.statistics().
                             stoppedBoundaries == 2u &&
                     executor.statistics().
-                            completedDebugSteps == 1u,
-                "debugger decisions should be counted only when the executor applies a boundary");
+                            completedDebugSteps == 1u &&
+                    executor.statistics().
+                            ownerLocalTransitionsApplied ==
+                        6u,
+                "debugger decisions should be counted only after each direct transition boundary is applied");
 
             executor.reset();
             t.IsTrue(
