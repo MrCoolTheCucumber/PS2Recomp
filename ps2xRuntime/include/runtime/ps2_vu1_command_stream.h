@@ -1173,6 +1173,7 @@ private:
     void signalWorkAvailable() noexcept;
     [[nodiscard]] bool tryAcquireWorkSignal() noexcept;
     void acquireWorkSignal() noexcept;
+    void waitForSpaceChange(uint64_t spaceEpoch) noexcept;
     void signalSpaceAvailable() noexcept;
     void closeAdmissionAndQuiesceProducer() noexcept;
     void workerMain() noexcept;
@@ -1209,6 +1210,7 @@ private:
     std::atomic<bool> m_cancelRequested{false};
     std::atomic<uint64_t> m_workSignals{0u};
     std::atomic<uint64_t> m_spaceEpoch{0u};
+    std::atomic<bool> m_spaceWaitRequired{false};
     std::atomic<uint64_t> m_minimumAcceptedGeneration{1u};
     std::atomic<uint64_t> m_queuedPayloadBytes{0u};
     std::atomic<size_t> m_queueHighWater{0u};

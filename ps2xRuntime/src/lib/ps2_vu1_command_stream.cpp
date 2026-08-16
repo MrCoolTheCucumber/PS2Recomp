@@ -3454,13 +3454,32 @@ void ThreadedVu1Executor::acquireWorkSignal() noexcept
     }
 }
 
+void ThreadedVu1Executor::waitForSpaceChange(
+    uint64_t spaceEpoch) noexcept
+{
+    // Admission is serialized by m_submitMutex, so at most one producer can
+    // wait here. Publish that wait before sleeping. The space epoch still
+    // advances on every release: if a release raced ahead of this flag, wait
+    // observes the changed epoch and returns without requiring a notification.
+    m_spaceWaitRequired.store(
+        true, std::memory_order_seq_cst);
+    m_spaceEpoch.wait(
+        spaceEpoch, std::memory_order_seq_cst);
+    m_spaceWaitRequired.store(
+        false, std::memory_order_seq_cst);
+}
+
 void ThreadedVu1Executor::signalSpaceAvailable() noexcept
 {
     const uint64_t prior = m_spaceEpoch.fetch_add(
-        1u, std::memory_order_release);
+        1u, std::memory_order_seq_cst);
     if (prior == std::numeric_limits<uint64_t>::max())
         std::terminate();
-    m_spaceEpoch.notify_all();
+    if (m_spaceWaitRequired.load(
+            std::memory_order_seq_cst))
+    {
+        m_spaceEpoch.notify_one();
+    }
 }
 
 void ThreadedVu1Executor::closeAdmissionAndQuiesceProducer() noexcept
@@ -3695,8 +3714,7 @@ Vu1CommandSubmission ThreadedVu1Executor::submitAsyncImpl(
         }
 
         const auto waitAt = std::chrono::steady_clock::now();
-        m_spaceEpoch.wait(
-            spaceEpoch, std::memory_order_acquire);
+        waitForSpaceChange(spaceEpoch);
         const uint64_t waitNanoseconds =
             static_cast<uint64_t>(
                 std::chrono::duration_cast<
@@ -3905,8 +3923,7 @@ Vu1ExecutionEpoch ThreadedVu1Executor::submitExecutionEpoch(
             throwSubmissionUnavailable();
         }
         const auto waitAt = std::chrono::steady_clock::now();
-        m_spaceEpoch.wait(
-            spaceEpoch, std::memory_order_acquire);
+        waitForSpaceChange(spaceEpoch);
         const uint64_t waitNanoseconds =
             static_cast<uint64_t>(
                 std::chrono::duration_cast<
