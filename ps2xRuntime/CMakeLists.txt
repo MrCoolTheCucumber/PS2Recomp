@@ -121,6 +121,17 @@ option(PS2X_ENABLE_DEBUG_SERVER
 option(PS2X_ENABLE_DEBUG_UI
     "Build the embedded ImGui runtime debugger panel"
     OFF)
+option(PS2X_ENABLE_PERF_HUD
+    "Build the separate Linux performance HUD opened with F12"
+    OFF)
+
+if(PS2X_ENABLE_PERF_HUD AND
+   NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+        NOT PS2X_IS_ANDROID AND
+        NOT PS2X_IS_VITA))
+    message(FATAL_ERROR
+        "PS2X_ENABLE_PERF_HUD currently supports Linux desktop builds only")
+endif()
 
 set(PS2X_EE_FCONTEXT_PLATFORM_SUPPORTED OFF)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8
@@ -293,7 +304,7 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
-    if(PS2X_ENABLE_DEBUG_SERVER)
+    if(PS2X_ENABLE_DEBUG_SERVER OR PS2X_ENABLE_PERF_HUD)
         FetchContent_Declare(
             rapidjson
             GIT_REPOSITORY https://github.com/Tencent/rapidjson.git
@@ -307,7 +318,8 @@ else()
         endif()
     endif()
 
-    if(NOT PS2X_IS_ANDROID AND PS2X_ENABLE_DEBUG_UI)
+    if(NOT PS2X_IS_ANDROID AND
+       (PS2X_ENABLE_DEBUG_UI OR PS2X_ENABLE_PERF_HUD))
     FetchContent_Declare(
         imgui
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -350,7 +362,21 @@ else()
     )
     target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
     target_link_libraries(rlImGui PUBLIC raylib imgui)
-    endif() # NOT PS2X_IS_ANDROID AND PS2X_ENABLE_DEBUG_UI
+    endif() # desktop ImGui consumers
+endif()
+
+if(PS2X_ENABLE_PERF_HUD)
+    add_library(ps2_performance_telemetry STATIC
+        src/lib/ps2_performance_telemetry.cpp
+        src/lib/ps2_performance_threads_linux.cpp
+    )
+    target_compile_features(ps2_performance_telemetry PUBLIC cxx_std_20)
+    target_include_directories(ps2_performance_telemetry
+        PUBLIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        PRIVATE
+            "${rapidjson_SOURCE_DIR}/include"
+    )
 endif()
 
 add_library(ps2_host_backend INTERFACE)
@@ -800,6 +826,22 @@ else()
     )
 endif()
 
+if(PS2X_ENABLE_PERF_HUD)
+    target_sources(ps2_runtime PRIVATE
+        src/lib/ps2_performance_hud.cpp
+    )
+    target_link_libraries(ps2_runtime PRIVATE
+        ps2_performance_telemetry
+    )
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_PERF_HUD=1
+    )
+else()
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_PERF_HUD=0
+    )
+endif()
+
 # Tests and interactive debugger surfaces exercise the diagnostic APIs. A
 # production runtime can opt in explicitly, but otherwise should not pay for
 # dormant atomics and out-of-line trace probes at every EE/VU/GS boundary.
@@ -1030,6 +1072,31 @@ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
 endif()
 
+if(PS2X_ENABLE_PERF_HUD)
+    add_executable(ps2DebugHud
+        src/perf_hud/ps2_debug_hud.cpp
+    )
+    target_compile_features(ps2DebugHud PRIVATE cxx_std_20)
+    target_link_libraries(ps2DebugHud PRIVATE
+        ps2_performance_telemetry
+        rlImGui
+        imgui
+        raylib
+    )
+    add_dependencies(ps2EntryRunner ps2DebugHud)
+
+    if(PS2X_BUILD_TEST)
+        add_executable(ps2_performance_telemetry_tests
+            src/perf_hud/ps2_performance_telemetry_tests.cpp
+        )
+        target_compile_features(
+            ps2_performance_telemetry_tests PRIVATE cxx_std_20)
+        target_link_libraries(ps2_performance_telemetry_tests PRIVATE
+            ps2_performance_telemetry
+        )
+    endif()
+endif()
+
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
 
 if(PS2X_IS_VITA)
@@ -1067,6 +1134,15 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_runtime)
     EnableFastReleaseMode(ps2EntryRunner)
+    if(TARGET ps2_performance_telemetry)
+        EnableFastReleaseMode(ps2_performance_telemetry)
+    endif()
+    if(TARGET ps2DebugHud)
+        EnableFastReleaseMode(ps2DebugHud)
+    endif()
+    if(TARGET ps2_performance_telemetry_tests)
+        EnableFastReleaseMode(ps2_performance_telemetry_tests)
+    endif()
 
     if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
         if(MSVC)
@@ -1113,6 +1189,12 @@ install(TARGETS ps2_runtime ps2EntryRunner
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
+
+if(TARGET ps2DebugHud)
+    install(TARGETS ps2DebugHud
+        RUNTIME DESTINATION bin
+    )
+endif()
 
 if(WIN32 AND PS2X_ENABLE_FFMPEG)
     install(DIRECTORY "${FFMPEG_BIN_DIR}/"

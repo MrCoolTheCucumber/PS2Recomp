@@ -58,6 +58,8 @@ namespace ps2x::iop
 class PS2IopHostAdapter;
 class PS2IopTransport;
 class PS2DebugServer;
+class PS2PerformanceHud;
+class PS2PerformanceHudImpl;
 struct HostPresentationUploadState;
 struct ThreadInfo;
 struct EeThreadRuntimeState;
@@ -2446,6 +2448,8 @@ public:
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
 
 private:
+    friend class PS2PerformanceHudImpl;
+
     void acknowledgeGuestPreemptionRequests() noexcept;
     [[nodiscard]] bool consumeGuestPreemptionRequest() noexcept;
     void startDedicatedEeExecution();
@@ -3067,6 +3071,7 @@ private:
     GsCommandProcessor m_gsCommandProcessor;
     std::unique_ptr<GsCommandExecutor> m_gsExecutor;
     ThreadedGsExecutor *m_threadedGsExecutor = nullptr;
+    GsExecutionMode m_gsExecutionMode = GsExecutionMode::Inline;
     bool m_gsAsyncEnabled = false;
     uint32_t m_gsMaximumFieldLead = 1u;
     size_t m_gsAsyncPendingLimit = 1u;
@@ -3658,6 +3663,9 @@ private:
     uint8_t *m_boundGSVram = nullptr;
 #if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
     std::unique_ptr<PS2DebugServer> m_debugServer;
+#endif
+#if defined(PS2X_ENABLE_PERF_HUD) && PS2X_ENABLE_PERF_HUD
+    std::unique_ptr<PS2PerformanceHud> m_performanceHud;
 #endif
     std::unique_ptr<ps2_stubs::MpegRuntimeState>
         m_mpegRuntimeState;

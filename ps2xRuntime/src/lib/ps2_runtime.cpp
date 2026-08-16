@@ -40,6 +40,9 @@
 #if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
 #include "runtime/ps2_debug_server.h"
 #endif
+#if defined(PS2X_ENABLE_PERF_HUD) && PS2X_ENABLE_PERF_HUD
+#include "ps2_performance_hud.h"
+#endif
 
 #include <iostream>
 #include <fstream>
@@ -1468,6 +1471,7 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         configuration.gsMaximumFieldLead;
     m_gsAsyncPendingLimit = std::max<size_t>(
         1u, configuration.gsCommandQueueCapacity + 2u);
+    m_gsExecutionMode = configuration.gsExecutionMode;
 
     switch (configuration.gsExecutionMode)
     {
@@ -2016,6 +2020,10 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+#if defined(PS2X_ENABLE_PERF_HUD) && PS2X_ENABLE_PERF_HUD
+        if (m_performanceHud)
+            m_performanceHud->stop();
+#endif
         if (m_eeRuntimeExecutor)
         {
             m_eeRuntimeExecutor->join();
@@ -9830,6 +9838,9 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
         m_debugServer = std::make_unique<PS2DebugServer>(*this);
         (void)m_debugServer->start();
+#endif
+#if defined(PS2X_ENABLE_PERF_HUD) && PS2X_ENABLE_PERF_HUD
+        m_performanceHud = std::make_unique<PS2PerformanceHud>(*this);
 #endif
         return true;
     }
@@ -18256,6 +18267,14 @@ void PS2Runtime::run()
                            std::memory_order_relaxed) >
                    0))
     {
+#if defined(PS2X_ENABLE_PERF_HUD) && PS2X_ENABLE_PERF_HUD
+        if (m_performanceHud)
+        {
+            m_performanceHud->update();
+            if (IsKeyPressed(KEY_F12))
+                m_performanceHud->toggle();
+        }
+#endif
         if (dedicatedExecutor &&
             m_eeExecutionBackend
                     ->managedThreadCount() == 0u)
@@ -18630,6 +18649,10 @@ void PS2Runtime::run()
         }
     }
 
+#if defined(PS2X_ENABLE_PERF_HUD) && PS2X_ENABLE_PERF_HUD
+    if (m_performanceHud)
+        m_performanceHud->stop();
+#endif
     UnloadTexture(frameTex);
     CloseWindow();
 
