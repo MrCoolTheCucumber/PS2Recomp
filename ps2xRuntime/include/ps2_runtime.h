@@ -2759,11 +2759,62 @@ private:
         bool operator==(
             const Vu1CoarseEstimatorIdentity &) const = default;
     };
+    static constexpr size_t
+        kVu1CoarseEstimatorMaximumHistoryCapacity = 64u;
+    static constexpr size_t kVu1CoarseEstimatorNoEntry =
+        std::numeric_limits<size_t>::max();
+    struct Vu1CoarseCycleHistory
+    {
+        std::array<
+            uint32_t,
+            kVu1CoarseEstimatorMaximumHistoryCapacity> cycles{};
+        size_t begin = 0u;
+        size_t count = 0u;
+
+        [[nodiscard]] bool empty() const noexcept
+        {
+            return count == 0u;
+        }
+
+        [[nodiscard]] size_t size() const noexcept
+        {
+            return count;
+        }
+
+        [[nodiscard]] uint32_t operator[](
+            size_t index) const noexcept
+        {
+            return cycles[
+                (begin + index) % cycles.size()];
+        }
+
+        void pushBack(uint32_t value, size_t capacity) noexcept
+        {
+            if (count < capacity)
+            {
+                cycles[(begin + count) % cycles.size()] = value;
+                ++count;
+                return;
+            }
+            cycles[(begin + count) % cycles.size()] = value;
+            begin = (begin + 1u) % cycles.size();
+        }
+
+        void clear() noexcept
+        {
+            begin = 0u;
+            count = 0u;
+        }
+    };
     struct Vu1CoarseEstimatorEntry
     {
         Vu1CoarseEstimatorIdentity identity{};
-        std::deque<uint32_t> cycleHistory;
+        Vu1CoarseCycleHistory cycleHistory{};
+        size_t olderEntry = kVu1CoarseEstimatorNoEntry;
+        size_t newerEntry = kVu1CoarseEstimatorNoEntry;
     };
+    void unlinkVu1CoarseEstimatorEntry(size_t index) noexcept;
+    void appendVu1CoarseEstimatorEntry(size_t index) noexcept;
     [[nodiscard]] Vu1CoarseEstimatorIdentity
     vu1CoarseEstimatorIdentity(
         const Vu1InvocationCommand &command) const;
@@ -3101,9 +3152,13 @@ private:
     };
     std::optional<Vu1PendingCoarseInvocation>
         m_pendingVu1CoarseInvocation;
-    std::deque<uint32_t> m_vu1CoarseCycleHistory;
-    std::deque<Vu1CoarseEstimatorEntry>
+    Vu1CoarseCycleHistory m_vu1CoarseCycleHistory{};
+    std::vector<Vu1CoarseEstimatorEntry>
         m_vu1CoarseEstimatorEntries;
+    size_t m_vu1CoarseEstimatorOldestEntry =
+        kVu1CoarseEstimatorNoEntry;
+    size_t m_vu1CoarseEstimatorNewestEntry =
+        kVu1CoarseEstimatorNoEntry;
     std::optional<Vu1PendingSlicePlan>
         m_deferredVu1SlicePlan;
     Vu1SpeculationPublicationState

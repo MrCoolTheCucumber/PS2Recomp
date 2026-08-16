@@ -1539,7 +1539,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
          m_vu1CoarseMaximumInvocationCycles == 0u ||
          m_vu1CoarseMaximumPath1Bytes == 0u ||
          m_vu1CoarseEstimatorHistoryCapacity == 0u ||
-         m_vu1CoarseEstimatorHistoryCapacity > 64u ||
+         m_vu1CoarseEstimatorHistoryCapacity >
+             kVu1CoarseEstimatorMaximumHistoryCapacity ||
          m_vu1CoarseEstimatorIdentityCapacity == 0u ||
          m_vu1CoarseEstimatorIdentityCapacity > 4096u ||
          m_vu1CoarseMinimumEstimateCycles >
@@ -1551,6 +1552,12 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     {
         throw std::invalid_argument(
             "invalid bounded coarse VU1 configuration");
+    }
+    if (m_vu1ExecutionMode ==
+        Vu1ExecutionMode::ThreadedCoarse)
+    {
+        m_vu1CoarseEstimatorEntries.reserve(
+            m_vu1CoarseEstimatorIdentityCapacity);
     }
 
     m_memory.installPostBiosTlbState();
@@ -7725,6 +7732,53 @@ PS2Runtime::vu1CoarseEstimatorIdentity(
     };
 }
 
+void PS2Runtime::unlinkVu1CoarseEstimatorEntry(
+    size_t index) noexcept
+{
+    Vu1CoarseEstimatorEntry &entry =
+        m_vu1CoarseEstimatorEntries[index];
+    if (entry.olderEntry != kVu1CoarseEstimatorNoEntry)
+    {
+        m_vu1CoarseEstimatorEntries[
+            entry.olderEntry].newerEntry = entry.newerEntry;
+    }
+    else
+    {
+        m_vu1CoarseEstimatorOldestEntry = entry.newerEntry;
+    }
+    if (entry.newerEntry != kVu1CoarseEstimatorNoEntry)
+    {
+        m_vu1CoarseEstimatorEntries[
+            entry.newerEntry].olderEntry = entry.olderEntry;
+    }
+    else
+    {
+        m_vu1CoarseEstimatorNewestEntry = entry.olderEntry;
+    }
+    entry.olderEntry = kVu1CoarseEstimatorNoEntry;
+    entry.newerEntry = kVu1CoarseEstimatorNoEntry;
+}
+
+void PS2Runtime::appendVu1CoarseEstimatorEntry(
+    size_t index) noexcept
+{
+    Vu1CoarseEstimatorEntry &entry =
+        m_vu1CoarseEstimatorEntries[index];
+    entry.olderEntry = m_vu1CoarseEstimatorNewestEntry;
+    entry.newerEntry = kVu1CoarseEstimatorNoEntry;
+    if (m_vu1CoarseEstimatorNewestEntry !=
+        kVu1CoarseEstimatorNoEntry)
+    {
+        m_vu1CoarseEstimatorEntries[
+            m_vu1CoarseEstimatorNewestEntry].newerEntry = index;
+    }
+    else
+    {
+        m_vu1CoarseEstimatorOldestEntry = index;
+    }
+    m_vu1CoarseEstimatorNewestEntry = index;
+}
+
 uint32_t PS2Runtime::estimateVu1CoarseCycles(
     const Vu1CoarseEstimatorIdentity &identity)
 {
@@ -7761,15 +7815,16 @@ uint32_t PS2Runtime::estimateVu1CoarseCycles(
     inputHash = appendVu1CoarseDigest(
         inputHash, identityHit ? 1u : 0u);
 
-    const std::deque<uint32_t> &history = identityHit
+    const Vu1CoarseCycleHistory &history = identityHit
         ? matchingEntry->cycleHistory
         : m_vu1CoarseCycleHistory;
     inputHash = appendVu1CoarseDigest(
         inputHash, history.size());
 
     uint64_t cycleSum = 0u;
-    for (uint32_t cycles : history)
+    for (size_t index = 0u; index < history.size(); ++index)
     {
+        const uint32_t cycles = history[index];
         cycleSum += cycles;
         inputHash = appendVu1CoarseDigest(inputHash, cycles);
     }
@@ -8074,12 +8129,8 @@ bool PS2Runtime::completeVu1CoarseInvocation(
         m_vu1CoarseEstimatorResultDigest.store(
             resultDigest, std::memory_order_release);
 
-        m_vu1CoarseCycleHistory.push_back(actual);
-        while (m_vu1CoarseCycleHistory.size() >
-               m_vu1CoarseEstimatorHistoryCapacity)
-        {
-            m_vu1CoarseCycleHistory.pop_front();
-        }
+        m_vu1CoarseCycleHistory.pushBack(
+            actual, m_vu1CoarseEstimatorHistoryCapacity);
         m_vu1CoarseEstimatorHistorySize.store(
             m_vu1CoarseCycleHistory.size(),
             std::memory_order_release);
@@ -8095,31 +8146,43 @@ bool PS2Runtime::completeVu1CoarseInvocation(
                 return entry.identity ==
                     pending.estimatorIdentity;
             });
-        Vu1CoarseEstimatorEntry updatedEntry{};
+        size_t updatedIndex = kVu1CoarseEstimatorNoEntry;
         if (matchingEntry !=
             m_vu1CoarseEstimatorEntries.end())
         {
-            updatedEntry = std::move(*matchingEntry);
-            m_vu1CoarseEstimatorEntries.erase(
-                matchingEntry);
+            updatedIndex = static_cast<size_t>(
+                matchingEntry -
+                m_vu1CoarseEstimatorEntries.begin());
+            unlinkVu1CoarseEstimatorEntry(updatedIndex);
         }
         else
         {
             if (m_vu1CoarseEstimatorEntries.size() >=
                 m_vu1CoarseEstimatorIdentityCapacity)
             {
-                m_vu1CoarseEstimatorEntries.pop_front();
+                updatedIndex =
+                    m_vu1CoarseEstimatorOldestEntry;
+                unlinkVu1CoarseEstimatorEntry(updatedIndex);
+                Vu1CoarseEstimatorEntry &updatedEntry =
+                    m_vu1CoarseEstimatorEntries[updatedIndex];
+                updatedEntry.identity =
+                    pending.estimatorIdentity;
+                updatedEntry.cycleHistory.clear();
             }
-            updatedEntry.identity = pending.estimatorIdentity;
+            else
+            {
+                updatedIndex =
+                    m_vu1CoarseEstimatorEntries.size();
+                m_vu1CoarseEstimatorEntries.emplace_back();
+                m_vu1CoarseEstimatorEntries[
+                    updatedIndex].identity =
+                    pending.estimatorIdentity;
+            }
         }
-        updatedEntry.cycleHistory.push_back(actual);
-        while (updatedEntry.cycleHistory.size() >
-               m_vu1CoarseEstimatorHistoryCapacity)
-        {
-            updatedEntry.cycleHistory.pop_front();
-        }
-        m_vu1CoarseEstimatorEntries.push_back(
-            std::move(updatedEntry));
+        m_vu1CoarseEstimatorEntries[
+            updatedIndex].cycleHistory.pushBack(
+                actual, m_vu1CoarseEstimatorHistoryCapacity);
+        appendVu1CoarseEstimatorEntry(updatedIndex);
         m_vu1CoarseEstimatorIdentitySize.store(
             m_vu1CoarseEstimatorEntries.size(),
             std::memory_order_release);
@@ -8641,6 +8704,10 @@ Vu1CommandResult PS2Runtime::submitVu1Command(
     {
         m_vu1CoarseCycleHistory.clear();
         m_vu1CoarseEstimatorEntries.clear();
+        m_vu1CoarseEstimatorOldestEntry =
+            kVu1CoarseEstimatorNoEntry;
+        m_vu1CoarseEstimatorNewestEntry =
+            kVu1CoarseEstimatorNoEntry;
         m_vu1CoarseEstimatorHistorySize.store(
             0u, std::memory_order_release);
         m_vu1CoarseEstimatorIdentitySize.store(
