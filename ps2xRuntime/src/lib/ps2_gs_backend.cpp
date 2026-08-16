@@ -190,7 +190,7 @@ namespace
 
     GsDrawBounds decodeBounds(const GSPrimReg &primitive,
                               const GSContext &context,
-                              const std::array<GSVertex, 3> &vertices,
+                              std::span<const GSVertex> vertices,
                               const std::array<int32_t, 3> &fixedX,
                               const std::array<int32_t, 3> &fixedY,
                               uint8_t vertexCount) noexcept
@@ -1045,43 +1045,76 @@ GsDrawCommand buildGsDrawCommand(
     std::span<const GSVertex> vertices,
     const GsDrawGlobalState &globalState)
 {
+    const GsDrawGeometry geometry = describeGsDrawGeometry(
+        primitive, context, vertices);
+    return buildGsDrawCommand(
+        sequence,
+        primitive,
+        context,
+        vertices,
+        globalState,
+        geometry);
+}
+
+GsDrawGeometry describeGsDrawGeometry(
+    const GSPrimReg &primitive,
+    const GSContext &context,
+    std::span<const GSVertex> vertices) noexcept
+{
+    GsDrawGeometry geometry;
+    geometry.vertexCount = static_cast<uint8_t>(std::min<size_t>(
+        {vertices.size(), geometry.fixedX.size(),
+         expectedVertexCount(primitive.type)}));
+    for (uint8_t i = 0u; i < geometry.vertexCount; ++i)
+    {
+        geometry.fixedX[i] =
+            static_cast<int32_t>(vertices[i].x12_4) -
+            static_cast<int32_t>(context.xyoffset.ofx);
+        geometry.fixedY[i] =
+            static_cast<int32_t>(vertices[i].y12_4) -
+            static_cast<int32_t>(context.xyoffset.ofy);
+    }
+    if (primitive.type == GS_PRIM_SPRITE &&
+        geometry.vertexCount == 2u)
+    {
+        geometry.fixedX[2] = geometry.fixedX[1];
+        geometry.fixedY[2] = geometry.fixedY[1];
+    }
+    geometry.bounds = decodeBounds(
+        primitive,
+        context,
+        vertices,
+        geometry.fixedX,
+        geometry.fixedY,
+        geometry.vertexCount);
+    return geometry;
+}
+
+GsDrawCommand buildGsDrawCommand(
+    uint64_t sequence,
+    const GSPrimReg &primitive,
+    const GSContext &context,
+    std::span<const GSVertex> vertices,
+    const GsDrawGlobalState &globalState,
+    const GsDrawGeometry &geometry)
+{
     std::array<GSVertex, 3> copiedVertices;
     const uint8_t vertexCount = static_cast<uint8_t>(std::min<size_t>(
-        {vertices.size(), copiedVertices.size(), expectedVertexCount(primitive.type)}));
+        {vertices.size(), copiedVertices.size(), geometry.vertexCount}));
     std::copy_n(vertices.begin(), vertexCount, copiedVertices.begin());
     std::fill(
         copiedVertices.begin() + vertexCount,
         copiedVertices.end(),
         GSVertex{});
-
-    std::array<int32_t, 3> fixedX;
-    std::array<int32_t, 3> fixedY;
-    for (uint8_t i = 0u; i < vertexCount; ++i)
-    {
-        fixedX[i] = static_cast<int32_t>(copiedVertices[i].x12_4) -
-                    static_cast<int32_t>(context.xyoffset.ofx);
-        fixedY[i] = static_cast<int32_t>(copiedVertices[i].y12_4) -
-                    static_cast<int32_t>(context.xyoffset.ofy);
-    }
-    std::fill(fixedX.begin() + vertexCount, fixedX.end(), 0);
-    std::fill(fixedY.begin() + vertexCount, fixedY.end(), 0);
-    if (primitive.type == GS_PRIM_SPRITE && vertexCount == 2u)
-    {
-        fixedX[2] = fixedX[1];
-        fixedY[2] = fixedY[1];
-    }
-
-    const GsDrawBounds bounds = decodeBounds(
-        primitive, context, copiedVertices, fixedX, fixedY, vertexCount);
     return GsDrawCommand(
         sequence,
         primitive,
         context,
         copiedVertices,
         vertexCount,
-        fixedX,
-        fixedY,
-        bounds,
+        geometry.fixedX,
+        geometry.fixedY,
+        geometry.bounds,
         globalState);
 }
 
@@ -2194,6 +2227,22 @@ GsSubmissionResult GsBackendRouter::submit(
         updateQueueDepth(*m_softwareBackend);
     }
     return {true, true, false, decision};
+}
+
+GsSubmissionResult GsBackendRouter::submitNoop()
+{
+    m_softwareBackend->recordNoop();
+    if (m_countersEnabled)
+    {
+        ++m_counters.commands;
+        ++m_counters.noopCommands;
+        recordDecision(GsFallbackReason::EmptyBounds, 0u);
+    }
+    return {
+        true,
+        false,
+        false,
+        {true, GsFallbackReason::EmptyBounds}};
 }
 
 void GsBackendRouter::flush(GsFlushReason reason)

@@ -56,6 +56,19 @@ struct GsDrawBounds
     }
 };
 
+// Geometry derived before a command snapshots the comparatively large GS
+// context and vertex payload. The raster frontend can use an exact empty
+// result to account a semantic no-op without constructing data that no
+// backend will consume. Nonempty callers pass the same result into the
+// command builder so fixed coordinates and bounds are computed only once.
+struct GsDrawGeometry
+{
+    uint8_t vertexCount = 0;
+    std::array<int32_t, 3> fixedX{};
+    std::array<int32_t, 3> fixedY{};
+    GsDrawBounds bounds{};
+};
+
 struct GsDrawResources
 {
     GsVramPageMask framebufferReadPages;
@@ -141,6 +154,13 @@ private:
         const GSContext &,
         std::span<const GSVertex>,
         const GsDrawGlobalState &);
+    friend GsDrawCommand buildGsDrawCommand(
+        uint64_t,
+        const GSPrimReg &,
+        const GSContext &,
+        std::span<const GSVertex>,
+        const GsDrawGlobalState &,
+        const GsDrawGeometry &);
 
     uint64_t m_sequence = 0;
     GSPrimReg m_primitive{};
@@ -347,6 +367,12 @@ public:
     {
         (void)command;
     }
+    // A frontend which has already proven exact empty geometry may use this
+    // lighter notification when no diagnostic consumer needs the command
+    // snapshot itself.
+    virtual void recordNoop()
+    {
+    }
     virtual void flush(GsFlushReason reason) = 0;
     [[nodiscard]] virtual size_t pendingCommandCount() const noexcept = 0;
 
@@ -425,6 +451,7 @@ public:
 
     [[nodiscard]] GsSubmissionResult submit(
         const GsDrawCommand &command);
+    [[nodiscard]] GsSubmissionResult submitNoop();
     void flush(GsFlushReason reason);
     // Completes the current command stream like a normal flush, but only
     // publishes the requested GPU-newer pages to canonical CPU VRAM. This is
@@ -494,6 +521,19 @@ private:
     const GSContext &context,
     std::span<const GSVertex> vertices,
     const GsDrawGlobalState &globalState);
+
+[[nodiscard]] GsDrawGeometry describeGsDrawGeometry(
+    const GSPrimReg &primitive,
+    const GSContext &context,
+    std::span<const GSVertex> vertices) noexcept;
+
+[[nodiscard]] GsDrawCommand buildGsDrawCommand(
+    uint64_t sequence,
+    const GSPrimReg &primitive,
+    const GSContext &context,
+    std::span<const GSVertex> vertices,
+    const GsDrawGlobalState &globalState,
+    const GsDrawGeometry &geometry);
 
 // Returns a bounded conservative mask for one GS surface rectangle. bp is in
 // 256-byte blocks and bw is the GS buffer-width field in 64-pixel units. The

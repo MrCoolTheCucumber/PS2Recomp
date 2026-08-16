@@ -2000,6 +2000,11 @@ struct GSRasterizer::BackendState
             rasterizer.recordNoopCommand(owner, command);
         }
 
+        void recordNoop() override
+        {
+            rasterizer.recordNoopCommand(owner);
+        }
+
         void flush(GsFlushReason) override
         {
             rasterizer.flushSoftwareDrawBatch(owner);
@@ -2571,6 +2576,40 @@ bool GSRasterizer::ownsScanline(int y) const
 
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    const GSPrimReg &primitive = gs->m_prim;
+    const GSContext &context = gs->activeContext();
+    const std::span<const GSVertex> vertices(gs->m_vtxQueue, 3u);
+    const GsDrawGeometry geometry = describeGsDrawGeometry(
+        primitive, context, vertices);
+    const uint64_t sequence = gs->m_nextDrawSequence++;
+
+    // Empty geometry cannot touch GS local memory. When neither raster
+    // instrumentation nor recursive-feedback state needs the full command,
+    // account it before copying the context and vertex payload. Retain the
+    // established command path around feedback snapshots because even an
+    // empty recursive draw can define the immutable image used by a later
+    // member of the run.
+    const uint32_t frameBase =
+        GSInternal::framePageBaseToBlock(context.frame.fbp);
+    const bool recursiveTextureDraw =
+        primitive.tme && context.tex0.tbp0 == frameBase &&
+        gs->m_vram && gs->m_vramSize != 0u;
+    if (geometry.bounds.exact && geometry.bounds.empty() &&
+        !rasterizerInstrumentationRequested() &&
+        !recursiveTextureDraw && !m_feedbackSnapshotValid &&
+        !m_feedbackSnapshotDeviceResident)
+    {
+        m_textureReadVram = nullptr;
+        const GsSubmissionResult result =
+            m_backendState->router.submitNoop();
+        if (!result.submitted)
+        {
+            throw std::runtime_error(
+                "GS gpu-strict rejected exact empty draw");
+        }
+        return;
+    }
+
     const GsDrawGlobalState globalState{
         .texa = gs->m_texa,
         .texclut = gs->m_texclut,
@@ -2583,11 +2622,12 @@ void GSRasterizer::drawPrimitive(GS *gs)
         .colorClamp = gs->m_colorClamp,
     };
     const GsDrawCommand command = buildGsDrawCommand(
-        gs->m_nextDrawSequence++,
-        gs->m_prim,
-        gs->activeContext(),
-        std::span<const GSVertex>(gs->m_vtxQueue, 3u),
-        globalState);
+        sequence,
+        primitive,
+        context,
+        vertices,
+        globalState,
+        geometry);
     prepareFeedbackSnapshot(gs, command);
     const GsSubmissionResult result =
         m_backendState->router.submit(command);
@@ -2709,6 +2749,11 @@ void GSRasterizer::recordNoopCommand(
         renderSoftwarePrimitive(gs, command);
     else
         DebugProgressScope progress(*this, gs);
+}
+
+void GSRasterizer::recordNoopCommand(GS *gs)
+{
+    DebugProgressScope progress(*this, gs);
 }
 
 void GSRasterizer::recordAcceleratedCommit(

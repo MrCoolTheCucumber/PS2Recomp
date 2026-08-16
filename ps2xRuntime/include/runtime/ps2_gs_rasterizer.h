@@ -122,6 +122,7 @@ private:
         const GsDrawCommand &command);
     void submitSoftwareCommand(GS *gs, const GsDrawCommand &command);
     void recordNoopCommand(GS *gs, const GsDrawCommand &command);
+    void recordNoopCommand(GS *gs);
     void recordAcceleratedCommit(
         GS *gs,
         const GsDrawCommand &command);
