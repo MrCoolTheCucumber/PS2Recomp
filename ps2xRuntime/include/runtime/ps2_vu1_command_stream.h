@@ -1171,8 +1171,6 @@ private:
     [[nodiscard]] AdmissionResult tryEnqueue(WorkItem &item);
     [[noreturn]] void throwSubmissionUnavailable() const;
     void signalWorkAvailable() noexcept;
-    [[nodiscard]] bool tryAcquireWorkSignal() noexcept;
-    void acquireWorkSignal() noexcept;
     void waitForSpaceChange(uint64_t spaceEpoch) noexcept;
     void signalSpaceAvailable() noexcept;
     void closeAdmissionAndQuiesceProducer() noexcept;
@@ -1208,7 +1206,8 @@ private:
     std::atomic<bool> m_accepting{true};
     std::atomic<bool> m_drainRequested{false};
     std::atomic<bool> m_cancelRequested{false};
-    std::atomic<uint64_t> m_workSignals{0u};
+    std::atomic<uint64_t> m_workEpoch{0u};
+    std::atomic<bool> m_workWaitRequired{false};
     std::atomic<uint64_t> m_spaceEpoch{0u};
     std::atomic<bool> m_spaceWaitRequired{false};
     std::atomic<uint64_t> m_minimumAcceptedGeneration{1u};

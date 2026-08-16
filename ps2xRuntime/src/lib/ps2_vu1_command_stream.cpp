@@ -3432,25 +3432,14 @@ void ThreadedVu1Executor::signalWorkAvailable() noexcept
 {
     m_workNotificationCount.fetch_add(
         1u, std::memory_order_relaxed);
-    if (m_workSignals.exchange(
-            1u, std::memory_order_release) == 0u)
+    const uint64_t prior = m_workEpoch.fetch_add(
+        1u, std::memory_order_seq_cst);
+    if (prior == std::numeric_limits<uint64_t>::max())
+        std::terminate();
+    if (m_workWaitRequired.load(
+            std::memory_order_seq_cst))
     {
-        m_workSignals.notify_one();
-    }
-}
-
-bool ThreadedVu1Executor::tryAcquireWorkSignal() noexcept
-{
-    return m_workSignals.exchange(
-               0u, std::memory_order_acq_rel) != 0u;
-}
-
-void ThreadedVu1Executor::acquireWorkSignal() noexcept
-{
-    while (!tryAcquireWorkSignal())
-    {
-        m_workSignals.wait(
-            0u, std::memory_order_acquire);
+        m_workEpoch.notify_one();
     }
 }
 
@@ -4849,38 +4838,45 @@ void ThreadedVu1Executor::workerMain() noexcept
                     std::memory_order_acquire) ||
                 m_drainRequested.load(
                     std::memory_order_acquire);
-            if (m_queue.empty() && !lifecycleRequested &&
-                !tryAcquireWorkSignal())
+            if (m_queue.empty() && !lifecycleRequested)
             {
-                const auto idleAt =
-                    std::chrono::steady_clock::now();
-                acquireWorkSignal();
-                const uint64_t idleNanoseconds =
-                    static_cast<uint64_t>(
-                        std::chrono::duration_cast<
-                            std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now() - idleAt)
-                            .count());
-                m_workerIdleNanoseconds.fetch_add(
-                    idleNanoseconds, std::memory_order_relaxed);
-                m_workerWakeCount.fetch_add(
-                    1u, std::memory_order_relaxed);
-            }
-            else
-            {
-                // Queue state and lifecycle requests are authoritative even
-                // when an earlier ready run consumed their coalesced signal.
-                (void)tryAcquireWorkSignal();
+                // Observe the publication epoch before advertising sleep.
+                // An enqueue which races ahead of the advertisement changes
+                // the epoch, while one which races behind it observes the
+                // wait flag and notifies. Rechecking queue and lifecycle state
+                // after both operations keeps those states authoritative.
+                const uint64_t workEpoch = m_workEpoch.load(
+                    std::memory_order_seq_cst);
+                m_workWaitRequired.store(
+                    true, std::memory_order_seq_cst);
+                const bool lifecycleAfterAdvertisement =
+                    m_cancelRequested.load(
+                        std::memory_order_acquire) ||
+                    m_drainRequested.load(
+                        std::memory_order_acquire);
+                if (m_queue.empty() &&
+                    !lifecycleAfterAdvertisement)
+                {
+                    const auto idleAt =
+                        std::chrono::steady_clock::now();
+                    m_workEpoch.wait(
+                        workEpoch, std::memory_order_seq_cst);
+                    const uint64_t idleNanoseconds =
+                        static_cast<uint64_t>(
+                            std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - idleAt)
+                                .count());
+                    m_workerIdleNanoseconds.fetch_add(
+                        idleNanoseconds, std::memory_order_relaxed);
+                    m_workerWakeCount.fetch_add(
+                        1u, std::memory_order_relaxed);
+                }
+                m_workWaitRequired.store(
+                    false, std::memory_order_seq_cst);
             }
             m_workerDrainCount.fetch_add(
                 1u, std::memory_order_relaxed);
-        }
-        else
-        {
-            // Commands admitted while the owner was active leave one latched
-            // notification. Clear it while continuing the same ready run;
-            // the queue itself is the authoritative work source.
-            (void)tryAcquireWorkSignal();
         }
         drainingReadyRun = false;
 
