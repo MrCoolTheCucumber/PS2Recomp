@@ -29,6 +29,34 @@ fails instead of silently selecting host threads. Runtime diagnostics report
 the context build mode, selected backend, Boost version, target architecture,
 ABI, and context implementation.
 
+## Owner-local scheduler transitions
+
+The dedicated fiber executor can carry one typed scheduler transition in an
+`EeSchedulerRunResult`.  This path is only valid for a synchronous mutation
+created by the currently running executor-owned guest fiber and consumed at
+the boundary which immediately follows its yield.  It is a value-semantic
+protocol: it does not allocate completion state, carry an arbitrary callback,
+lock the host-publication queue, or notify its condition variable.
+
+`RotateThreadReadyQueue` currently uses this path when all ownership checks
+hold.  The fiber records the originating scheduler handle and generation,
+literal requested priority, and declared reschedule policy.  The executor
+then commits the exiting continuation, applies the transition exactly once,
+reschedules exactly once, publishes the selected context, and only afterward
+processes queued host publications, modeled timeouts, hardware events,
+interrupts, and debugger disposition.  Stale identities, invalid payload
+combinations, duplicate transitions, and reentrant application fail through
+the executor's normal deterministic failure path.
+
+The protocol does not replace asynchronous publication.  External host
+threads, delayed work, control requests, wakeups, alarms, and operations that
+need a completion future continue to use the synchronized publication queue.
+The legacy host-thread backend, non-dedicated execution, interrupt-context
+rotation, and executor-consequence code retain their established paths.
+Runtime diagnostics expose the cumulative
+`owner_local_transitions_applied` count separately from publications queued
+and applied.
+
 ## Context build modes
 
 `PS2X_EE_CONTEXT_BUILD_MODE` makes the continuation contract explicit:
