@@ -457,7 +457,13 @@ void VuUnit::reset()
     m_progressInvocations.store(0u, std::memory_order_relaxed);
     m_progressCycles.store(0u, std::memory_order_relaxed);
     m_progressPc.store(0u, std::memory_order_relaxed);
+    m_interpreterRecoveryPending = false;
     m_lastExitReason = VuExitReason::Inactive;
+}
+
+void VuUnit::requestInterpreterRecovery()
+{
+    m_interpreterRecoveryPending = true;
 }
 
 VuProgressSnapshot VuUnit::getProgressSnapshot() const
@@ -862,7 +868,11 @@ VuRunResult VuUnit::advance(
     }
 
     VuRunResult result;
-    if (m_resolvedBackend == VuBackendKind::Recompiler)
+    if (m_interpreterRecoveryPending)
+    {
+        result = m_interpreter->run(context, maxCycles);
+    }
+    else if (m_resolvedBackend == VuBackendKind::Recompiler)
         [[unlikely]]
     {
         result = runRecompilerContext(
@@ -879,6 +889,8 @@ VuRunResult VuUnit::advance(
         // optimizer-visible hot loop.
         result = m_interpreter->run(context, maxCycles);
     }
+    if (m_interpreterRecoveryPending && !context.state.active)
+        m_interpreterRecoveryPending = false;
     m_lastExitReason = result.reason;
     return result;
 }

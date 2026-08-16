@@ -549,6 +549,16 @@ public:
     VuExecutionState &state() { return m_state; }
     const VuExecutionState &state() const { return m_state; }
     bool isActive() const { return m_state.active; }
+    // A cold save-state cannot retain native/JIT pipeline work which was in
+    // flight at the capture boundary.  Let the discarded activation reach a
+    // clean inactive boundary in the interpreter without changing the
+    // configured production backend.  The request survives a subsequent
+    // start/resume and clears automatically when the unit becomes inactive.
+    void requestInterpreterRecovery();
+    bool interpreterRecoveryPending() const
+    {
+        return m_interpreterRecoveryPending;
+    }
     VuProgressSnapshot getProgressSnapshot() const;
     void setProgressTrackingEnabled(bool enabled);
     void setInstructionObserver(VuInstructionObserver observer);
@@ -694,6 +704,7 @@ private:
     IVuExecutionBackend *m_backend = nullptr;
     VuBackendKind m_requestedBackend = VuBackendKind::Auto;
     VuBackendKind m_resolvedBackend = VuBackendKind::Interpreter;
+    bool m_interpreterRecoveryPending = false;
     VuExitReason m_lastExitReason = VuExitReason::Inactive;
     VuVerifyDiagnostics m_verifyDiagnostics{};
 };

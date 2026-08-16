@@ -1174,6 +1174,61 @@ void register_ps2_vu1_tests()
                 "selected native execution should populate the unit cache");
         });
 
+        tc.Run("VU interpreter recovery returns to the selected native backend", [](TestCase &t)
+        {
+            if (!VuRecompilerBackend::supported())
+                return;
+
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(),
+                     "VU1 recovery fixture should initialize");
+            writeVuInstructionPair(
+                fx.code, 0u,
+                makeVuIaddiu(1u, 0u, 7),
+                kVuUpperEnd);
+            writeVuInstructionPair(
+                fx.code, 8u,
+                makeVuIaddiu(2u, 0u, 9),
+                kVuUpperNop);
+            fx.mem.markVU1CodeModified();
+
+            VuUnit unit(VuUnitId::Vu1);
+            std::string diagnostic;
+            t.IsTrue(
+                unit.setBackend(
+                    VuBackendKind::Recompiler, &diagnostic),
+                "recovery fixture should select native execution");
+            unit.requestInterpreterRecovery();
+            unit.start(0u, 0u, 0u, &fx.mem);
+            const VuRunResult recovered = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 2u);
+            t.IsTrue(
+                recovered.reason == VuExitReason::ProgramEnded &&
+                    !unit.interpreterRecoveryPending(),
+                "the interpreter should carry recovery to an inactive boundary");
+            t.IsTrue(
+                unit.resolvedBackend() == VuBackendKind::Recompiler &&
+                    unit.backendName() == "x86-64-recompiler",
+                "recovery must not replace the selected production backend");
+            t.IsNull(
+                unit.programCacheIfCreated(),
+                "the recovery activation must not populate the native cache");
+
+            unit.start(0u, 0u, 0u, &fx.mem);
+            const VuRunResult native = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 2u);
+            t.IsTrue(
+                native.reason == VuExitReason::ProgramEnded,
+                "the next activation should complete natively");
+            t.IsNotNull(
+                unit.programCacheIfCreated(),
+                "native execution should resume after bounded recovery");
+        });
+
         tc.Run("VU1 progress tracking preserves native execution", [](TestCase &t)
         {
             if (!VuRecompilerBackend::supported())

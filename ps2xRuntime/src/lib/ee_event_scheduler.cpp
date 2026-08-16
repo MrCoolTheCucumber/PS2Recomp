@@ -1,6 +1,7 @@
 #include "runtime/ee_event_scheduler.h"
 
 #include <limits>
+#include <unordered_set>
 
 namespace ps2x::timing
 {
@@ -154,6 +155,61 @@ namespace ps2x::timing
     EeEventScheduler::statistics() const noexcept
     {
         return m_statistics;
+    }
+
+    EeEventSchedulerSnapshot EeEventScheduler::snapshot() const noexcept
+    {
+        EeEventSchedulerSnapshot state{};
+        for (size_t index = 0u; index < m_slots.size(); ++index)
+        {
+            const Slot &source = m_slots[index];
+            state.slots[index] = {
+                .source = static_cast<EeEventSource>(index),
+                .deadline = source.deadline,
+                .generation = source.generation,
+                .sequence = source.sequence,
+                .pending = source.pending,
+            };
+        }
+        state.nextSequence = m_nextSequence;
+        state.statistics = m_statistics;
+        return state;
+    }
+
+    bool EeEventScheduler::restore(
+        const EeEventSchedulerSnapshot &state) noexcept
+    {
+        std::unordered_set<uint64_t> pendingSequences;
+        for (size_t index = 0u; index < state.slots.size(); ++index)
+        {
+            const EeEventSlotSnapshot &source = state.slots[index];
+            if (source.source != static_cast<EeEventSource>(index))
+                return false;
+            if (source.pending &&
+                (source.generation == 0u || source.sequence == 0u ||
+                 source.sequence > state.nextSequence ||
+                 !pendingSequences.insert(source.sequence).second))
+            {
+                return false;
+            }
+        }
+
+        for (size_t index = 0u; index < m_slots.size(); ++index)
+        {
+            const EeEventSlotSnapshot &source = state.slots[index];
+            m_slots[index] = {
+                .deadline = source.deadline,
+                .generation = source.generation,
+                .sequence = source.sequence,
+                .pending = source.pending,
+            };
+        }
+        m_nextSequence = state.nextSequence;
+        m_statistics = state.statistics;
+        m_serviceTick = {};
+        m_servicing = false;
+        recomputeNext();
+        return true;
     }
 
     void EeEventScheduler::recomputeNext() noexcept

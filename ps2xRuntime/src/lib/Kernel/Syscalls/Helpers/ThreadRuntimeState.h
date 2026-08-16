@@ -66,6 +66,19 @@ public:
         return isValid(m_state);
     }
 
+    // Save states restore the authoritative guest-visible image while native
+    // continuations are rebuilt separately. Preserve the saved revision: it
+    // is part of the observable transition history, not a restore mutation.
+    bool restore(const EeThreadGuestStateSnapshot &state) noexcept
+    {
+        if (!isValid(state))
+        {
+            return false;
+        }
+        m_state = state;
+        return true;
+    }
+
     bool isDormant() const noexcept
     {
         return m_state.status == kDormant;

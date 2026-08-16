@@ -329,6 +329,19 @@ namespace ps2x::timing
         };
     }
 
+    void Cop0Timing::restore(
+        const Cop0TimingSnapshot &state) noexcept
+    {
+        m_count = state.count;
+        m_compare = state.compare;
+        m_pccr = state.pccr;
+        m_pcr = state.pcr;
+        m_lastCountCycle = state.lastCountCycle;
+        m_lastPerformanceCycle = state.lastPerformanceCycle;
+        m_timerArmed = state.timerArmed;
+        m_timerPending = state.timerPending;
+    }
+
     bool Cop0Timing::performanceCounterEnabled(
         uint32_t pccr,
         size_t counter,

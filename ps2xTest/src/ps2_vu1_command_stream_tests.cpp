@@ -1121,8 +1121,12 @@ void register_ps2_vu1_command_stream_tests()
             t.IsTrue(
                 fixture.submit(Vu1RestoreCommand{
                     .snapshot = snapshot->snapshot,
+                    .interpreterRecovery = true,
                 }).disposition == Vu1CommandDisposition::Completed,
                 "restore should accept the complete owner snapshot");
+            t.IsTrue(
+                fixture.unit.interpreterRecoveryPending(),
+                "restore should publish the requested cold-recovery policy");
             const Vu1CommandResult restoredResult =
                 fixture.submit(Vu1BarrierCommand{});
             const auto *restored =
@@ -1133,6 +1137,12 @@ void register_ps2_vu1_command_stream_tests()
                 "restore should reproduce the complete architectural hash");
             t.Equals(fixture.unit.state().vi[3], int32_t{0x1234},
                      "restore should reproduce register state");
+            (void)fixture.submit(Vu1RestoreCommand{
+                .snapshot = snapshot->snapshot,
+            });
+            t.IsFalse(
+                fixture.unit.interpreterRecoveryPending(),
+                "an ordinary snapshot restore should clear transient recovery");
         });
 
         tc.Run("threaded VU1 queue applies bounded slot and payload backpressure", [](TestCase &t)

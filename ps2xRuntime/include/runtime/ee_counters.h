@@ -48,6 +48,7 @@ namespace ps2x::timing
     struct EeCounterBankSnapshot
     {
         std::array<EeCounterSnapshot, kEeCounterCount> counters{};
+        EeCounterVideoTiming videoTiming{};
         uint64_t currentCycle = 0u;
         uint64_t hSyncStartCycle = 0u;
         uint64_t vSyncStartCycle = 0u;
@@ -94,6 +95,8 @@ namespace ps2x::timing
         [[nodiscard]] std::optional<uint64_t>
         nextEventCycle() const noexcept;
         [[nodiscard]] EeCounterBankSnapshot snapshot() const noexcept;
+        [[nodiscard]] bool restore(
+            const EeCounterBankSnapshot &snapshot) noexcept;
 
         [[nodiscard]] static bool isRegisterAddress(
             uint32_t address) noexcept;

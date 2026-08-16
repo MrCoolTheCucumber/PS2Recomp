@@ -200,6 +200,11 @@ namespace ps2x::timing
             m_now = EeTick{};
         }
 
+        constexpr void restore(EeTick now) noexcept
+        {
+            m_now = now;
+        }
+
     private:
         EeTick m_now{};
     };

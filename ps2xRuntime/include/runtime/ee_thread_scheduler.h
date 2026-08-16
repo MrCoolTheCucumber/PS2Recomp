@@ -187,6 +187,14 @@ namespace ps2x::ee
         uint64_t queueSequence = 0u;
     };
 
+    struct EeThreadSchedulerSnapshot
+    {
+        std::vector<EeSchedulerThreadSnapshot> threads;
+        std::optional<int> currentThreadId;
+        uint64_t nextQueueSequence = 1u;
+        ps2x::timing::EeTick canonicalTick{};
+    };
+
     // oldThreadId/newThreadId are the selected RUN owner before and after
     // the transition. threadId identifies the affected record; its remaining
     // fields are the post-transition snapshot. wait retains the affected wait
@@ -431,6 +439,9 @@ namespace ps2x::ee
         waitOrder(EeSchedulerWaitKey wait) const;
         [[nodiscard]] size_t threadCount() const noexcept;
         [[nodiscard]] bool validate() const;
+        [[nodiscard]] EeThreadSchedulerSnapshot snapshot() const;
+        [[nodiscard]] bool restore(
+            const EeThreadSchedulerSnapshot &snapshot);
         // Enabling starts a fresh bounded capture. Overflow retains the newest
         // records and increments droppedTransitionTraceCount. Disabling stops
         // publication without discarding the captured snapshot.

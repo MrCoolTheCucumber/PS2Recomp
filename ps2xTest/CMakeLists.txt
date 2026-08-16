@@ -81,6 +81,7 @@ add_library(ps2_test_lib STATIC
     src/ps2_runtime_io_tests.cpp
     src/ps2_runtime_kernel_tests.cpp
     src/ps2_runtime_interrupt_tests.cpp
+    src/ps2_save_state_tests.cpp
     src/ps2_memory_tests.cpp
     src/ps2_perf_jitdump_tests.cpp
     src/ps2_vu_executable_memory_tests.cpp

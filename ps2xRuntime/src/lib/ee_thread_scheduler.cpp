@@ -1375,6 +1375,123 @@ namespace ps2x::ee
         return m_threads.size();
     }
 
+    EeThreadSchedulerSnapshot EeThreadScheduler::snapshot() const
+    {
+        EeThreadSchedulerSnapshot state{};
+        state.currentThreadId = m_currentThreadId;
+        state.nextQueueSequence = m_nextQueueSequence;
+        state.canonicalTick = m_canonicalTick;
+        state.threads.reserve(m_threads.size());
+        for (const auto &[threadId, record] : m_threads)
+        {
+            state.threads.push_back(EeSchedulerThreadSnapshot{
+                .id = threadId,
+                .generation = record.generation,
+                .priority = record.priority,
+                .state = record.state,
+                .wait = record.wait,
+                .completedWait = record.completedWait,
+                .retainCompletedWaitReason =
+                    record.retainCompletedWaitReason,
+                .wakeupCount = record.wakeupCount,
+                .suspendCount = record.suspendCount,
+                .queueSequence = record.queueSequence,
+            });
+        }
+        std::sort(
+            state.threads.begin(), state.threads.end(),
+            [](const EeSchedulerThreadSnapshot &left,
+               const EeSchedulerThreadSnapshot &right)
+            {
+                return left.id < right.id;
+            });
+        return state;
+    }
+
+    bool EeThreadScheduler::restore(
+        const EeThreadSchedulerSnapshot &state)
+    {
+        EeThreadScheduler candidate;
+        candidate.m_nextQueueSequence = state.nextQueueSequence;
+        candidate.m_canonicalTick = state.canonicalTick;
+        candidate.m_currentThreadId = state.currentThreadId;
+
+        std::vector<const EeSchedulerThreadSnapshot *> queued;
+        queued.reserve(state.threads.size());
+        uint64_t maximumQueueSequence = 0u;
+        for (const EeSchedulerThreadSnapshot &source : state.threads)
+        {
+            if (!validThreadId(source.id) ||
+                source.generation == 0u ||
+                !validPriority(source.priority) ||
+                candidate.m_threads.contains(source.id))
+            {
+                return false;
+            }
+            candidate.m_threads.emplace(
+                source.id,
+                ThreadRecord{
+                    .generation = source.generation,
+                    .priority = source.priority,
+                    .state = source.state,
+                    .wait = source.wait,
+                    .completedWait = source.completedWait,
+                    .retainCompletedWaitReason =
+                        source.retainCompletedWaitReason,
+                    .wakeupCount = source.wakeupCount,
+                    .suspendCount = source.suspendCount,
+                    .queueSequence = source.queueSequence,
+                });
+            if (source.queueSequence != 0u)
+            {
+                queued.push_back(&source);
+                maximumQueueSequence = std::max(
+                    maximumQueueSequence, source.queueSequence);
+            }
+        }
+        if (candidate.m_nextQueueSequence == 0u ||
+            candidate.m_nextQueueSequence <= maximumQueueSequence)
+        {
+            return false;
+        }
+
+        std::sort(
+            queued.begin(), queued.end(),
+            [](const EeSchedulerThreadSnapshot *left,
+               const EeSchedulerThreadSnapshot *right)
+            {
+                return left->queueSequence < right->queueSequence;
+            });
+        uint64_t previousSequence = 0u;
+        for (const EeSchedulerThreadSnapshot *source : queued)
+        {
+            if (source->queueSequence == previousSequence)
+                return false;
+            previousSequence = source->queueSequence;
+            const EeSchedulerThreadHandle handle{
+                source->id, source->generation};
+            switch (source->state)
+            {
+            case EeSchedulerThreadState::Ready:
+                candidate.m_readyQueues[
+                    static_cast<size_t>(source->priority)]
+                    .push_back(handle);
+                break;
+            case EeSchedulerThreadState::Waiting:
+            case EeSchedulerThreadState::WaitSuspended:
+                candidate.m_waitQueues[source->wait].push_back(handle);
+                break;
+            default:
+                return false;
+            }
+        }
+
+        if (!candidate.validate())
+            return false;
+        *this = std::move(candidate);
+        return true;
+    }
+
     bool EeThreadScheduler::validate() const
     {
         std::unordered_map<int, size_t>

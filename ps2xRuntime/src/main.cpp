@@ -221,6 +221,8 @@ namespace
                " [--gs-command-queue-capacity POSITIVE_INTEGER]"
                " [--vu1-execution inline|threaded-sync|threaded-async|threaded-coarse]"
                " [--vu1-checkpoint-epochs on|off]"
+               " [--load-state PATH]"
+               " [--quick-save-state PATH]"
                " [ELF [CD_IMAGE]]\n";
     }
 
@@ -234,6 +236,8 @@ namespace
         size_t gsCommandQueueCapacity = 512u;
         Vu1ExecutionMode vu1ExecutionMode = Vu1ExecutionMode::Inline;
         bool vu1CheckpointEpochs = true;
+        std::optional<std::filesystem::path> loadStatePath;
+        std::filesystem::path quickSaveStatePath{"quickstate.p2s"};
         std::vector<std::filesystem::path> positionalPaths;
     };
 
@@ -322,6 +326,28 @@ namespace
                     throw std::invalid_argument(
                         "--vu1-checkpoint-epochs requires on or off");
                 }
+                continue;
+            }
+            if (!optionsEnded && argument == "--load-state")
+            {
+                if (++i >= argc || !argv[i] || argv[i][0] == '\0')
+                {
+                    throw std::invalid_argument(
+                        "--load-state requires a path");
+                }
+                options.loadStatePath =
+                    std::filesystem::path(argv[i]);
+                continue;
+            }
+            if (!optionsEnded && argument == "--quick-save-state")
+            {
+                if (++i >= argc || !argv[i] || argv[i][0] == '\0')
+                {
+                    throw std::invalid_argument(
+                        "--quick-save-state requires a path");
+                }
+                options.quickSaveStatePath =
+                    std::filesystem::path(argv[i]);
                 continue;
             }
             if (!optionsEnded && !argument.empty() && argument[0] == '-')
@@ -427,6 +453,8 @@ int main(int argc, char *argv[])
         runtimeConfiguration.vu1CheckpointEpochs =
             options.vu1CheckpointEpochs;
         PS2Runtime runtime(runtimeConfiguration);
+        runtime.setQuickSaveStatePath(
+            options.quickSaveStatePath);
         configureOptionalCdImage(runtime, options);
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
         // This hook is to prevent leak rlimgui deps to recompiler etc
@@ -488,6 +516,23 @@ int main(int argc, char *argv[])
         {
             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
             return 1;
+        }
+
+        if (options.loadStatePath)
+        {
+            std::string stateError;
+            if (!runtime.loadState(
+                    *options.loadStatePath, &stateError))
+            {
+                std::cerr
+                    << "Failed to load save state '"
+                    << *options.loadStatePath
+                    << "': " << stateError << std::endl;
+                return 1;
+            }
+            std::cout
+                << "Loaded save state: "
+                << *options.loadStatePath << std::endl;
         }
 
         runtime.run();

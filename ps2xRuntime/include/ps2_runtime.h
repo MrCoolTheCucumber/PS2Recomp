@@ -28,6 +28,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 
 #include "runtime/ps2_build_config.h"
@@ -897,6 +898,21 @@ public:
     void resetEeTiming(R5900Context *context = nullptr);
     void setRealtimeVSyncPacingEnabled(bool enabled);
     bool loadELF(const std::string &elfPath);
+    // Save files contain guest architecture and device state only. Native
+    // continuations, JIT code, renderer resources, and host handles are
+    // rebuilt by a fresh runner, so a state remains useful after recompiling.
+    [[nodiscard]] bool saveState(
+        const std::filesystem::path &path,
+        std::string *error = nullptr);
+    [[nodiscard]] bool loadState(
+        const std::filesystem::path &path,
+        std::string *error = nullptr);
+    void setQuickSaveStatePath(std::filesystem::path path);
+    [[nodiscard]] const std::filesystem::path &
+    quickSaveStatePath() const noexcept
+    {
+        return m_quickSaveStatePath;
+    }
     void run();
 
     void setIopPluginSearchPaths(std::vector<std::filesystem::path> paths);
@@ -2455,6 +2471,22 @@ private:
     void startDedicatedEeExecution();
     void joinDedicatedEeExecution();
     void runMainEeContinuation();
+    void runRestoredEeContinuation(
+        int threadId,
+        const std::shared_ptr<ThreadInfo> &info);
+    [[nodiscard]] bool encodeRuntimeCoreSaveState(
+        const ps2x::ee::EeThreadSchedulerSnapshot &scheduler,
+        std::vector<uint8_t> &output,
+        std::string *error);
+    [[nodiscard]] bool decodeRuntimeCoreSaveState(
+        std::span<const uint8_t> input,
+        std::string *error);
+    [[nodiscard]] bool encodeRuntimeHleSaveState(
+        std::vector<uint8_t> &output,
+        std::string *error);
+    [[nodiscard]] bool decodeRuntimeHleSaveState(
+        std::span<const uint8_t> input,
+        std::string *error);
     [[nodiscard]] ps2x::timing::EeTickDelta
     eeExecutorElapsedSinceSelection() const noexcept;
 
@@ -3446,6 +3478,11 @@ private:
     int m_boundEeThreadId = 1;
     std::optional<EeInterruptedContinuationFrame>
         m_eeInterruptedContinuation;
+    std::optional<ps2x::ee::EeThreadSchedulerSnapshot>
+        m_pendingRestoredEeScheduler;
+    bool m_saveStateLoaded = false;
+    std::filesystem::path m_quickSaveStatePath{
+        "quickstate.p2s"};
     uint32_t m_asyncCallbackInvocationDepth = 0u;
     mutable std::recursive_timed_mutex m_guestExecutionMutex;
     mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};

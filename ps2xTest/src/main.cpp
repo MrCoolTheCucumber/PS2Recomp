@@ -40,6 +40,7 @@ void register_ps2_runtime_elf_tests();
 void register_ps2_runtime_io_tests();
 void register_ps2_runtime_kernel_tests();
 void register_ps2_runtime_interrupt_tests();
+void register_ps2_save_state_tests();
 void register_ps2_memory_tests();
 void register_ps2_perf_jitdump_tests();
 void register_ps2_vu_executable_memory_tests();
@@ -101,6 +102,7 @@ int main()
     register_ps2_runtime_io_tests();
     register_ps2_runtime_kernel_tests();
     register_ps2_runtime_interrupt_tests();
+    register_ps2_save_state_tests();
     register_ps2_memory_tests();
     register_ps2_perf_jitdump_tests();
     register_ps2_vu_executable_memory_tests();

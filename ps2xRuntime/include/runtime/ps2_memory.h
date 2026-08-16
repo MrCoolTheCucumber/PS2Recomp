@@ -8,6 +8,7 @@
 #include <exception>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1050,6 +1051,16 @@ public:
 
     // Initialize memory
     bool initialize(size_t ramSize = PS2_RAM_SIZE);
+
+    // A portable architectural snapshot. Host callbacks, mutexes, tracing,
+    // and translation caches are intentionally excluded and remain bound to
+    // the newly created runtime on restore.
+    [[nodiscard]] bool encodeSaveState(
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) const;
+    [[nodiscard]] bool decodeSaveState(
+        std::span<const uint8_t> input,
+        std::string *error = nullptr);
 
     // Memory access methods
     uint8_t *getRDRAM() { return m_rdram; }

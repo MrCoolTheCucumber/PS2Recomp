@@ -1105,7 +1105,7 @@ uint64_t vu1CommandPayloadSize(
             }
             else if constexpr (std::is_same_v<T, Vu1RestoreCommand>)
             {
-                return sizeof(uint64_t) +
+                return sizeof(uint64_t) + sizeof(bool) +
                        (value.snapshot
                             ? value.snapshot->microMemory.size() +
                                   value.snapshot->dataMemory.size()
@@ -1271,6 +1271,7 @@ uint64_t vu1CommandPayloadHash(
             }
             else if constexpr (std::is_same_v<T, Vu1RestoreCommand>)
             {
+                hashScalar(hash, value.interpreterRecovery);
                 if (value.snapshot)
                     hashScalar(hash, snapshotHash(*value.snapshot));
             }
@@ -2318,6 +2319,8 @@ Vu1CommandResultPayload Vu1CommandProcessor::apply(
                 }
                 const Vu1Snapshot &snapshot = *value.snapshot;
                 m_unit.state() = snapshot.state;
+                m_unit.m_interpreterRecoveryPending =
+                    value.interpreterRecovery;
                 std::memcpy(
                     m_microMemory,
                     snapshot.microMemory.data(),

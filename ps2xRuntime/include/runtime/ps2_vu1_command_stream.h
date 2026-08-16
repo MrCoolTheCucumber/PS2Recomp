@@ -300,6 +300,9 @@ struct Vu1RestoreCommand
     // Snapshot payloads are cold and large. Box them so every hot command
     // record remains a compact, bounded queue envelope.
     std::shared_ptr<const Vu1Snapshot> snapshot;
+    // Cold portable states discard an in-flight native activation.  Keep the
+    // selected backend but interpret through the next inactive boundary.
+    bool interpreterRecovery = false;
 };
 
 struct Vu1BarrierCommand

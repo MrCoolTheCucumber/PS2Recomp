@@ -104,6 +104,7 @@ namespace ps2x::timing
         [[nodiscard]] bool performanceExceptionPending(
             uint32_t status) const noexcept;
         [[nodiscard]] Cop0TimingSnapshot snapshot() const noexcept;
+        void restore(const Cop0TimingSnapshot &snapshot) noexcept;
 
     private:
         [[nodiscard]] static bool performanceCounterEnabled(

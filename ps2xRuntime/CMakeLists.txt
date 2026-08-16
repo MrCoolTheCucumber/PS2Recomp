@@ -651,9 +651,12 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_gs_vulkan_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
+    src/lib/ps2_memory_save_state.cpp
     src/lib/ps2_pad.cpp
     src/lib/ps2_perf_jitdump.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/ps2_runtime_save_state.cpp
+    src/lib/ps2_save_state.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/ps2_vu1_command_stream.cpp
     src/lib/vu/ps2_vu_analysis.cpp

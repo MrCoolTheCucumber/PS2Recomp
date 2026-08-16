@@ -2852,6 +2852,48 @@ void PS2Runtime::runMainEeContinuation()
         << std::dec << std::endl);
 }
 
+void PS2Runtime::runRestoredEeContinuation(
+    int threadId,
+    const std::shared_ptr<ThreadInfo> &info)
+{
+    if (!info)
+        return;
+    try
+    {
+        dispatchLoop(
+            m_memory.getRDRAM(),
+            &info->context);
+    }
+    catch (const ThreadExitException &)
+    {
+    }
+
+    bool stillRegistered = false;
+    {
+        EeThreadRuntimeState &state =
+            *m_eeThreadRuntimeState;
+        std::lock_guard<std::mutex> lock(
+            state.threadMapMutex);
+        const auto current = state.threads.find(threadId);
+        stillRegistered =
+            current != state.threads.end() &&
+            current->second == info;
+    }
+    if (stillRegistered)
+    {
+        std::lock_guard<std::mutex> lock(info->m);
+        info->guestState.makeDormant();
+        info->pendingWaitCompletion =
+            ps2x::ee::EeSchedulerWaitCompletion::None;
+        info->pendingEventFlagResultBits = 0u;
+        info->forceRelease.store(
+            false, std::memory_order_relaxed);
+        info->terminated.store(
+            false, std::memory_order_relaxed);
+    }
+    info->cv.notify_all();
+}
+
 void PS2Runtime::startDedicatedEeExecution()
 {
     if (!m_eeRuntimeExecutor)
@@ -2859,6 +2901,86 @@ void PS2Runtime::startDedicatedEeExecution()
         throw std::logic_error(
             "selected EE backend has no dedicated "
             "executor");
+    }
+
+    if (m_pendingRestoredEeScheduler)
+    {
+        const ps2x::ee::EeThreadSchedulerSnapshot
+            restoredScheduler =
+                *m_pendingRestoredEeScheduler;
+        std::vector<std::pair<
+            ps2x::ee::EeSchedulerThreadSnapshot,
+            std::shared_ptr<ThreadInfo>>>
+            continuations;
+        {
+            EeThreadRuntimeState &state =
+                *m_eeThreadRuntimeState;
+            std::lock_guard<std::mutex> lock(
+                state.threadMapMutex);
+            state.contextThreadIds.clear();
+            for (const auto &saved :
+                 restoredScheduler.threads)
+            {
+                const auto found = state.threads.find(saved.id);
+                if (found == state.threads.end() ||
+                    !found->second ||
+                    found->second->generation != saved.generation)
+                {
+                    throw std::logic_error(
+                        "restored EE scheduler has no matching thread record");
+                }
+                std::shared_ptr<ThreadInfo> info = found->second;
+                info->boundContext =
+                    saved.id == 1
+                        ? &m_cpuContext
+                        : &info->context;
+                state.contextThreadIds[info->boundContext] = saved.id;
+                if (saved.state !=
+                    ps2x::ee::EeSchedulerThreadState::Dormant)
+                {
+                    continuations.emplace_back(saved, info);
+                }
+            }
+        }
+
+        m_eeRuntimeExecutor->start(
+            [this, restoredScheduler, continuations =
+                       std::move(continuations)](
+                ps2x::ee::EeThreadScheduler &scheduler,
+                IEeExecutionBackend &backend)
+            {
+                ThreadNaming::SetCurrentThreadName(
+                    "EeExecutor");
+                for (const auto &[saved, info] : continuations)
+                {
+                    if (saved.id == 1)
+                    {
+                        backend.create(
+                            1,
+                            [this]()
+                            {
+                                runMainEeContinuation();
+                            });
+                    }
+                    else
+                    {
+                        backend.create(
+                            saved.id,
+                            [this, threadId = saved.id, info]()
+                            {
+                                runRestoredEeContinuation(
+                                    threadId, info);
+                            });
+                    }
+                }
+                if (!scheduler.restore(restoredScheduler))
+                {
+                    throw std::logic_error(
+                        "failed to seed the restored EE scheduler");
+                }
+            });
+        m_pendingRestoredEeScheduler.reset();
+        return;
     }
 
     std::shared_ptr<ThreadInfo> mainInfo;
@@ -18116,28 +18238,42 @@ bool PS2Runtime::isStopRequested() const
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
-    ps2_syscalls::resetFileIoState(this);
-    ps2_syscalls::resetDeci2State(this);
-    ps2_stubs::resetCdState(this);
-    ps2_stubs::resetDmaState(this);
-    ps2_stubs::resetLibCState(this);
-    ps2_stubs::resetMemoryCardState(this);
-    ps2_stubs::resetPadState(this);
-    ps2_stubs::resetSifState(this);
-    resetIop();
-    ps2_stubs::resetAudioStubState(this);
-    ps2_stubs::resetGsSyncVCallbackState(this);
-    ps2_stubs::resetMpegStubState(this);
+    const bool restoredSaveState = m_saveStateLoaded;
+    if (!restoredSaveState)
+    {
+        ps2_syscalls::resetFileIoState(this);
+        ps2_syscalls::resetDeci2State(this);
+        ps2_stubs::resetCdState(this);
+        ps2_stubs::resetDmaState(this);
+        ps2_stubs::resetLibCState(this);
+        ps2_stubs::resetMemoryCardState(this);
+        ps2_stubs::resetPadState(this);
+        ps2_stubs::resetSifState(this);
+        resetIop();
+        ps2_stubs::resetAudioStubState(this);
+        ps2_stubs::resetGsSyncVCallbackState(this);
+        ps2_stubs::resetMpegStubState(this);
+        ps2_syscalls::initializeGuestKernelState(
+            m_memory.getRDRAM(), this);
+        m_cpuContext.r[4] = _mm_setzero_si128();
+        m_cpuContext.r[5] = _mm_setzero_si128();
+        m_cpuContext.r[29] = _mm_set_epi64x(
+            0,
+            static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
+    }
+    else
+    {
+        // MPEG decoder internals and host presentation textures are native
+        // resources, not guest architecture. Start those cold; the game
+        // recreates either on its next use.
+        ps2_stubs::resetMpegStubState(this);
+    }
     m_hostPresentationUploadState->reset();
-    ps2_syscalls::initializeGuestKernelState(
-        m_memory.getRDRAM(), this);
-    m_cpuContext.r[4] = _mm_setzero_si128();
-    m_cpuContext.r[5] = _mm_setzero_si128();
-    m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
     m_debugPc.store(m_cpuContext.pc, std::memory_order_relaxed);
     m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)), std::memory_order_relaxed);
     m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[29], 0)), std::memory_order_relaxed);
     m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[28], 0)), std::memory_order_relaxed);
+    if (!restoredSaveState)
     {
         std::lock_guard<std::recursive_timed_mutex> lock(
             m_guestExecutionMutex);
@@ -18185,6 +18321,7 @@ void PS2Runtime::run()
     if (dedicatedExecutor)
     {
         startDedicatedEeExecution();
+        m_saveStateLoaded = false;
     }
     else
     {
@@ -18267,6 +18404,24 @@ void PS2Runtime::run()
                            std::memory_order_relaxed) >
                    0))
     {
+#if !defined(PLATFORM_VITA)
+        if (IsKeyPressed(KEY_F5))
+        {
+            std::string saveError;
+            if (saveState(m_quickSaveStatePath, &saveError))
+            {
+                std::cout
+                    << "[save-state] wrote "
+                    << m_quickSaveStatePath << std::endl;
+            }
+            else
+            {
+                std::cerr
+                    << "[save-state] failed: "
+                    << saveError << std::endl;
+            }
+        }
+#endif
 #if defined(PS2X_ENABLE_PERF_HUD) && PS2X_ENABLE_PERF_HUD
         if (m_performanceHud)
         {

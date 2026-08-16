@@ -841,6 +841,7 @@ namespace ps2x::timing
                     counter.targetAfterOverflow,
             };
         }
+        result.videoTiming = m_videoTiming;
         result.currentCycle = m_currentCycle;
         result.hSyncStartCycle = m_hSync.startCycle;
         result.vSyncStartCycle = m_vSync.startCycle;
@@ -853,5 +854,59 @@ namespace ps2x::timing
         result.hSyncPhase = m_hSync.phase;
         result.vSyncPhase = m_vSync.phase;
         return result;
+    }
+
+    bool EeCounterBank::restore(
+        const EeCounterBankSnapshot &state) noexcept
+    {
+        if (state.hSyncPhase != EeCounterSignalPhase::Render &&
+            state.hSyncPhase != EeCounterSignalPhase::Blank)
+        {
+            return false;
+        }
+        if (state.vSyncPhase != EeCounterSignalPhase::Render &&
+            state.vSyncPhase != EeCounterSignalPhase::Blank)
+        {
+            return false;
+        }
+        if (state.videoTiming.renderCycles == 0u ||
+            state.videoTiming.blankCycles == 0u ||
+            state.videoTiming.hRenderCycles == 0u ||
+            state.videoTiming.hBlankCycles == 0u)
+        {
+            return false;
+        }
+        for (const EeCounterSnapshot &counter : state.counters)
+        {
+            if (counter.rate == 0u)
+                return false;
+        }
+
+        for (size_t index = 0u; index < m_counters.size(); ++index)
+        {
+            const EeCounterSnapshot &source = state.counters[index];
+            m_counters[index] = {
+                .count = source.count,
+                .mode = source.mode,
+                .target = source.target,
+                .hold = source.hold,
+                .rate = source.rate,
+                .startCycle = source.startCycle,
+                .targetAfterOverflow = source.targetAfterOverflow,
+            };
+        }
+        m_videoTiming = state.videoTiming;
+        m_hSync = {
+            .phase = state.hSyncPhase,
+            .startCycle = state.hSyncStartCycle,
+            .deltaCycles = state.hSyncDeltaCycles,
+        };
+        m_vSync = {
+            .phase = state.vSyncPhase,
+            .startCycle = state.vSyncStartCycle,
+            .deltaCycles = state.vSyncDeltaCycles,
+        };
+        m_currentCycle = state.currentCycle;
+        return true;
     }
 }

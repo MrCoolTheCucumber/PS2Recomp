@@ -145,6 +145,22 @@ namespace ps2x::timing
         uint64_t serviceLimitHits = 0u;
     };
 
+    struct EeEventSlotSnapshot
+    {
+        EeEventSource source = EeEventSource::Cop0Performance;
+        EeTick deadline{};
+        uint64_t generation = 0u;
+        uint64_t sequence = 0u;
+        bool pending = false;
+    };
+
+    struct EeEventSchedulerSnapshot
+    {
+        std::array<EeEventSlotSnapshot, kEeEventSourceCount> slots{};
+        uint64_t nextSequence = 0u;
+        EeEventSchedulerStatistics statistics{};
+    };
+
     class EeEventScheduler
     {
     public:
@@ -171,6 +187,9 @@ namespace ps2x::timing
         [[nodiscard]] bool deadlineDue(EeTick now) const noexcept;
         [[nodiscard]] const EeEventSchedulerStatistics &statistics()
             const noexcept;
+        [[nodiscard]] EeEventSchedulerSnapshot snapshot() const noexcept;
+        [[nodiscard]] bool restore(
+            const EeEventSchedulerSnapshot &snapshot) noexcept;
 
         template <typename Visitor>
         EeEventServiceResult serviceDue(
