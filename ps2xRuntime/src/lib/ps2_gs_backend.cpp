@@ -595,6 +595,56 @@ namespace
         return state;
     }
 
+    bool matchesResourceDescriptionState(
+        const std::array<uint64_t, 13u> &state,
+        const GsDrawCommand &command) noexcept
+    {
+        const GSPrimReg &primitive = command.primitive();
+        const GSContext &context = command.context();
+        const GSTex0Reg &tex0 = context.tex0;
+        const GSTexClutReg &texclut = command.globalState().texclut;
+        if (state[0] !=
+                (static_cast<uint64_t>(primitive.tme) |
+                 (static_cast<uint64_t>(primitive.abe) << 1u) |
+                 (static_cast<uint64_t>(primitive.aa1) << 2u)) ||
+            state[1] !=
+                (static_cast<uint64_t>(context.frame.fbp) |
+                 (static_cast<uint64_t>(context.frame.fbw) << 32u)) ||
+            state[2] !=
+                (static_cast<uint64_t>(context.frame.psm) |
+                 (static_cast<uint64_t>(context.frame.fbmsk) << 8u)) ||
+            state[3] !=
+                (static_cast<uint64_t>(context.zbuf.zbp) |
+                 (static_cast<uint64_t>(context.zbuf.psm) << 32u) |
+                 (static_cast<uint64_t>(context.zbuf.zmask) << 40u)) ||
+            state[4] != context.test ||
+            state[5] != context.alpha)
+        {
+            return false;
+        }
+        if (!primitive.tme)
+            return true;
+
+        return state[6] ==
+                   (static_cast<uint64_t>(tex0.tbp0) |
+                    (static_cast<uint64_t>(tex0.tbw) << 32u) |
+                    (static_cast<uint64_t>(tex0.psm) << 40u) |
+                    (static_cast<uint64_t>(tex0.tw) << 48u) |
+                    (static_cast<uint64_t>(tex0.th) << 56u)) &&
+               state[7] ==
+                   (static_cast<uint64_t>(tex0.cbp) |
+                    (static_cast<uint64_t>(tex0.cpsm) << 32u) |
+                    (static_cast<uint64_t>(tex0.csm) << 40u)) &&
+               state[8] == context.tex1 &&
+               state[9] == context.miptbp1 &&
+               state[10] == context.miptbp2 &&
+               state[11] == context.clamp &&
+               state[12] ==
+                   (static_cast<uint64_t>(texclut.cbw) |
+                    (static_cast<uint64_t>(texclut.cou) << 8u) |
+                    (static_cast<uint64_t>(texclut.cov) << 16u));
+    }
+
     uint64_t surfaceExtent(
         uint32_t widthUnits,
         uint8_t psm,
@@ -984,12 +1034,10 @@ const GsDrawResources &GsDrawResourceCache::describeView(
         context.frame.fbw, context.frame.psm, maximumX, maximumY);
     const uint64_t depthExtent = surfaceExtent(
         context.frame.fbw, context.zbuf.psm, maximumX, maximumY);
-    const std::array<uint64_t, 13u> resourceState =
-        resourceDescriptionState(command);
     if (m_resourceStateValid &&
         m_framebufferExtent == framebufferExtent &&
         m_depthExtent == depthExtent &&
-        m_resourceState == resourceState)
+        matchesResourceDescriptionState(m_resourceState, command))
     {
         return m_resources;
     }
@@ -1017,7 +1065,7 @@ const GsDrawResources &GsDrawResourceCache::describeView(
         &m_mipPages,
         &m_clutPages,
         m_unknownTextureLayout);
-    m_resourceState = resourceState;
+    m_resourceState = resourceDescriptionState(command);
     m_framebufferExtent = framebufferExtent;
     m_depthExtent = depthExtent;
     m_resourceStateValid = true;
