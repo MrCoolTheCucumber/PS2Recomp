@@ -753,7 +753,9 @@ void rasterize_pixel(uint record_index, uint x, uint y)
             fog_channel(source.b, fog_color.b, fixed_fog));
     }
 
-    bool alpha_pass = uint(source.a) >= triangle.alpha_reference;
+    bool alpha_pass =
+        (triangle.raster_flags & 512u) == 0u &&
+        uint(source.a) >= triangle.alpha_reference;
     if (!alpha_pass && (triangle.raster_flags & 128u) != 0u)
         return;
     uint framebuffer_word_index = gs_word_index(

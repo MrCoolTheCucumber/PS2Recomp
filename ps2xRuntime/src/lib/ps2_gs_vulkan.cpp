@@ -877,6 +877,9 @@ namespace
         const bool fixedMipLinearRebias =
             (triangle.rasterFlags &
              GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS) != 0u;
+        const bool alphaTestNever =
+            (triangle.rasterFlags &
+             GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_TEST_NEVER) != 0u;
         const bool accessesDepth =
             (triangle.rasterFlags &
              (GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
@@ -927,6 +930,13 @@ namespace
             triangle.lodL > 3u || triangle.alphaReference > 255u)
         {
             return "Vulkan T8 Gouraud triangle texture state is invalid";
+        }
+        if (alphaTestNever &&
+            (triangle.alphaReference != 0u ||
+             (triangle.rasterFlags &
+              GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY) == 0u))
+        {
+            return "Vulkan T8 Gouraud triangle NEVER alpha state is non-canonical";
         }
         if (fixedMipLinearRebias &&
             (textureDisabled || !constantQFixed ||
@@ -2961,7 +2971,8 @@ prepareGsVulkanPreclassifiedResidentT8GouraudDepthCt32Triangle(
         static_cast<uint8_t>((context.test >> 12u) & 0x3u);
     const bool depthTestEnabled =
         ((context.test >> 16u) & 1u) != 0u;
-    prepared.alphaReference = alphaTestMethod == 1u
+    prepared.alphaReference =
+        (alphaTestMethod == 0u || alphaTestMethod == 1u)
         ? 0u
         : static_cast<uint32_t>((context.test >> 4u) & 0xFFu);
     prepared.paletteIndex = paletteIndex;
@@ -2973,7 +2984,8 @@ prepareGsVulkanPreclassifiedResidentT8GouraudDepthCt32Triangle(
           ((context.test >> 17u) & 0x3u) == 2u)
              ? GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL
              : 0u) |
-        (depthTestEnabled && !context.zbuf.zmask
+        (depthTestEnabled && alphaTestMethod != 0u &&
+         !context.zbuf.zmask
              ? GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE
              : 0u) |
         ((alphaFailMethod == 3u)
@@ -2993,6 +3005,9 @@ prepareGsVulkanPreclassifiedResidentT8GouraudDepthCt32Triangle(
              : 0u) |
         (fixedBaseLevel
              ? GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS
+             : 0u) |
+        ((alphaTestMethod == 0u)
+             ? GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_TEST_NEVER
              : 0u);
 
     return {true, GsFallbackReason::Supported};
@@ -3867,7 +3882,7 @@ namespace
     static_assert(
         kGsGouraudDepthCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(
-        sizeof(kGsT8GouraudDepthCt32TriangleShaderSpv) == 220516u);
+        sizeof(kGsT8GouraudDepthCt32TriangleShaderSpv) == 220932u);
     static_assert(
         kGsT8GouraudDepthCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);

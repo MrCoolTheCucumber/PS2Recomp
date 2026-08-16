@@ -1214,6 +1214,10 @@ inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_KEEP =
     1u << 7u;
 inline constexpr uint32_t
 GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS = 1u << 8u;
+// ATST=NEVER with AFAIL=RGB_ONLY still executes texture, fog, blending, and
+// framebuffer RGB writes, but it can never update framebuffer alpha or Z.
+inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_TEST_NEVER =
+    1u << 9u;
 inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_VALID_FLAGS =
     GS_VULKAN_T8_GOURAUD_FLAG_FOG |
     GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
@@ -1223,7 +1227,8 @@ inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_VALID_FLAGS =
     GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED |
     GS_VULKAN_T8_GOURAUD_FLAG_ADDITIVE_SOURCE_ALPHA |
     GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_KEEP |
-    GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS;
+    GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS |
+    GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_TEST_NEVER;
 
 // Compact resident record for the same exact T8 contract. Palettes are
 // captured once per distinct consecutive CLUT image and indexed explicitly

@@ -5890,6 +5890,48 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(triangle.reserved, 0u,
                      "prepared ABI padding must remain deterministic");
 
+            GSContext neverContext = command.context();
+            // ATE=1, ATST=NEVER, AFAIL=RGB_ONLY, DATE=0,
+            // ZTE=1, ZTST=GEQUAL.
+            neverContext.test = 0x53001ull;
+            const GsDrawCommand never = buildGsDrawCommand(
+                34u,
+                command.primitive(),
+                neverContext,
+                std::span<const GSVertex>(command.vertices()),
+                command.globalState());
+            GsVulkanT8GouraudDepthCt32Triangle neverRecord{};
+            const GsBackendDecision neverDecision =
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
+                    never, palette, neverRecord);
+            t.IsTrue(
+                neverDecision.supported,
+                "NEVER/RGB_ONLY T8 triangles should retain framebuffer RGB work");
+            t.Equals(
+                neverRecord.rasterFlags,
+                GS_VULKAN_T8_GOURAUD_FLAG_FOG |
+                    GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
+                    GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY |
+                    GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_TEST_NEVER,
+                "NEVER preparation should suppress alpha and depth writes explicitly");
+            t.Equals(
+                neverRecord.alphaReference, 0u,
+                "NEVER preparation should canonicalize its ignored reference");
+
+            GSContext rejectedNeverContext = neverContext;
+            rejectedNeverContext.test &= ~(3ull << 12u);
+            rejectedNeverContext.test |= 1ull << 12u;
+            const GsDrawCommand rejectedNever = buildGsDrawCommand(
+                34u,
+                command.primitive(),
+                rejectedNeverContext,
+                std::span<const GSVertex>(command.vertices()),
+                command.globalState());
+            t.Equals(
+                classifyGsT8GouraudDepthCt32Triangle(rejectedNever).reason,
+                GsFallbackReason::AlphaTest,
+                "NEVER alpha tests outside RGB_ONLY must remain in software");
+
             GSPrimReg framebufferOnlyPrimitive = command.primitive();
             framebufferOnlyPrimitive.type = GS_PRIM_TRIANGLE;
             framebufferOnlyPrimitive.fge = false;
@@ -20424,8 +20466,19 @@ void register_ps2_gs_vulkan_tests()
                 first.context(),
                 std::span<const GSVertex>(secondVertices),
                 first.globalState());
-            const std::array<GsDrawCommand, 5> commands{{
-                first, second, fixed, untextured, untexturedGouraud}};
+            GSContext neverContext = first.context();
+            // ATE=1, ATST=NEVER, AFAIL=RGB_ONLY, DATE=0,
+            // ZTE=1, ZTST=GEQUAL.
+            neverContext.test = 0x53001ull;
+            const GsDrawCommand never = buildGsDrawCommand(
+                30'106u,
+                first.primitive(),
+                neverContext,
+                std::span<const GSVertex>(first.vertices()),
+                first.globalState());
+            const std::array<GsDrawCommand, 6> commands{{
+                first, second, fixed, untextured, untexturedGouraud,
+                never}};
 
             std::array<uint32_t, 256> palette{};
             std::vector<uint8_t> initial =
@@ -20473,7 +20526,7 @@ void register_ps2_gs_vulkan_tests()
                 }
             }
 
-            std::array<GsVulkanT8GouraudDepthCt32Triangle, 5> prepared{};
+            std::array<GsVulkanT8GouraudDepthCt32Triangle, 6> prepared{};
             for (size_t index = 0u; index < commands.size(); ++index)
             {
                 const std::span<const uint32_t> decodedPalette =
@@ -20495,6 +20548,10 @@ void register_ps2_gs_vulkan_tests()
                 (prepared[2].rasterFlags &
                  GS_VULKAN_T8_GOURAUD_FLAG_ADDITIVE_SOURCE_ALPHA) != 0u,
                 "the resident fixture should include one additive-alpha record");
+            t.IsTrue(
+                (prepared[5].rasterFlags &
+                 GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_TEST_NEVER) != 0u,
+                "the resident fixture should include one NEVER/RGB_ONLY record");
             GsVulkanT8GouraudDepthCt32Triangle thirdPrepared{};
             const GsBackendDecision thirdDecision =
                 prepareGsVulkanT8GouraudDepthCt32Triangle(
@@ -20525,7 +20582,8 @@ void register_ps2_gs_vulkan_tests()
                 return output;
             };
             const std::vector<uint8_t> expectedSingle = renderSoftware(1u);
-            const std::vector<uint8_t> expectedResident = renderSoftware(5u);
+            const std::vector<uint8_t> expectedResident =
+                renderSoftware(commands.size());
             const auto renderOneSoftware = [&](const GsDrawCommand &command)
             {
                 std::vector<uint8_t> output = initial;
@@ -20547,6 +20605,8 @@ void register_ps2_gs_vulkan_tests()
                 renderOneSoftware(untextured);
             const std::vector<uint8_t> expectedUntexturedGouraud =
                 renderOneSoftware(untexturedGouraud);
+            const std::vector<uint8_t> expectedNever =
+                renderOneSoftware(never);
 
             GsVulkanCapabilityReport preflight{};
             const GsVulkanServiceConfig config =
@@ -20699,6 +20759,27 @@ void register_ps2_gs_vulkan_tests()
                         actualUntexturedGouraud.begin())));
                 return;
             }
+            std::vector<uint8_t> actualNever = {0xA5u};
+            if (!service->executeT8GouraudDepthCt32Triangle(
+                    initial, prepared[5], actualNever,
+                    &operationError))
+            {
+                t.Fail(
+                    "NEVER/RGB_ONLY Vulkan execution failed: " +
+                    operationError);
+                return;
+            }
+            if (actualNever != expectedNever)
+            {
+                const auto mismatch = std::mismatch(
+                    actualNever.begin(), actualNever.end(),
+                    expectedNever.begin());
+                t.Fail(
+                    "NEVER/RGB_ONLY Vulkan execution first disagreed with software at byte " +
+                    std::to_string(static_cast<size_t>(
+                        mismatch.first - actualNever.begin())));
+                return;
+            }
 
             GsVramPageMask allPages;
             allPages.setAll();
@@ -20806,8 +20887,8 @@ void register_ps2_gs_vulkan_tests()
                 service->statistics();
             t.Equals(
                 statistics.t8GouraudDepthCt32TriangleDrawsCompleted,
-                10ull,
-                "five single and five resident triangle draws should complete");
+                12ull,
+                "six single and six resident triangle draws should complete");
             t.Equals(
                 statistics.t8GouraudDepthCt32TriangleDrawsFailed,
                 0ull,
@@ -20819,10 +20900,10 @@ void register_ps2_gs_vulkan_tests()
                 "the dependent resident pair should use one batch");
             t.Equals(
                 statistics.largestResidentT8GouraudDepthCt32TriangleBatch,
-                5ull,
-                "the resident batch high water should retain all five draws");
-            t.Equals(statistics.shaderDispatches, 6ull,
-                     "five single plus ordered resident execution should use six dispatches");
+                6ull,
+                "the resident batch high water should retain all six draws");
+            t.Equals(statistics.shaderDispatches, 7ull,
+                     "six single plus ordered resident execution should use seven dispatches");
             t.Equals(statistics.validationErrors, 0u,
                      "T8 execution must remain validation-clean");
             t.Equals(statistics.validationWarnings, 0u,

@@ -1867,10 +1867,12 @@ GsBackendDecision classifyGsT8GouraudDepthCt32Triangle(
         static_cast<uint8_t>((context.test >> 1u) & 0x7u);
     const uint8_t alphaFailMethod =
         static_cast<uint8_t>((context.test >> 12u) & 0x3u);
+    const bool alphaNever = alphaTestMethod == 0u;
     const bool alphaAlways = alphaTestMethod == 1u;
     const bool alphaGequal = alphaTestMethod == 5u;
     if (!alphaTestEnabled ||
         (!alphaAlways &&
+         !(alphaNever && alphaFailMethod == 3u) &&
          (!alphaGequal ||
           (alphaFailMethod != 0u &&
            alphaFailMethod != 1u && alphaFailMethod != 3u))))
