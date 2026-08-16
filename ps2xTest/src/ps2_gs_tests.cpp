@@ -1673,10 +1673,20 @@ void register_ps2_gs_tests()
                 3ull,
                 "every short-run command should name the cost policy");
             t.Equals(
+                counters.decisionPixels[static_cast<size_t>(
+                    GsFallbackReason::CostModel)],
+                192ull,
+                "cost decisions should retain exact deferred pixel work");
+            t.Equals(
                 counters.decisions[static_cast<size_t>(
                     GsFallbackReason::Supported)],
                 3ull,
                 "every admitted run member should be supported once");
+            t.Equals(
+                counters.decisionPixels[static_cast<size_t>(
+                    GsFallbackReason::Supported)],
+                192ull,
+                "supported decisions should retain exact admitted pixel work");
         });
 
         tc.Run("GS frontend routes draws and visibility boundaries through the software backend", [](TestCase &t)

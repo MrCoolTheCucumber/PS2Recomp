@@ -304,6 +304,7 @@ struct GsBackendCounters
     // than a batch wall-clock measurement.
     uint64_t softwareRasterHostNanoseconds = 0;
     std::array<uint64_t, GS_FALLBACK_REASON_COUNT> decisions{};
+    std::array<uint64_t, GS_FALLBACK_REASON_COUNT> decisionPixels{};
     std::array<uint64_t, GS_FLUSH_REASON_COUNT> flushReasons{};
 };
 
@@ -443,7 +444,8 @@ private:
         GsFlushReason reason);
     void resolvePendingHybrid(bool accelerate);
     void updateDeferredQueueDepth() noexcept;
-    void recordDecision(GsFallbackReason reason) noexcept;
+    void recordDecision(
+        GsFallbackReason reason, uint64_t pixels) noexcept;
     void recordFlush(GsFlushReason reason) noexcept;
     void updateQueueDepth(const IGsRasterBackend &backend) noexcept;
 

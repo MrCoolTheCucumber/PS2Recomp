@@ -1975,7 +1975,7 @@ GsSubmissionResult GsBackendRouter::submit(
         if (m_countersEnabled)
         {
             ++m_counters.noopCommands;
-            recordDecision(GsFallbackReason::EmptyBounds);
+            recordDecision(GsFallbackReason::EmptyBounds, pixels);
         }
         return {
             true,
@@ -2008,7 +2008,7 @@ GsSubmissionResult GsBackendRouter::submit(
         {
             ++m_counters.softwareCommands;
             m_counters.softwarePixels += pixels;
-            recordDecision(GsFallbackReason::Supported);
+            recordDecision(GsFallbackReason::Supported, pixels);
             updateQueueDepth(*m_softwareBackend);
         }
         return {
@@ -2046,7 +2046,7 @@ GsSubmissionResult GsBackendRouter::submit(
         if (compatible)
         {
             if (m_countersEnabled)
-                recordDecision(decision.reason);
+                recordDecision(decision.reason, pixels);
             transitionTo(ActiveBackend::Accelerated);
             m_acceleratedBackend->submit(
                 std::span<const GsDrawCommand>(&command, 1u));
@@ -2120,7 +2120,7 @@ GsSubmissionResult GsBackendRouter::submit(
     if (decision.supported)
     {
         if (m_countersEnabled)
-            recordDecision(decision.reason);
+            recordDecision(decision.reason, pixels);
         transitionTo(ActiveBackend::Accelerated);
         m_acceleratedBackend->submit(
             std::span<const GsDrawCommand>(&command, 1u));
@@ -2143,7 +2143,7 @@ GsSubmissionResult GsBackendRouter::submit(
     {
         if (m_countersEnabled)
         {
-            recordDecision(decision.reason);
+            recordDecision(decision.reason, pixels);
             ++m_counters.strictFailures;
             m_counters.strictFailurePixels += pixels;
         }
@@ -2163,7 +2163,7 @@ GsSubmissionResult GsBackendRouter::submit(
     m_activeBackend = ActiveBackend::Software;
     if (m_countersEnabled)
     {
-        recordDecision(decision.reason);
+        recordDecision(decision.reason, pixels);
         ++m_counters.softwareCommands;
         ++m_counters.fallbackCommands;
         m_counters.softwarePixels += pixels;
@@ -2413,12 +2413,13 @@ void GsBackendRouter::resolvePendingHybrid(bool accelerate)
 
     if (!m_countersEnabled)
         return;
-    for (size_t index = 0u; index < commandCount; ++index)
+    for (const GsDrawCommand &command : commands)
     {
         recordDecision(
             accelerate
                 ? GsFallbackReason::Supported
-                : GsFallbackReason::CostModel);
+                : GsFallbackReason::CostModel,
+            drawPixelCount(command));
     }
     if (accelerate)
     {
@@ -2455,11 +2456,14 @@ void GsBackendRouter::updateDeferredQueueDepth() noexcept
 }
 
 void GsBackendRouter::recordDecision(
-    GsFallbackReason reason) noexcept
+    GsFallbackReason reason, uint64_t pixels) noexcept
 {
     const size_t index = static_cast<size_t>(reason);
     if (index < m_counters.decisions.size())
+    {
         ++m_counters.decisions[index];
+        m_counters.decisionPixels[index] += pixels;
+    }
 }
 
 void GsBackendRouter::recordFlush(GsFlushReason reason) noexcept

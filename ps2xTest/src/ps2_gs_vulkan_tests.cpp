@@ -10071,6 +10071,16 @@ void register_ps2_gs_vulkan_tests()
                     GsFallbackReason::CostModel)],
                 1ull,
                 "the named cost-model decision should be counted once");
+            t.Equals(
+                counters.decisionPixels[static_cast<size_t>(
+                    GsFallbackReason::CostModel)],
+                16ull,
+                "the named cost-model decision should retain pixel work");
+            t.Equals(
+                counters.decisionPixels[static_cast<size_t>(
+                    GsFallbackReason::Supported)],
+                64ull,
+                "the supported decision should retain accelerated pixels");
             t.Equals(counters.queueHighWatermark, 1ull,
                      "the cost sequence should expose one queued GPU draw");
 

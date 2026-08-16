@@ -206,6 +206,18 @@ namespace
                    << counters.decisions[index];
         }
 
+        output << "},\"decision_pixels\":{";
+        for (size_t index = 0u;
+             index < GS_FALLBACK_REASON_COUNT;
+             ++index)
+        {
+            if (index != 0u)
+                output << ',';
+            const auto reason = static_cast<GsFallbackReason>(index);
+            output << '\"' << gsFallbackReasonName(reason) << "\":"
+                   << counters.decisionPixels[index];
+        }
+
         output << "},\"flush_reasons\":{";
         for (size_t index = 0u;
              index < GS_FLUSH_REASON_COUNT;
