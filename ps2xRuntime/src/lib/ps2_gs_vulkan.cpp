@@ -2614,17 +2614,11 @@ __attribute__((target_clones("fma", "default"),
                optimize("fp-contract=off")))
 #endif
 GsBackendDecision
-prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
+prepareGsVulkanPreclassifiedResidentT8GouraudDepthCt32Triangle(
     const GsDrawCommand &command,
     uint32_t paletteIndex,
-    GsVulkanResidentT8GouraudDepthCt32Triangle &triangle,
-    const GsDrawResources *classifiedResources) noexcept
+    GsVulkanResidentT8GouraudDepthCt32Triangle &triangle) noexcept
 {
-    const GsBackendDecision decision = classifiedResources
-        ? GsBackendDecision{true, GsFallbackReason::Supported}
-        : classifyGsT8GouraudDepthCt32Triangle(command);
-    if (!decision.supported)
-        return decision;
     const GSPrimReg &primitive = command.primitive();
     const bool textured = primitive.tme;
     const GSContext &context = command.context();
@@ -2703,7 +2697,8 @@ prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
     const float gradientY02OverCross =
         gradientDy02 / gradientCross;
 
-    GsVulkanResidentT8GouraudDepthCt32Triangle prepared{};
+    triangle = {};
+    GsVulkanResidentT8GouraudDepthCt32Triangle &prepared = triangle;
     const float textureScaleU = textured
         ? static_cast<float>(65536u << context.tex0.tw)
         : 1.0f;
@@ -2986,14 +2981,34 @@ prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
              ? GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS
              : 0u);
 
-    // The classifier already proved exact non-aliasing resource masks for
-    // this immutable command. The service boundary repeats the complete raw-
-    // record validation before device execution; avoid rebuilding all page
-    // ranges a third time during record preparation.
+    return {true, GsFallbackReason::Supported};
+}
+
+GsBackendDecision
+prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
+    const GsDrawCommand &command,
+    uint32_t paletteIndex,
+    GsVulkanResidentT8GouraudDepthCt32Triangle &triangle,
+    const GsDrawResources *classifiedResources) noexcept
+{
+    const GsBackendDecision decision = classifiedResources
+        ? GsBackendDecision{true, GsFallbackReason::Supported}
+        : classifyGsT8GouraudDepthCt32Triangle(command);
+    if (!decision.supported)
+        return decision;
+
+    GsVulkanResidentT8GouraudDepthCt32Triangle prepared{};
+    const GsBackendDecision setup =
+        prepareGsVulkanPreclassifiedResidentT8GouraudDepthCt32Triangle(
+            command, paletteIndex, prepared);
+    if (!setup.supported)
+        return setup;
     if (!classifiedResources &&
         t8GouraudDepthCt32TriangleValidationError(
             prepared, false, true))
+    {
         return {false, GsFallbackReason::UnknownMemoryLayout};
+    }
     triangle = prepared;
     return decision;
 }

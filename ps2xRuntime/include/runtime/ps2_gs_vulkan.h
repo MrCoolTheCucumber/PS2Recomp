@@ -1303,6 +1303,16 @@ prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
     GsVulkanResidentT8GouraudDepthCt32Triangle &triangle,
     const GsDrawResources *classifiedResources = nullptr) noexcept;
 
+// Preparation-only entry point for the Vulkan backend after it has retained
+// a successful T8 classification and exact resource view. Unlike the public
+// classifier/preparer above, this may construct the record directly in its
+// destination because only geometric setup can still reject the command.
+[[nodiscard]] GsBackendDecision
+prepareGsVulkanPreclassifiedResidentT8GouraudDepthCt32Triangle(
+    const GsDrawCommand &command,
+    uint32_t paletteIndex,
+    GsVulkanResidentT8GouraudDepthCt32Triangle &triangle) noexcept;
+
 // Narrow injectable execution seam used by the Phase 3 verification backend.
 // Production requests still enter through the single-owner service below.
 class IGsVulkanDrawExecutor

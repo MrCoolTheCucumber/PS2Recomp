@@ -2013,9 +2013,8 @@ void GsVulkanRasterBackend::submit(
                 t8Palette = m_impl->cachedDecodedPalette;
             }
             const GsBackendDecision prepared =
-                prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
-                    command, 0u, t8GouraudDepthTriangle,
-                    &resources);
+                prepareGsVulkanPreclassifiedResidentT8GouraudDepthCt32Triangle(
+                    command, 0u, t8GouraudDepthTriangle);
             if (!prepared.supported)
             {
                 m_impl->failRequest(
