@@ -6062,21 +6062,91 @@ void register_ps2_gs_vulkan_tests()
                     "untextured setup should use canonical unit Q");
             }
 
-            const GsDrawCommand rejectedFixedMip = buildGsDrawCommand(
+            const GsDrawCommand fixedMipBase = buildGsDrawCommand(
                 37u, fixedCoordinates, command.context(),
+                std::span<const GSVertex>(fixedVertices),
+                command.globalState());
+            GsVulkanT8GouraudDepthCt32Triangle fixedMipBaseRecord{};
+            const GsBackendDecision fixedMipBaseDecision =
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
+                    fixedMipBase, palette, fixedMipBaseRecord);
+            t.IsTrue(
+                fixedMipBaseDecision.supported,
+                "negative-LOD fixed UV mipmaps should use the exact base-level path");
+            t.Equals(
+                fixedMipBaseRecord.maximumMipLevel, 0u,
+                "a fixed UV negative LOD should canonicalize to the base mip level");
+            t.Equals(
+                fixedMipBaseRecord.rasterFlags,
+                GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
+                    GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE |
+                    GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY |
+                    GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED |
+                    GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS,
+                "fixed UV mip magnification should retain its software scanline rebias");
+
+            GSContext noDepthAlwaysContext = command.context();
+            // ATE=1, ATST=ALWAYS, DATE=0, ZTE=0.
+            noDepthAlwaysContext.test = 0x43u;
+            const GsDrawCommand noDepthAlways = buildGsDrawCommand(
+                38u, fixedCoordinates, noDepthAlwaysContext,
+                std::span<const GSVertex>(fixedVertices),
+                command.globalState());
+            GsVulkanT8GouraudDepthCt32Triangle noDepthAlwaysRecord{};
+            const GsBackendDecision noDepthAlwaysDecision =
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
+                    noDepthAlways, palette, noDepthAlwaysRecord);
+            t.IsTrue(
+                noDepthAlwaysDecision.supported,
+                "fixed UV mip triangles with disabled depth and ALWAYS alpha should be eligible");
+            t.Equals(
+                noDepthAlwaysRecord.rasterFlags,
+                GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED |
+                    GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS,
+                "disabled depth should not leak the inactive ZTST or depth-write state");
+            t.Equals(
+                noDepthAlwaysRecord.alphaReference, 0u,
+                "ALWAYS alpha should publish a canonical zero reference");
+
+            GSContext noDepthKeepContext = noDepthAlwaysContext;
+            // ATE=1, ATST=GEQUAL, AREF=4, AFAIL=KEEP, DATE=0,
+            // ZTE=0, ZTST=ALWAYS.
+            noDepthKeepContext.test = 0x2004Bu;
+            const GsDrawCommand noDepthKeep = buildGsDrawCommand(
+                39u, fixedCoordinates, noDepthKeepContext,
+                std::span<const GSVertex>(fixedVertices),
+                command.globalState());
+            GsVulkanT8GouraudDepthCt32Triangle noDepthKeepRecord{};
+            const GsBackendDecision noDepthKeepDecision =
+                prepareGsVulkanT8GouraudDepthCt32Triangle(
+                    noDepthKeep, palette, noDepthKeepRecord);
+            t.IsTrue(
+                noDepthKeepDecision.supported,
+                "fixed UV mip triangles with KEEP alpha failure should be eligible");
+            t.Equals(
+                noDepthKeepRecord.rasterFlags,
+                GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED |
+                    GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_KEEP |
+                    GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS,
+                "KEEP alpha failure should be explicit without enabling depth");
+
+            GSContext nonBaseFixedMip = command.context();
+            nonBaseFixedMip.tex1 &= ~(0xFFFull << 32u);
+            const GsDrawCommand rejectedFixedMip = buildGsDrawCommand(
+                40u, fixedCoordinates, nonBaseFixedMip,
                 std::span<const GSVertex>(fixedVertices),
                 command.globalState());
             t.Equals(
                 classifyGsT8GouraudDepthCt32Triangle(
                     rejectedFixedMip).reason,
                 GsFallbackReason::UnsupportedTextureFilter,
-                "fixed UV with mipmaps must remain in software fallback");
+                "fixed UV mipmaps which can select another level must remain in software fallback");
 
             GSContext nearestMip = command.context();
             nearestMip.tex1 &= ~(0x7ull << 6u);
             nearestMip.tex1 |= 1ull << 6u;
             const GsDrawCommand rejectedFilter = buildGsDrawCommand(
-                38u, command.primitive(), nearestMip,
+                41u, command.primitive(), nearestMip,
                 std::span<const GSVertex>(command.vertices()),
                 command.globalState());
             t.Equals(

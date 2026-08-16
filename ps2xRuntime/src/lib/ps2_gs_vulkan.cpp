@@ -857,6 +857,12 @@ namespace
         const bool textureDisabled =
             (triangle.rasterFlags &
              GS_VULKAN_T8_GOURAUD_FLAG_TEXTURE_DISABLED) != 0u;
+        const bool constantQFixed =
+            (triangle.rasterFlags &
+             GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED) != 0u;
+        const bool fixedMipLinearRebias =
+            (triangle.rasterFlags &
+             GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS) != 0u;
         const auto allZero = [](const auto &values)
         {
             return std::all_of(
@@ -903,6 +909,12 @@ namespace
             triangle.lodL > 3u || triangle.alphaReference > 255u)
         {
             return "Vulkan T8 Gouraud triangle texture state is invalid";
+        }
+        if (fixedMipLinearRebias &&
+            (textureDisabled || !constantQFixed ||
+             triangle.maximumMipLevel != 0u))
+        {
+            return "Vulkan T8 Gouraud triangle fixed mip rebias state is invalid";
         }
         for (uint32_t level = 0u;
              level <= triangle.maximumMipLevel;
@@ -2898,7 +2910,12 @@ prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
 
     prepared.textureBaseBlocks[0] = textured ? context.tex0.tbp0 : 0u;
     prepared.textureWidths[0] = textured ? context.tex0.tbw : 1u;
-    prepared.maximumMipLevel = maximumMipLevel;
+    // Fixed UVs imply Q=1. A negative K clamps these draws to the base level,
+    // so retain the already exact no-mipmap device contract.
+    const bool fixedBaseLevel =
+        primitive.fst && maximumMipLevel != 0u &&
+        (((context.tex1 >> 32u) & 0x800u) != 0u);
+    prepared.maximumMipLevel = fixedBaseLevel ? 0u : maximumMipLevel;
     for (uint32_t level = 1u;
          level <= prepared.maximumMipLevel;
          ++level)
@@ -2925,20 +2942,28 @@ prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
         prepared.lodL =
             static_cast<uint32_t>((context.tex1 >> 19u) & 0x3u);
     }
-    prepared.alphaReference =
-        static_cast<uint32_t>((context.test >> 4u) & 0xFFu);
+    const uint8_t alphaTestMethod =
+        static_cast<uint8_t>((context.test >> 1u) & 0x7u);
+    const uint8_t alphaFailMethod =
+        static_cast<uint8_t>((context.test >> 12u) & 0x3u);
+    const bool depthTestEnabled =
+        ((context.test >> 16u) & 1u) != 0u;
+    prepared.alphaReference = alphaTestMethod == 1u
+        ? 0u
+        : static_cast<uint32_t>((context.test >> 4u) & 0xFFu);
     prepared.paletteIndex = paletteIndex;
     prepared.rasterFlags =
         (command.primitive().fge
              ? GS_VULKAN_T8_GOURAUD_FLAG_FOG
              : 0u) |
-        ((((context.test >> 17u) & 0x3u) == 2u)
+        ((depthTestEnabled &&
+          ((context.test >> 17u) & 0x3u) == 2u)
              ? GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL
              : 0u) |
-        (!context.zbuf.zmask
+        (depthTestEnabled && !context.zbuf.zmask
              ? GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE
              : 0u) |
-        ((((context.test >> 12u) & 0x3u) == 3u)
+        ((alphaFailMethod == 3u)
              ? GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY
              : 0u) |
         (constantQFixed
@@ -2949,6 +2974,12 @@ prepareGsVulkanResidentT8GouraudDepthCt32Triangle(
              : 0u) |
         (((context.alpha & 0xFFu) == 0x48u)
              ? GS_VULKAN_T8_GOURAUD_FLAG_ADDITIVE_SOURCE_ALPHA
+             : 0u) |
+        ((alphaTestMethod == 5u && alphaFailMethod == 0u)
+             ? GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_KEEP
+             : 0u) |
+        (fixedBaseLevel
+             ? GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS
              : 0u);
 
     // The classifier already proved exact non-aliasing resource masks for
@@ -3803,7 +3834,7 @@ namespace
     static_assert(
         kGsGouraudDepthCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(
-        sizeof(kGsT8GouraudDepthCt32TriangleShaderSpv) == 218876u);
+        sizeof(kGsT8GouraudDepthCt32TriangleShaderSpv) == 220516u);
     static_assert(
         kGsT8GouraudDepthCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);

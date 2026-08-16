@@ -1761,8 +1761,13 @@ GsBackendDecision classifyGsT8GouraudDepthCt32Triangle(
         static_cast<uint8_t>((context.test >> 1u) & 0x7u);
     const uint8_t alphaFailMethod =
         static_cast<uint8_t>((context.test >> 12u) & 0x3u);
-    if (!alphaTestEnabled || alphaTestMethod != 5u ||
-        (alphaFailMethod != 1u && alphaFailMethod != 3u))
+    const bool alphaAlways = alphaTestMethod == 1u;
+    const bool alphaGequal = alphaTestMethod == 5u;
+    if (!alphaTestEnabled ||
+        (!alphaAlways &&
+         (!alphaGequal ||
+          (alphaFailMethod != 0u &&
+           alphaFailMethod != 1u && alphaFailMethod != 3u))))
     {
         return {false, GsFallbackReason::AlphaTest};
     }
@@ -1808,9 +1813,15 @@ GsBackendDecision classifyGsT8GouraudDepthCt32Triangle(
     const bool fixedLod = (context.tex1 & 1u) != 0u;
     const bool automaticMipBase =
         ((context.tex1 >> 9u) & 1u) != 0u;
+    const uint16_t rawLodK =
+        static_cast<uint16_t>((context.tex1 >> 32u) & 0xFFFu);
+    const bool fixedUvMipClampsToBase =
+        primitive.fst && maximumMipLevel != 0u &&
+        (rawLodK & 0x800u) != 0u;
     if (primitive.tme &&
         (maximumMipLevel > 3u ||
-         (primitive.fst && maximumMipLevel != 0u) ||
+         (primitive.fst && maximumMipLevel != 0u &&
+          !fixedUvMipClampsToBase) ||
          magnificationFilter != 1u ||
          (maximumMipLevel == 0u
               ? minificationFilter != 1u && minificationFilter != 4u
@@ -1840,8 +1851,8 @@ GsBackendDecision classifyGsT8GouraudDepthCt32Triangle(
         static_cast<uint8_t>((context.test >> 17u) & 0x3u);
     if ((context.zbuf.psm != GS_PSM_Z32 &&
          context.zbuf.psm != GS_PSM_Z24) ||
-        !depthTestEnabled ||
-        (depthTestMethod != 1u && depthTestMethod != 2u))
+        (depthTestEnabled &&
+         depthTestMethod != 1u && depthTestMethod != 2u))
     {
         return {false, GsFallbackReason::UnsupportedDepthFunction};
     }

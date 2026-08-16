@@ -381,7 +381,8 @@ uint sample_linear_level(int fixed_u, int fixed_v, uint level)
         fixed_u = floor_divide_power_of_two(fixed_u, divisor);
         fixed_v = floor_divide_power_of_two(fixed_v, divisor);
     }
-    if ((triangle.raster_flags & 16u) == 0u)
+    if ((triangle.raster_flags & 16u) == 0u ||
+        (triangle.raster_flags & 256u) != 0u)
     {
         fixed_u = int(uint(fixed_u) - 0x8000u);
         fixed_v = int(uint(fixed_v) - 0x8000u);
@@ -753,6 +754,8 @@ void rasterize_pixel(uint record_index, uint x, uint y)
     }
 
     bool alpha_pass = uint(source.a) >= triangle.alpha_reference;
+    if (!alpha_pass && (triangle.raster_flags & 128u) != 0u)
+        return;
     uint framebuffer_word_index = gs_word_index(
         0x00u, triangle.framebuffer_base_block, x, y);
     uint destination =
