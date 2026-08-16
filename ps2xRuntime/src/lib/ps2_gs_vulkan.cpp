@@ -863,6 +863,10 @@ namespace
         const bool fixedMipLinearRebias =
             (triangle.rasterFlags &
              GS_VULKAN_T8_GOURAUD_FLAG_FIXED_MIP_LINEAR_REBIAS) != 0u;
+        const bool accessesDepth =
+            (triangle.rasterFlags &
+             (GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
+              GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE)) != 0u;
         const auto allZero = [](const auto &values)
         {
             return std::all_of(
@@ -1042,7 +1046,7 @@ namespace
                 triangle.boundsY0,
                 width,
                 height);
-        if (framebufferPages.intersects(depthPages))
+        if (accessesDepth && framebufferPages.intersects(depthPages))
             return "Vulkan T8 Gouraud triangle color and depth alias";
         if (textureDisabled)
             return nullptr;
@@ -1061,7 +1065,7 @@ namespace
                 std::max(1u, (1u << triangle.textureHeightLog2) >> level)));
         }
         if (texturePages.intersects(framebufferPages) ||
-            texturePages.intersects(depthPages))
+            (accessesDepth && texturePages.intersects(depthPages)))
         {
             return "Vulkan T8 Gouraud triangle texture aliases output";
         }

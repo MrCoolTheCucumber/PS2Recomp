@@ -20260,6 +20260,10 @@ void register_ps2_gs_vulkan_tests()
             thirdPrimitive.fge = false;
             GSContext thirdContext = first.context();
             thirdContext.zbuf.zmask = true;
+            // This variant has no depth test or write. Keep an intentionally
+            // aliased inactive Z surface so service validation exercises the
+            // same resource contract as classification.
+            thirdContext.zbuf.zbp = thirdContext.frame.fbp;
             thirdContext.tex1 =
                 (1ull << 5u) | (1ull << 6u) | (1ull << 9u);
             thirdContext.test = 0x3180Bull;
@@ -20276,6 +20280,10 @@ void register_ps2_gs_vulkan_tests()
                 thirdContext,
                 std::span<const GSVertex>(thirdVertices),
                 first.globalState());
+            t.IsFalse(
+                third.resources().depthReadPages.any() ||
+                    third.resources().depthWritePages.any(),
+                "inactive aliased depth should not enter the draw resource view");
             GSPrimReg fixedPrimitive = first.primitive();
             fixedPrimitive.type = GS_PRIM_TRIANGLE;
             fixedPrimitive.iip = false;
