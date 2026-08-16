@@ -1014,6 +1014,8 @@ int main(int argc, char **argv)
             argument ==
                 "--vulkan-min-hybrid-source-copy-alpha-pixels" ||
             argument == "--vulkan-min-hybrid-depth-ct32-pixels" ||
+            argument ==
+                "--vulkan-min-hybrid-alpha-fail-depth-run-pixels" ||
             argument == "--vulkan-min-hybrid-nearest-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-linear-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-linear-ct32-clamp-pixels" ||
