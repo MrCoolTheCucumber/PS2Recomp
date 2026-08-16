@@ -1414,6 +1414,35 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         return decision;
     }
 
+    if (decision.reason == GsFallbackReason::AlphaBlend)
+    {
+        GsVulkanDepthCt32Sprite sourceOverSprite{};
+        const GsBackendDecision sourceOverDecision =
+            prepareGsVulkanSourceOverCt32Sprite(
+                command, sourceOverSprite);
+        if (sourceOverDecision.supported)
+        {
+            if (!m_impl->exactDepthCt32Sprite)
+                return {false, GsFallbackReason::BackendUnavailable};
+            if (m_impl->config.mode == GsRendererMode::Hybrid)
+            {
+                const uint64_t pixels =
+                    static_cast<uint64_t>(
+                        sourceOverSprite.boundsX1 -
+                        sourceOverSprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sourceOverSprite.boundsY1 -
+                        sourceOverSprite.boundsY0);
+                if (pixels <
+                    m_impl->config.minimumHybridSourceOverSpritePixels)
+                {
+                    return {false, GsFallbackReason::CostModel};
+                }
+            }
+            return sourceOverDecision;
+        }
+    }
+
     // Depth is exact through full-image Verify and ordered resident execution.
     // Hybrid uses the conservative isolated-draw crossover measured across
     // Z32/Z24 ALWAYS and comparison states.
@@ -2051,15 +2080,21 @@ void GsVulkanRasterBackend::submit(
             if (!spriteDecision.supported)
             {
                 GsBackendDecision depthDecision =
-                    prepareGsVulkanDepthCt32Sprite(
+                    prepareGsVulkanSourceOverCt32Sprite(
                         command, depthSprite);
-                if (!depthDecision.supported &&
-                    depthDecision.reason ==
-                        GsFallbackReason::AlphaBlend)
+                if (!depthDecision.supported)
                 {
                     depthDecision =
-                        prepareGsVulkanSourceOverDepthCt32Sprite(
+                        prepareGsVulkanDepthCt32Sprite(
                             command, depthSprite);
+                    if (!depthDecision.supported &&
+                        depthDecision.reason ==
+                            GsFallbackReason::AlphaBlend)
+                    {
+                        depthDecision =
+                            prepareGsVulkanSourceOverDepthCt32Sprite(
+                                command, depthSprite);
+                    }
                 }
                 if (!depthDecision.supported)
                 {

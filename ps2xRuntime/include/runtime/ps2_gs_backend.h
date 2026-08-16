@@ -250,6 +250,7 @@ inline constexpr size_t GS_FLUSH_REASON_COUNT =
     static_cast<size_t>(GsFlushReason::Count);
 inline constexpr size_t GS_FALLBACK_REASON_COUNT =
     static_cast<size_t>(GsFallbackReason::Count);
+inline constexpr size_t GS_BACKEND_FALLBACK_STATE_CAPACITY = 128u;
 
 struct GsBackendDecision
 {
@@ -280,6 +281,24 @@ struct GsHybridBatchPolicy
     }
 };
 
+// Opt-in backend diagnostics retain a bounded sparse census of semantic
+// fallback pipeline states. The primitive bit layout is TYPE in bits 0-2,
+// followed by IIP/TME/FGE/ABE/AA1/FST/CTXT/FIX in bits 3-10. TEST and ALPHA
+// remain raw so a retained replay can distinguish exact alpha/depth modes
+// without putting dynamic allocation in the draw router.
+struct GsBackendFallbackStateCounter
+{
+    GsFallbackReason reason = GsFallbackReason::Supported;
+    uint16_t primitive = 0u;
+    uint8_t framebufferPsm = 0u;
+    uint8_t depthPsm = 0u;
+    bool depthMasked = false;
+    uint64_t test = 0u;
+    uint64_t alpha = 0u;
+    uint64_t commands = 0u;
+    uint64_t pixels = 0u;
+};
+
 struct GsBackendCounters
 {
     uint64_t commands = 0;
@@ -305,6 +324,11 @@ struct GsBackendCounters
     uint64_t softwareRasterHostNanoseconds = 0;
     std::array<uint64_t, GS_FALLBACK_REASON_COUNT> decisions{};
     std::array<uint64_t, GS_FALLBACK_REASON_COUNT> decisionPixels{};
+    std::array<
+        GsBackendFallbackStateCounter,
+        GS_BACKEND_FALLBACK_STATE_CAPACITY> fallbackStates{};
+    uint64_t fallbackStateOverflowCommands = 0u;
+    uint64_t fallbackStateOverflowPixels = 0u;
     std::array<uint64_t, GS_FLUSH_REASON_COUNT> flushReasons{};
 };
 
@@ -445,7 +469,9 @@ private:
     void resolvePendingHybrid(bool accelerate);
     void updateDeferredQueueDepth() noexcept;
     void recordDecision(
-        GsFallbackReason reason, uint64_t pixels) noexcept;
+        GsFallbackReason reason,
+        uint64_t pixels,
+        const GsDrawCommand *command = nullptr) noexcept;
     void recordFlush(GsFlushReason reason) noexcept;
     void updateQueueDepth(const IGsRasterBackend &backend) noexcept;
 
@@ -488,6 +514,13 @@ private:
 // D selector copies the source; those equations publish the same raster record.
 // Keeping this as a pure classifier gives census and every backend one reason.
 [[nodiscard]] GsBackendDecision classifyGsInitialCt32Sprite(
+    const GsDrawCommand &command) noexcept;
+
+// Exact flat CT32 sprite subset for the standard GS source-over equation
+// (Cs-Cd)*As/128+Cd with no observable depth read or write. The destination
+// framebuffer read remains explicit; PABE is disabled and COLCLAMP is enabled
+// so the device and software paths share one signed-integer blend operation.
+[[nodiscard]] GsBackendDecision classifyGsSourceOverCt32Sprite(
     const GsDrawCommand &command) noexcept;
 
 // Exact flat CT32 sprite subset with an enabled Z32/Z24 depth test. Opaque and

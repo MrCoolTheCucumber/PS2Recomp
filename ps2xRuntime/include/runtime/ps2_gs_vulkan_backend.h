@@ -25,6 +25,9 @@ struct GsVulkanRasterBackendConfig
     // Source-copy alpha equations reuse the flat sprite kernel but retain a
     // separate crossover because the software blend path is more expensive.
     uint64_t minimumHybridSourceCopyAlphaSpritePixels = 8'192u;
+    // Source-over without depth reuses the depth-capable blend kernel but
+    // avoids all Z traffic. It retains a separate crossover from depth work.
+    uint64_t minimumHybridSourceOverSpritePixels = 8'192u;
     // Depth work includes one CT32 write plus an exact Z32/Z24 test/write. The
     // default is the conservative isolated-draw crossover across both formats.
     uint64_t minimumHybridDepthCt32SpritePixels = 262'144u;

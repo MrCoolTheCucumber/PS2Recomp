@@ -1454,6 +1454,16 @@ GsBackendDecision classifyGsInitialCt32Sprite(
         AlphaRequirement::DisabledOrSourceCopy);
 }
 
+GsBackendDecision classifyGsSourceOverCt32Sprite(
+    const GsDrawCommand &command) noexcept
+{
+    return classifyFlatCt32State(
+        command, GS_PRIM_SPRITE, 2u,
+        TextureRequirement::Disabled,
+        DepthRequirement::None,
+        AlphaRequirement::SourceOver);
+}
+
 GsBackendDecision classifyGsDepthCt32Sprite(
     const GsDrawCommand &command) noexcept
 {
@@ -1975,7 +1985,8 @@ GsSubmissionResult GsBackendRouter::submit(
         if (m_countersEnabled)
         {
             ++m_counters.noopCommands;
-            recordDecision(GsFallbackReason::EmptyBounds, pixels);
+            recordDecision(
+                GsFallbackReason::EmptyBounds, pixels, &command);
         }
         return {
             true,
@@ -2008,7 +2019,8 @@ GsSubmissionResult GsBackendRouter::submit(
         {
             ++m_counters.softwareCommands;
             m_counters.softwarePixels += pixels;
-            recordDecision(GsFallbackReason::Supported, pixels);
+            recordDecision(
+                GsFallbackReason::Supported, pixels, &command);
             updateQueueDepth(*m_softwareBackend);
         }
         return {
@@ -2046,7 +2058,7 @@ GsSubmissionResult GsBackendRouter::submit(
         if (compatible)
         {
             if (m_countersEnabled)
-                recordDecision(decision.reason, pixels);
+                recordDecision(decision.reason, pixels, &command);
             transitionTo(ActiveBackend::Accelerated);
             m_acceleratedBackend->submit(
                 std::span<const GsDrawCommand>(&command, 1u));
@@ -2120,7 +2132,7 @@ GsSubmissionResult GsBackendRouter::submit(
     if (decision.supported)
     {
         if (m_countersEnabled)
-            recordDecision(decision.reason, pixels);
+            recordDecision(decision.reason, pixels, &command);
         transitionTo(ActiveBackend::Accelerated);
         m_acceleratedBackend->submit(
             std::span<const GsDrawCommand>(&command, 1u));
@@ -2143,7 +2155,7 @@ GsSubmissionResult GsBackendRouter::submit(
     {
         if (m_countersEnabled)
         {
-            recordDecision(decision.reason, pixels);
+            recordDecision(decision.reason, pixels, &command);
             ++m_counters.strictFailures;
             m_counters.strictFailurePixels += pixels;
         }
@@ -2163,7 +2175,7 @@ GsSubmissionResult GsBackendRouter::submit(
     m_activeBackend = ActiveBackend::Software;
     if (m_countersEnabled)
     {
-        recordDecision(decision.reason, pixels);
+        recordDecision(decision.reason, pixels, &command);
         ++m_counters.softwareCommands;
         ++m_counters.fallbackCommands;
         m_counters.softwarePixels += pixels;
@@ -2456,7 +2468,9 @@ void GsBackendRouter::updateDeferredQueueDepth() noexcept
 }
 
 void GsBackendRouter::recordDecision(
-    GsFallbackReason reason, uint64_t pixels) noexcept
+    GsFallbackReason reason,
+    uint64_t pixels,
+    const GsDrawCommand *command) noexcept
 {
     const size_t index = static_cast<size_t>(reason);
     if (index < m_counters.decisions.size())
@@ -2464,6 +2478,58 @@ void GsBackendRouter::recordDecision(
         ++m_counters.decisions[index];
         m_counters.decisionPixels[index] += pixels;
     }
+
+    if (!command || reason == GsFallbackReason::Supported ||
+        reason == GsFallbackReason::EmptyBounds ||
+        reason == GsFallbackReason::CostModel)
+    {
+        return;
+    }
+
+    const GSPrimReg &primitive = command->primitive();
+    const GSContext &context = command->context();
+    const uint16_t packedPrimitive =
+        static_cast<uint16_t>(primitive.type) |
+        (static_cast<uint16_t>(primitive.iip) << 3u) |
+        (static_cast<uint16_t>(primitive.tme) << 4u) |
+        (static_cast<uint16_t>(primitive.fge) << 5u) |
+        (static_cast<uint16_t>(primitive.abe) << 6u) |
+        (static_cast<uint16_t>(primitive.aa1) << 7u) |
+        (static_cast<uint16_t>(primitive.fst) << 8u) |
+        (static_cast<uint16_t>(primitive.ctxt) << 9u) |
+        (static_cast<uint16_t>(primitive.fix) << 10u);
+    for (GsBackendFallbackStateCounter &state :
+         m_counters.fallbackStates)
+    {
+        if (state.commands == 0u)
+        {
+            state.reason = reason;
+            state.primitive = packedPrimitive;
+            state.framebufferPsm = context.frame.psm;
+            state.depthPsm = context.zbuf.psm;
+            state.depthMasked = context.zbuf.zmask;
+            state.test = context.test;
+            state.alpha = context.alpha;
+            state.commands = 1u;
+            state.pixels = pixels;
+            return;
+        }
+        if (state.reason != reason ||
+            state.primitive != packedPrimitive ||
+            state.framebufferPsm != context.frame.psm ||
+            state.depthPsm != context.zbuf.psm ||
+            state.depthMasked != context.zbuf.zmask ||
+            state.test != context.test ||
+            state.alpha != context.alpha)
+        {
+            continue;
+        }
+        ++state.commands;
+        state.pixels += pixels;
+        return;
+    }
+    ++m_counters.fallbackStateOverflowCommands;
+    m_counters.fallbackStateOverflowPixels += pixels;
 }
 
 void GsBackendRouter::recordFlush(GsFlushReason reason) noexcept

@@ -74,6 +74,7 @@ namespace
                "[--vulkan-max-resident-batch COUNT] "
                "[--vulkan-min-hybrid-pixels COUNT] "
                "[--vulkan-min-hybrid-source-copy-alpha-pixels COUNT] "
+               "[--vulkan-min-hybrid-source-over-pixels COUNT] "
                "[--vulkan-min-hybrid-depth-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-alpha-fail-depth-run-pixels COUNT] "
                "[--vulkan-min-hybrid-nearest-ct32-pixels COUNT] "
@@ -218,7 +219,70 @@ namespace
                    << counters.decisionPixels[index];
         }
 
-        output << "},\"flush_reasons\":{";
+        output << "},\"fallback_states\":[";
+        bool firstFallbackState = true;
+        for (const GsBackendFallbackStateCounter &state :
+             counters.fallbackStates)
+        {
+            if (state.commands == 0u)
+                continue;
+            if (!firstFallbackState)
+                output << ',';
+            firstFallbackState = false;
+            output << "{\"reason\":\""
+                   << gsFallbackReasonName(state.reason)
+                   << "\",\"commands\":" << state.commands
+                   << ",\"pixels\":" << state.pixels
+                   << ",\"primitive_type\":"
+                   << (state.primitive & 0x7u)
+                   << ",\"iip\":"
+                   << ((state.primitive >> 3u) & 1u)
+                   << ",\"tme\":"
+                   << ((state.primitive >> 4u) & 1u)
+                   << ",\"fge\":"
+                   << ((state.primitive >> 5u) & 1u)
+                   << ",\"abe\":"
+                   << ((state.primitive >> 6u) & 1u)
+                   << ",\"aa1\":"
+                   << ((state.primitive >> 7u) & 1u)
+                   << ",\"fst\":"
+                   << ((state.primitive >> 8u) & 1u)
+                   << ",\"ctxt\":"
+                   << ((state.primitive >> 9u) & 1u)
+                   << ",\"fix\":"
+                   << ((state.primitive >> 10u) & 1u)
+                   << ",\"framebuffer_psm\":"
+                   << static_cast<uint32_t>(state.framebufferPsm)
+                   << ",\"depth_psm\":"
+                   << static_cast<uint32_t>(state.depthPsm)
+                   << ",\"depth_masked\":"
+                   << (state.depthMasked ? "true" : "false")
+                   << ",\"test\":" << state.test
+                   << ",\"alpha\":" << state.alpha
+                   << ",\"alpha_test_enabled\":"
+                   << (state.test & 1u)
+                   << ",\"alpha_test_method\":"
+                   << ((state.test >> 1u) & 0x7u)
+                   << ",\"alpha_reference\":"
+                   << ((state.test >> 4u) & 0xFFu)
+                   << ",\"alpha_fail_method\":"
+                   << ((state.test >> 12u) & 0x3u)
+                   << ",\"destination_alpha_test_enabled\":"
+                   << ((state.test >> 14u) & 1u)
+                   << ",\"destination_alpha_mode\":"
+                   << ((state.test >> 15u) & 1u)
+                   << ",\"depth_test_enabled\":"
+                   << ((state.test >> 16u) & 1u)
+                   << ",\"depth_test_method\":"
+                   << ((state.test >> 17u) & 0x3u)
+                   << '}';
+        }
+
+        output << "],\"fallback_state_overflow_commands\":"
+               << counters.fallbackStateOverflowCommands
+               << ",\"fallback_state_overflow_pixels\":"
+               << counters.fallbackStateOverflowPixels
+               << ",\"flush_reasons\":{";
         for (size_t index = 0u;
              index < GS_FLUSH_REASON_COUNT;
              ++index)
@@ -1013,6 +1077,7 @@ int main(int argc, char **argv)
             argument == "--vulkan-min-hybrid-pixels" ||
             argument ==
                 "--vulkan-min-hybrid-source-copy-alpha-pixels" ||
+            argument == "--vulkan-min-hybrid-source-over-pixels" ||
             argument == "--vulkan-min-hybrid-depth-ct32-pixels" ||
             argument ==
                 "--vulkan-min-hybrid-alpha-fail-depth-run-pixels" ||
@@ -1119,6 +1184,26 @@ int main(int argc, char **argv)
                 }
                 vulkanBackendConfig
                     .minimumHybridSourceCopyAlphaSpritePixels = minimum;
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument ==
+                     "--vulkan-min-hybrid-source-over-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels = 2048ull * 2048ull;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid source-over pixel threshold "
+                           "must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig.minimumHybridSourceOverSpritePixels =
+                    minimum;
                 vulkanOptionUsed = true;
                 replayOptionUsed = true;
                 gifReplayOptionUsed = true;

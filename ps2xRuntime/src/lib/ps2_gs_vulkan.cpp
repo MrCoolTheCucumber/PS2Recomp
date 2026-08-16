@@ -128,8 +128,9 @@ namespace
     const char *depthCt32SpriteShapeValidationError(
         const GsVulkanDepthCt32Sprite &sprite) noexcept
     {
+        const bool usesDepth = sprite.depthTestMethod != 0u;
         if (sprite.framebufferBaseBlock > 0x3FFFu ||
-            sprite.depthBaseBlock > 0x3FFFu)
+            (usesDepth && sprite.depthBaseBlock > 0x3FFFu))
         {
             return "Vulkan depth CT32 sprite base is outside GS VRAM";
         }
@@ -145,14 +146,17 @@ namespace
         }
         if (sprite.boundsX1 > 2048u || sprite.boundsY1 > 2048u)
             return "Vulkan depth CT32 sprite bounds are outside GS scissor range";
-        if (sprite.depthPsm != GS_PSM_Z32 &&
+        if (usesDepth &&
+            sprite.depthPsm != GS_PSM_Z32 &&
             sprite.depthPsm != GS_PSM_Z24)
         {
             return "Vulkan depth CT32 sprite has unsupported depth format";
         }
-        if (sprite.depthTestMethod == 0u ||
-            sprite.depthTestMethod > 3u ||
-            sprite.depthWrite > 1u)
+        if (sprite.depthTestMethod > 3u ||
+            sprite.depthWrite > 1u ||
+            (!usesDepth &&
+             (sprite.depthBaseBlock != 0u || sprite.depthPsm != 0u ||
+              sprite.depth != 0u || sprite.depthWrite != 0u)))
         {
             return "Vulkan depth CT32 sprite has unsupported depth function";
         }
@@ -177,17 +181,20 @@ namespace
                 sprite.boundsY0,
                 width,
                 height);
-        const GsVramPageMask depthPages =
-            gsVramPagesForSurfaceRect(
-                sprite.depthBaseBlock,
-                sprite.framebufferWidth,
-                static_cast<uint8_t>(sprite.depthPsm),
-                sprite.boundsX0,
-                sprite.boundsY0,
-                width,
-                height);
-        if (framebufferPages.intersects(depthPages))
-            return "Vulkan depth CT32 sprite framebuffer aliases depth";
+        if (usesDepth)
+        {
+            const GsVramPageMask depthPages =
+                gsVramPagesForSurfaceRect(
+                    sprite.depthBaseBlock,
+                    sprite.framebufferWidth,
+                    static_cast<uint8_t>(sprite.depthPsm),
+                    sprite.boundsX0,
+                    sprite.boundsY0,
+                    width,
+                    height);
+            if (framebufferPages.intersects(depthPages))
+                return "Vulkan depth CT32 sprite framebuffer aliases depth";
+        }
         return nullptr;
     }
 
@@ -256,19 +263,22 @@ namespace
         {
             access.readPages.unionWith(framebufferPages);
         }
-        const GsVramPageMask depthPages =
-            gsVramPagesForSurfaceRect(
-                sprite.depthBaseBlock,
-                sprite.framebufferWidth,
-                static_cast<uint8_t>(sprite.depthPsm),
-                sprite.boundsX0,
-                sprite.boundsY0,
-                width,
-                height);
-        if (sprite.depthTestMethod >= 2u)
-            access.readPages.unionWith(depthPages);
-        if (sprite.depthWrite != 0u)
-            access.writePages.unionWith(depthPages);
+        if (sprite.depthTestMethod != 0u)
+        {
+            const GsVramPageMask depthPages =
+                gsVramPagesForSurfaceRect(
+                    sprite.depthBaseBlock,
+                    sprite.framebufferWidth,
+                    static_cast<uint8_t>(sprite.depthPsm),
+                    sprite.boundsX0,
+                    sprite.boundsY0,
+                    width,
+                    height);
+            if (sprite.depthTestMethod >= 2u)
+                access.readPages.unionWith(depthPages);
+            if (sprite.depthWrite != 0u)
+                access.writePages.unionWith(depthPages);
+        }
         return access;
     }
 
@@ -1998,6 +2008,40 @@ GsBackendDecision prepareGsVulkanDepthCt32Sprite(
     prepared.depthWrite = context.zbuf.zmask ? 0u : 1u;
     prepared.colorBlendMode =
         GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_COPY;
+    if (depthCt32SpriteValidationError(prepared))
+        return {false, GsFallbackReason::UnknownMemoryLayout};
+
+    sprite = prepared;
+    return decision;
+}
+
+GsBackendDecision prepareGsVulkanSourceOverCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanDepthCt32Sprite &sprite) noexcept
+{
+    const GsBackendDecision decision =
+        classifyGsSourceOverCt32Sprite(command);
+    if (!decision.supported)
+        return decision;
+
+    const GSContext &context = command.context();
+    const GsDrawBounds &bounds = command.bounds();
+    const GSVertex &vertex = command.vertices()[1];
+    GsVulkanDepthCt32Sprite prepared{};
+    prepared.framebufferBaseBlock = context.frame.fbp << 5u;
+    prepared.framebufferWidth =
+        std::max<uint32_t>(context.frame.fbw, 1u);
+    prepared.boundsX0 = static_cast<uint32_t>(bounds.x0);
+    prepared.boundsY0 = static_cast<uint32_t>(bounds.y0);
+    prepared.boundsX1 = static_cast<uint32_t>(bounds.x1);
+    prepared.boundsY1 = static_cast<uint32_t>(bounds.y1);
+    prepared.rgba =
+        static_cast<uint32_t>(vertex.r) |
+        (static_cast<uint32_t>(vertex.g) << 8u) |
+        (static_cast<uint32_t>(vertex.b) << 16u) |
+        (static_cast<uint32_t>(vertex.a) << 24u);
+    prepared.colorBlendMode =
+        GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER;
     if (depthCt32SpriteValidationError(prepared))
         return {false, GsFallbackReason::UnknownMemoryLayout};
 
@@ -3744,7 +3788,7 @@ namespace
 
     static_assert(sizeof(kGsCt32SpriteShaderSpv) == 7536u);
     static_assert(kGsCt32SpriteShaderSpv[0] == 0x07230203u);
-    static_assert(sizeof(kGsDepthCt32SpriteShaderSpv) == 17032u);
+    static_assert(sizeof(kGsDepthCt32SpriteShaderSpv) == 17196u);
     static_assert(kGsDepthCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(
         sizeof(kGsFeedbackLinearDepthCt32SpriteShaderSpv) == 46420u);

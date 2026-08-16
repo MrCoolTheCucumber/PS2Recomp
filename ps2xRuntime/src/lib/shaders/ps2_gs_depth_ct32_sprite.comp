@@ -79,9 +79,14 @@ void main()
     if (x >= sprite.bounds_x1 || y >= sprite.bounds_y1)
         return;
 
-    uint depth_word_index = gs_word_index(
-        sprite.depth_psm, sprite.depth_base_block, x, y);
-    bool packed_z24 = sprite.depth_psm == 0x31u;
+    uint depth_word_index = 0u;
+    bool packed_z24 = false;
+    if (sprite.depth_test_method != 0u)
+    {
+        depth_word_index = gs_word_index(
+            sprite.depth_psm, sprite.depth_base_block, x, y);
+        packed_z24 = sprite.depth_psm == 0x31u;
+    }
     bool needs_depth_word =
         sprite.depth_test_method >= 2u ||
         (packed_z24 && sprite.depth_write != 0u);
@@ -92,7 +97,7 @@ void main()
         ? depth_word & 0x00ffffffu
         : depth_word;
     bool passes =
-        sprite.depth_test_method == 1u ||
+        sprite.depth_test_method <= 1u ||
         (sprite.depth_test_method == 2u &&
          sprite.depth >= current_depth) ||
         (sprite.depth_test_method == 3u &&

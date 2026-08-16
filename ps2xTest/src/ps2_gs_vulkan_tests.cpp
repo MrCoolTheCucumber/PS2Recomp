@@ -1022,7 +1022,7 @@ namespace
                 const uint32_t currentDepth =
                     sprite.depthTestMethod >= 2u ? readDepth(x, y) : 0u;
                 const bool passes =
-                    sprite.depthTestMethod == 1u ||
+                    sprite.depthTestMethod <= 1u ||
                     (sprite.depthTestMethod == 2u &&
                      sprite.depth >= currentDepth) ||
                     (sprite.depthTestMethod == 3u &&
@@ -3530,6 +3530,57 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(
                 actual == expected,
                 "the retained ALPHA=0 software draw must equal the opaque record over all VRAM");
+        });
+
+        tc.Run("source-over CT32 sprites publish a canonical no-depth record", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand opaque = makeCt32SpriteCommand(
+                25u, 7u, 4u,
+                {3u, 126u, 2u, 93u}, {16u, 32u},
+                49u, 65u, 1617u, 1041u,
+                0x60D020F0u);
+            const GsDrawCommand sourceOver = makeAlphaBlendCommand(
+                opaque, 26u, 0x8000000044ull, false, true);
+            const GsDrawResources resources = sourceOver.resources();
+            t.IsTrue(resources.framebufferReadPages.any(),
+                     "source-over should retain its destination read");
+            t.IsFalse(resources.depthReadPages.any() ||
+                          resources.depthWritePages.any(),
+                      "disabled depth should retain no Z dependency");
+            t.Equals(classifyGsInitialCt32Sprite(sourceOver).reason,
+                     GsFallbackReason::AlphaBlend,
+                     "source-over must not widen the source-copy contract");
+            t.IsTrue(classifyGsSourceOverCt32Sprite(sourceOver).supported,
+                     "standard clamped source-over without depth should be semantic");
+
+            GsVulkanDepthCt32Sprite record{
+                1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u};
+            const GsBackendDecision decision =
+                prepareGsVulkanSourceOverCt32Sprite(sourceOver, record);
+            t.IsTrue(decision.supported,
+                     "source-over should publish the shared blend record");
+            t.Equals(record.depthBaseBlock | record.depthPsm |
+                         record.depth | record.depthTestMethod |
+                         record.depthWrite,
+                     0u,
+                     "unused depth fields should be canonical zero");
+            t.Equals(record.colorBlendMode,
+                     GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER,
+                     "the record should retain the exact source-over operation");
+
+            std::vector<uint8_t> actual = makeVramPattern(0x534F4E44u);
+            std::vector<uint8_t> expected = actual;
+            applyDepthCt32SpriteCpu(expected, record);
+            GS gs;
+            gs.init(actual.data(), static_cast<uint32_t>(actual.size()),
+                    nullptr);
+            gs.setDebugHistoryPaused(true);
+            drawNearestCt32SpriteCommand(gs, sourceOver);
+            gs.flushRenderBatch();
+            t.IsTrue(actual == expected,
+                     "the no-depth prepared contract should match software over all VRAM");
         });
 
         tc.Run("depth CT32 sprite preparation publishes exact Z32 and Z24 state", [](TestCase &t)
@@ -10197,6 +10248,96 @@ void register_ps2_gs_vulkan_tests()
                 t.IsTrue(
                     disabled->classify(below).supported,
                     "zero should disable the source-copy Hybrid floor");
+            }
+        });
+
+        tc.Run("Vulkan hybrid source-over sprites use a no-depth crossover", [](TestCase &t)
+        {
+            const auto sourceOver = [](GsDrawCommand opaque,
+                                       uint64_t sequence)
+            {
+                return makeAlphaBlendCommand(
+                    opaque, sequence, 0x8000000044ull,
+                    false, true);
+            };
+            const GsDrawCommand below = sourceOver(
+                makeCt32SpriteCommand(
+                    355u, 12u, 1u,
+                    {0u, 63u, 0u, 63u}, {0u, 0u},
+                    0u, 0u, 64u * 16u, 64u * 16u,
+                    0x402010F0u),
+                356u);
+            const GsDrawCommand threshold = sourceOver(
+                makeCt32SpriteCommand(
+                    357u, 16u, 2u,
+                    {0u, 127u, 0u, 63u}, {0u, 0u},
+                    0u, 0u, 128u * 16u, 64u * 16u,
+                    0x80402010u),
+                358u);
+
+            GsVulkanDepthCt32Sprite thresholdRecord{};
+            t.IsTrue(
+                prepareGsVulkanSourceOverCt32Sprite(
+                    threshold, thresholdRecord).supported,
+                "the threshold source-over fixture should be semantic");
+            std::vector<uint8_t> vram = makeVramPattern(0x534F504Fu);
+            std::vector<uint8_t> expected = vram;
+            applyDepthCt32SpriteCpu(expected, thresholdRecord);
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            t.Equals(config.minimumHybridSourceOverSpritePixels,
+                     8'192ull,
+                     "source-over should retain its independent default floor");
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &) { ++softwareCalls; },
+                    [&](const GsDrawCommand &) { ++commitCalls; },
+                    nullptr);
+            t.IsNotNull(backend.get(),
+                        "the source-over policy fixture should construct");
+            if (!backend)
+                return;
+            t.Equals(backend->classify(below).reason,
+                     GsFallbackReason::CostModel,
+                     "4,096 source-over pixels should remain below the floor");
+            t.IsTrue(backend->classify(threshold).supported,
+                     "8,192 source-over pixels should meet the floor exactly");
+
+            backend->submit(std::span<const GsDrawCommand>(&threshold, 1u));
+            backend->flush(GsFlushReason::Explicit);
+            backend->prepareCpuVramAccess(
+                threshold.resources().writePages,
+                GsFlushReason::CpuReadback);
+            t.IsTrue(vram == expected,
+                     "resident no-depth source-over should remain exact");
+            t.Equals(softwareCalls, 0ull,
+                     "admitted source-over should not call software");
+            t.Equals(commitCalls, 1ull,
+                     "admitted source-over should commit once");
+            t.Equals(backend->serviceStatistics()
+                         .depthCt32SpriteDrawsCompleted,
+                     1ull,
+                     "source-over should reuse one depth-capable dispatch");
+
+            config.minimumHybridSourceOverSpritePixels = 0u;
+            std::vector<uint8_t> disabledVram = makeVramPattern(0x534F5041u);
+            std::unique_ptr<GsVulkanRasterBackend> disabled =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, disabledVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(disabled.get(),
+                        "a zero source-over floor should construct");
+            if (disabled)
+            {
+                t.IsTrue(disabled->classify(below).supported,
+                         "zero should disable only the source-over cost gate");
             }
         });
 
@@ -18264,7 +18405,7 @@ void register_ps2_gs_vulkan_tests()
                      "post-shutdown depth rejection must preserve output");
         });
 
-        tc.Run("Vulkan source-over depth CT32 sprites match clamped GS blending", [](TestCase &t)
+        tc.Run("Vulkan source-over CT32 sprites match clamped GS blending", [](TestCase &t)
         {
             GSMem::InitLookupTables();
             const std::array<GsDrawCommand, 3> opaque{{
@@ -18292,8 +18433,8 @@ void register_ps2_gs_vulkan_tests()
                 0x0000008000000044ull,
                 0x000000FF00000044ull,
             }};
-            std::array<GsVulkanDepthCt32Sprite, 3> sprites{};
-            for (size_t index = 0u; index < sprites.size(); ++index)
+            std::array<GsVulkanDepthCt32Sprite, 4> sprites{};
+            for (size_t index = 0u; index < opaque.size(); ++index)
             {
                 const GsDrawCommand command = makeAlphaBlendCommand(
                     opaque[index], 30'110u + index,
@@ -18308,6 +18449,24 @@ void register_ps2_gs_vulkan_tests()
                         std::string(gsFallbackReasonName(decision.reason)));
                     return;
                 }
+            }
+            const GsDrawCommand noDepthSourceOver = makeAlphaBlendCommand(
+                makeCt32SpriteCommand(
+                    30'103u, 7u, 4u,
+                    {3u, 126u, 2u, 93u}, {16u, 32u},
+                    49u, 65u, 1617u, 1041u,
+                    0x60D020F0u),
+                30'113u, 0x8000000044ull, false, true);
+            const GsBackendDecision noDepthDecision =
+                prepareGsVulkanSourceOverCt32Sprite(
+                    noDepthSourceOver, sprites.back());
+            if (!noDepthDecision.supported)
+            {
+                t.Fail(
+                    "synthetic no-depth source-over sprite was rejected as " +
+                    std::string(gsFallbackReasonName(
+                        noDepthDecision.reason)));
+                return;
             }
 
             GsVulkanCapabilityReport preflight{};
@@ -18327,14 +18486,14 @@ void register_ps2_gs_vulkan_tests()
             }
             t.IsNotNull(
                 service.get(),
-                "a suitable device should create the source-over depth service");
+                "a suitable device should create the source-over service");
             if (!service)
                 return;
             const GsVulkanDeviceReport *selected =
                 creationReport.selectedDevice();
             t.IsNotNull(
                 selected,
-                "the source-over depth service should retain its device");
+                "the source-over service should retain its device");
             if (!selected)
                 return;
             t.IsTrue(
@@ -18357,7 +18516,7 @@ void register_ps2_gs_vulkan_tests()
                         gpu, sprites[index], actual, &operationError))
                 {
                     t.Fail(
-                        "GPU source-over depth sprite " +
+                        "GPU source-over sprite " +
                         std::to_string(index) + " failed: " +
                         operationError);
                     service->shutdown();
@@ -18365,7 +18524,7 @@ void register_ps2_gs_vulkan_tests()
                 }
                 t.IsTrue(
                     actual == expected,
-                    "source-over depth GPU output must match complete CPU VRAM");
+                    "source-over GPU output must match complete CPU VRAM");
                 gpu = std::move(actual);
             }
 

@@ -501,8 +501,9 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
     GsVulkanCt32Sprite &sprite) noexcept;
 
 // Fixed record for exact flat CT32 color plus Z32/Z24 depth execution. The
-// depth method uses GS ZTST values (ALWAYS=1, GEQUAL=2, GREATER=3); depthWrite
-// is normalized from ZMASK. Z24 writes preserve the unrelated high byte.
+// depth method uses DISABLED=0 or GS ZTST values (ALWAYS=1, GEQUAL=2,
+// GREATER=3); depthWrite is normalized from ZMASK. Z24 writes preserve the
+// unrelated high byte. Disabled records canonically zero every depth field.
 // colorBlendMode is a packed color-operation descriptor. Source-copy and
 // source-over use their literal operation values. FIXED_ALPHA additionally
 // stores FIX in bits 8..15 and optional CT32 DATE/DATM state in bits 16..17.
@@ -564,6 +565,13 @@ static_assert(offsetof(GsVulkanDepthCt32Sprite, reserved3) == 60u);
 
 // Rejection leaves the caller's record untouched.
 [[nodiscard]] GsBackendDecision prepareGsVulkanDepthCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanDepthCt32Sprite &sprite) noexcept;
+
+// Publishes the depth-sprite ABI with no depth effects and its exact
+// source-over color operation. Unused depth fields are zeroed canonically.
+// Rejection leaves the caller's record untouched.
+[[nodiscard]] GsBackendDecision prepareGsVulkanSourceOverCt32Sprite(
     const GsDrawCommand &command,
     GsVulkanDepthCt32Sprite &sprite) noexcept;
 

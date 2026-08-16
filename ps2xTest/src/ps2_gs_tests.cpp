@@ -1370,6 +1370,21 @@ void register_ps2_gs_tests()
                     static_cast<size_t>(GsFallbackReason::Textured)],
                 1ull,
                 "the classifier's single reason should be counted");
+            const GsBackendFallbackStateCounter &fallbackState =
+                router.counters().fallbackStates[0];
+            t.Equals(fallbackState.reason,
+                     GsFallbackReason::Textured,
+                     "semantic fallbacks should retain their exact reason");
+            t.Equals(fallbackState.commands, 1ull,
+                     "the sparse state census should count the fallback");
+            t.Equals(fallbackState.pixels, 256ull,
+                     "the sparse state census should retain pixel work");
+            t.Equals(fallbackState.primitive,
+                     static_cast<uint16_t>(GS_PRIM_SPRITE),
+                     "the state census should retain primitive flags");
+            t.Equals(fallbackState.framebufferPsm,
+                     static_cast<uint8_t>(GS_PSM_CT32),
+                     "the state census should retain framebuffer format");
             const GsDrawResources commandResources = command.resources();
             GsVramPageMask commandAccess = commandResources.readPages;
             commandAccess.unionWith(commandResources.writePages);
