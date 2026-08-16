@@ -12,6 +12,18 @@ namespace ps2x::performance {
 namespace {
 using JsonWriter = rapidjson::Writer<rapidjson::StringBuffer>;
 
+constexpr std::array<const char *, kTelemetryFlushReasonCount>
+    kFlushReasonNames{
+        "explicit",           "transfer",
+        "cpu_readback",       "feedback_snapshot",
+        "clut_hazard",        "finish",
+        "presentation_latch", "debugger_observation",
+        "backend_switch",     "reset",
+        "save_load",          "shutdown",
+        "queue_backpressure", "resource_hazard",
+        "pipeline_change",
+    };
+
 void setError(std::string *error, std::string message) {
   if (error)
     *error = std::move(message);
@@ -31,6 +43,15 @@ void writeString(JsonWriter &writer, const char *name,
                  const std::string &value) {
   writer.Key(name);
   writer.String(value.data(), static_cast<rapidjson::SizeType>(value.size()));
+}
+
+void writeFlushReasonCounters(JsonWriter &writer, const char *name,
+                              const FlushReasonCounters &counters) {
+  writer.Key(name);
+  writer.StartObject();
+  for (size_t index = 0u; index < counters.size(); ++index)
+    writeUint64(writer, kFlushReasonNames[index], counters[index]);
+  writer.EndObject();
 }
 
 bool readObject(const rapidjson::Value &parent, const char *name,
@@ -88,11 +109,34 @@ bool readString(const rapidjson::Value &parent, const char *name,
   return true;
 }
 
+bool readFlushReasonCounters(const rapidjson::Value &parent, const char *name,
+                             FlushReasonCounters &counters,
+                             std::string *error) {
+  const rapidjson::Value *value = nullptr;
+  if (!readObject(parent, name, value, error))
+    return false;
+  for (size_t index = 0u; index < counters.size(); ++index) {
+    if (!readUint64(*value, kFlushReasonNames[index], counters[index], error))
+      return false;
+  }
+  return true;
+}
+
 bool counterDelta(uint64_t previous, uint64_t current,
                   uint64_t &delta) noexcept {
   if (current < previous)
     return false;
   delta = current - previous;
+  return true;
+}
+
+bool counterDeltas(const FlushReasonCounters &previous,
+                   const FlushReasonCounters &current,
+                   FlushReasonCounters &deltas) noexcept {
+  for (size_t index = 0u; index < deltas.size(); ++index) {
+    if (!counterDelta(previous[index], current[index], deltas[index]))
+      return false;
+  }
   return true;
 }
 
@@ -162,6 +206,9 @@ void writeGs(JsonWriter &writer, const GsTelemetry &gs) {
   writeUint64(writer, "fallback_pixels", gs.routingFallbackPixels);
   writeUint64(writer, "software_raster_host_ns",
               gs.softwareRasterHostNanoseconds);
+  writeUint64(writer, "flushes", gs.routingFlushes);
+  writeUint64(writer, "backend_switches", gs.routingBackendSwitches);
+  writeFlushReasonCounters(writer, "flush_reasons", gs.routingFlushReasons);
   writer.EndObject();
 
   writer.Key("vulkan");
@@ -179,6 +226,20 @@ void writeGs(JsonWriter &writer, const GsTelemetry &gs) {
   writeUint64(writer, "committed_gpu_commands", gs.vulkanCommittedGpuCommands);
   writeUint64(writer, "verification_mismatches",
               gs.vulkanVerificationMismatches);
+  writeUint64(writer, "resource_hazard_drains", gs.vulkanResourceHazardDrains);
+  writeUint64(writer, "queue_backpressure_drains",
+              gs.vulkanQueueBackpressureDrains);
+  writeUint64(writer, "pipeline_change_drains", gs.vulkanPipelineChangeDrains);
+  writeUint64(writer, "cpu_access_preparations",
+              gs.vulkanCpuAccessPreparations);
+  writeUint64(writer, "cpu_to_gpu_operations", gs.vulkanCpuToGpuOperations);
+  writeUint64(writer, "cpu_to_gpu_pages", gs.vulkanCpuToGpuPages);
+  writeUint64(writer, "gpu_to_cpu_operations", gs.vulkanGpuToCpuOperations);
+  writeUint64(writer, "gpu_to_cpu_pages", gs.vulkanGpuToCpuPages);
+  writeFlushReasonCounters(writer, "download_operations_by_reason",
+                           gs.vulkanDownloadOperationsByReason);
+  writeFlushReasonCounters(writer, "downloaded_pages_by_reason",
+                           gs.vulkanDownloadedPagesByReason);
   writer.EndObject();
   writer.EndObject();
 }
@@ -285,6 +346,11 @@ bool readGs(const rapidjson::Value &root, GsTelemetry &gs, std::string *error) {
                     error) &&
          readUint64(*routing, "software_raster_host_ns",
                     gs.softwareRasterHostNanoseconds, error) &&
+         readUint64(*routing, "flushes", gs.routingFlushes, error) &&
+         readUint64(*routing, "backend_switches", gs.routingBackendSwitches,
+                    error) &&
+         readFlushReasonCounters(*routing, "flush_reasons",
+                                 gs.routingFlushReasons, error) &&
          readObject(*value, "vulkan", vulkan, error) &&
          readUint64(*vulkan, "round_trips_completed",
                     gs.vulkanRoundTripsCompleted, error) &&
@@ -306,7 +372,27 @@ bool readGs(const rapidjson::Value &root, GsTelemetry &gs, std::string *error) {
          readUint64(*vulkan, "committed_gpu_commands",
                     gs.vulkanCommittedGpuCommands, error) &&
          readUint64(*vulkan, "verification_mismatches",
-                    gs.vulkanVerificationMismatches, error);
+                    gs.vulkanVerificationMismatches, error) &&
+         readUint64(*vulkan, "resource_hazard_drains",
+                    gs.vulkanResourceHazardDrains, error) &&
+         readUint64(*vulkan, "queue_backpressure_drains",
+                    gs.vulkanQueueBackpressureDrains, error) &&
+         readUint64(*vulkan, "pipeline_change_drains",
+                    gs.vulkanPipelineChangeDrains, error) &&
+         readUint64(*vulkan, "cpu_access_preparations",
+                    gs.vulkanCpuAccessPreparations, error) &&
+         readUint64(*vulkan, "cpu_to_gpu_operations",
+                    gs.vulkanCpuToGpuOperations, error) &&
+         readUint64(*vulkan, "cpu_to_gpu_pages", gs.vulkanCpuToGpuPages,
+                    error) &&
+         readUint64(*vulkan, "gpu_to_cpu_operations",
+                    gs.vulkanGpuToCpuOperations, error) &&
+         readUint64(*vulkan, "gpu_to_cpu_pages", gs.vulkanGpuToCpuPages,
+                    error) &&
+         readFlushReasonCounters(*vulkan, "download_operations_by_reason",
+                                 gs.vulkanDownloadOperationsByReason, error) &&
+         readFlushReasonCounters(*vulkan, "downloaded_pages_by_reason",
+                                 gs.vulkanDownloadedPagesByReason, error);
 }
 
 bool readVu1(const rapidjson::Value &root, Vu1Telemetry &vu1,
@@ -379,9 +465,12 @@ calculateTelemetryRates(const TelemetrySnapshot &previous,
     return rates;
 
   uint64_t delta = 0u;
+  uint64_t presentations = 0u;
   if (counterDelta(previous.guest.presentations, current.guest.presentations,
-                   delta)) {
-    rates.framesPerSecond = static_cast<double>(delta) / rates.elapsedSeconds;
+                   presentations)) {
+    rates.framesPerSecond =
+        static_cast<double>(presentations) / rates.elapsedSeconds;
+    rates.presentationValid = presentations != 0u;
   }
   if (current.guest.vsyncPeriodCycles != 0u &&
       current.guest.vsyncPeriodCycles == previous.guest.vsyncPeriodCycles &&
@@ -476,21 +565,79 @@ calculateTelemetryRates(const TelemetrySnapshot &previous,
         static_cast<double>(softwareCommands) / rates.elapsedSeconds;
     rates.acceleratedCommandsPerSecond =
         static_cast<double>(acceleratedCommands) / rates.elapsedSeconds;
+    rates.noopCommandsPerSecond =
+        static_cast<double>(noopCommands) / rates.elapsedSeconds;
     rates.softwarePixelsPerSecond =
         static_cast<double>(softwarePixels) / rates.elapsedSeconds;
     rates.acceleratedPixelsPerSecond =
         static_cast<double>(acceleratedPixels) / rates.elapsedSeconds;
+    if (rates.presentationValid) {
+      const double presentationCount = static_cast<double>(presentations);
+      rates.fallbackCommandsPerPresentation =
+          static_cast<double>(fallbackCommands) / presentationCount;
+      rates.softwareCommandsPerPresentation =
+          static_cast<double>(softwareCommands) / presentationCount;
+      rates.acceleratedCommandsPerPresentation =
+          static_cast<double>(acceleratedCommands) / presentationCount;
+      rates.noopCommandsPerPresentation =
+          static_cast<double>(noopCommands) / presentationCount;
+    }
   }
 
-  if (counterDelta(previous.gs.vulkanQueueSubmissions,
-                   current.gs.vulkanQueueSubmissions, delta)) {
-    rates.vulkanSubmissionsPerSecond =
-        static_cast<double>(delta) / rates.elapsedSeconds;
+  uint64_t backendSwitches = 0u;
+  uint64_t routingFlushes = 0u;
+  FlushReasonCounters routingFlushReasons{};
+  rates.batchingValid =
+      counterDelta(previous.gs.routingBackendSwitches,
+                   current.gs.routingBackendSwitches, backendSwitches) &&
+      counterDelta(previous.gs.routingFlushes, current.gs.routingFlushes,
+                   routingFlushes) &&
+      counterDeltas(previous.gs.routingFlushReasons,
+                    current.gs.routingFlushReasons, routingFlushReasons);
+  if (rates.batchingValid) {
+    rates.backendSwitchesPerSecond =
+        static_cast<double>(backendSwitches) / rates.elapsedSeconds;
+    rates.routingFlushesPerSecond =
+        static_cast<double>(routingFlushes) / rates.elapsedSeconds;
+    for (size_t index = 0u; index < routingFlushReasons.size(); ++index) {
+      rates.routingFlushReasonsPerSecond[index] =
+          static_cast<double>(routingFlushReasons[index]) /
+          rates.elapsedSeconds;
+    }
+    if (rates.presentationValid) {
+      const double presentationCount = static_cast<double>(presentations);
+      rates.backendSwitchesPerPresentation =
+          static_cast<double>(backendSwitches) / presentationCount;
+      rates.routingFlushesPerPresentation =
+          static_cast<double>(routingFlushes) / presentationCount;
+      for (size_t index = 0u; index < routingFlushReasons.size(); ++index) {
+        rates.routingFlushReasonsPerPresentation[index] =
+            static_cast<double>(routingFlushReasons[index]) / presentationCount;
+      }
+    }
   }
+
+  uint64_t vulkanSubmissions = 0u;
+  if (counterDelta(previous.gs.vulkanQueueSubmissions,
+                   current.gs.vulkanQueueSubmissions, vulkanSubmissions)) {
+    rates.vulkanSubmissionsPerSecond =
+        static_cast<double>(vulkanSubmissions) / rates.elapsedSeconds;
+    if (rates.presentationValid) {
+      rates.vulkanSubmissionsPerPresentation =
+          static_cast<double>(vulkanSubmissions) /
+          static_cast<double>(presentations);
+    }
+  }
+  uint64_t vulkanDispatches = 0u;
   if (counterDelta(previous.gs.vulkanShaderDispatches,
-                   current.gs.vulkanShaderDispatches, delta)) {
+                   current.gs.vulkanShaderDispatches, vulkanDispatches)) {
     rates.vulkanDispatchesPerSecond =
-        static_cast<double>(delta) / rates.elapsedSeconds;
+        static_cast<double>(vulkanDispatches) / rates.elapsedSeconds;
+    if (rates.presentationValid) {
+      rates.vulkanDispatchesPerPresentation =
+          static_cast<double>(vulkanDispatches) /
+          static_cast<double>(presentations);
+    }
   }
   if (counterDelta(previous.gs.vulkanRequestWaitNanoseconds,
                    current.gs.vulkanRequestWaitNanoseconds, delta)) {
@@ -502,15 +649,93 @@ calculateTelemetryRates(const TelemetrySnapshot &previous,
     rates.vulkanFenceWaitPercent =
         percentOfElapsed(delta, rates.elapsedSeconds);
   }
+  uint64_t uploadedBytes = 0u;
   if (counterDelta(previous.gs.vulkanBytesUploaded,
-                   current.gs.vulkanBytesUploaded, delta)) {
+                   current.gs.vulkanBytesUploaded, uploadedBytes)) {
     rates.vulkanUploadBytesPerSecond =
-        static_cast<double>(delta) / rates.elapsedSeconds;
+        static_cast<double>(uploadedBytes) / rates.elapsedSeconds;
+    if (rates.presentationValid) {
+      rates.vulkanUploadBytesPerPresentation =
+          static_cast<double>(uploadedBytes) /
+          static_cast<double>(presentations);
+    }
   }
+  uint64_t downloadedBytes = 0u;
   if (counterDelta(previous.gs.vulkanBytesDownloaded,
-                   current.gs.vulkanBytesDownloaded, delta)) {
+                   current.gs.vulkanBytesDownloaded, downloadedBytes)) {
     rates.vulkanDownloadBytesPerSecond =
-        static_cast<double>(delta) / rates.elapsedSeconds;
+        static_cast<double>(downloadedBytes) / rates.elapsedSeconds;
+    if (rates.presentationValid) {
+      rates.vulkanDownloadBytesPerPresentation =
+          static_cast<double>(downloadedBytes) /
+          static_cast<double>(presentations);
+    }
+  }
+
+  uint64_t resourceHazardDrains = 0u;
+  uint64_t queueBackpressureDrains = 0u;
+  uint64_t pipelineChangeDrains = 0u;
+  uint64_t cpuAccessPreparations = 0u;
+  uint64_t cpuToGpuOperations = 0u;
+  uint64_t cpuToGpuPages = 0u;
+  uint64_t gpuToCpuOperations = 0u;
+  uint64_t gpuToCpuPages = 0u;
+  FlushReasonCounters downloadOperationsByReason{};
+  FlushReasonCounters downloadedPagesByReason{};
+  rates.coherencyValid =
+      counterDelta(previous.gs.vulkanResourceHazardDrains,
+                   current.gs.vulkanResourceHazardDrains,
+                   resourceHazardDrains) &&
+      counterDelta(previous.gs.vulkanQueueBackpressureDrains,
+                   current.gs.vulkanQueueBackpressureDrains,
+                   queueBackpressureDrains) &&
+      counterDelta(previous.gs.vulkanPipelineChangeDrains,
+                   current.gs.vulkanPipelineChangeDrains,
+                   pipelineChangeDrains) &&
+      counterDelta(previous.gs.vulkanCpuAccessPreparations,
+                   current.gs.vulkanCpuAccessPreparations,
+                   cpuAccessPreparations) &&
+      counterDelta(previous.gs.vulkanCpuToGpuOperations,
+                   current.gs.vulkanCpuToGpuOperations, cpuToGpuOperations) &&
+      counterDelta(previous.gs.vulkanCpuToGpuPages,
+                   current.gs.vulkanCpuToGpuPages, cpuToGpuPages) &&
+      counterDelta(previous.gs.vulkanGpuToCpuOperations,
+                   current.gs.vulkanGpuToCpuOperations, gpuToCpuOperations) &&
+      counterDelta(previous.gs.vulkanGpuToCpuPages,
+                   current.gs.vulkanGpuToCpuPages, gpuToCpuPages) &&
+      counterDeltas(previous.gs.vulkanDownloadOperationsByReason,
+                    current.gs.vulkanDownloadOperationsByReason,
+                    downloadOperationsByReason) &&
+      counterDeltas(previous.gs.vulkanDownloadedPagesByReason,
+                    current.gs.vulkanDownloadedPagesByReason,
+                    downloadedPagesByReason);
+  if (rates.coherencyValid && rates.presentationValid) {
+    const double presentationCount = static_cast<double>(presentations);
+    rates.vulkanResourceHazardDrainsPerPresentation =
+        static_cast<double>(resourceHazardDrains) / presentationCount;
+    rates.vulkanQueueBackpressureDrainsPerPresentation =
+        static_cast<double>(queueBackpressureDrains) / presentationCount;
+    rates.vulkanPipelineChangeDrainsPerPresentation =
+        static_cast<double>(pipelineChangeDrains) / presentationCount;
+    rates.vulkanCpuAccessPreparationsPerPresentation =
+        static_cast<double>(cpuAccessPreparations) / presentationCount;
+    rates.vulkanCpuToGpuOperationsPerPresentation =
+        static_cast<double>(cpuToGpuOperations) / presentationCount;
+    rates.vulkanCpuToGpuPagesPerPresentation =
+        static_cast<double>(cpuToGpuPages) / presentationCount;
+    rates.vulkanGpuToCpuOperationsPerPresentation =
+        static_cast<double>(gpuToCpuOperations) / presentationCount;
+    rates.vulkanGpuToCpuPagesPerPresentation =
+        static_cast<double>(gpuToCpuPages) / presentationCount;
+    for (size_t index = 0u; index < downloadOperationsByReason.size();
+         ++index) {
+      rates.vulkanDownloadOperationsByReasonPerPresentation[index] =
+          static_cast<double>(downloadOperationsByReason[index]) /
+          presentationCount;
+      rates.vulkanDownloadedPagesByReasonPerPresentation[index] =
+          static_cast<double>(downloadedPagesByReason[index]) /
+          presentationCount;
+    }
   }
 
   return rates;

@@ -577,6 +577,25 @@ std::string formatBytes(double value) {
   return buffer.data();
 }
 
+std::string formatPerPresentation(double value) {
+  if (std::abs(value) >= 1'000.0)
+    return formatNumber(value);
+  std::array<char, 64u> buffer{};
+  const double magnitude = std::abs(value);
+  if (magnitude >= 100.0)
+    std::snprintf(buffer.data(), buffer.size(), "%.1f", value);
+  else if (magnitude >= 1.0)
+    std::snprintf(buffer.data(), buffer.size(), "%.2f", value);
+  else
+    std::snprintf(buffer.data(), buffer.size(), "%.3f", value);
+  return buffer.data();
+}
+
+double flushRate(const ps2x::performance::FlushReasonRates &rates,
+                 ps2x::performance::TelemetryFlushReason reason) noexcept {
+  return rates[ps2x::performance::flushReasonIndex(reason)];
+}
+
 void metricCell(const char *label, const std::string &value,
                 const char *detail = nullptr) {
   ImGui::TextDisabled("%s", label);
@@ -697,12 +716,107 @@ void drawRendererSplit(const TelemetrySnapshot &snapshot,
         formatNumber(rates.softwareCommandsPerSecond) + " / " +
             formatNumber(rates.acceleratedCommandsPerSecond) + "/s");
     row("Fallback draws", formatNumber(rates.fallbackCommandsPerSecond) + "/s");
+    if (rates.batchingValid) {
+      row("Backend switches / router flushes",
+          formatNumber(rates.backendSwitchesPerSecond) + " / " +
+              formatNumber(rates.routingFlushesPerSecond) + "/s");
+    } else {
+      row("Backend switches / router flushes", "warming");
+    }
+    if (rates.routingValid && rates.presentationValid) {
+      row("Draws / presentation",
+          "sw " + formatPerPresentation(rates.softwareCommandsPerPresentation) +
+              " | accel " +
+              formatPerPresentation(rates.acceleratedCommandsPerPresentation) +
+              " | no-op " +
+              formatPerPresentation(rates.noopCommandsPerPresentation));
+    } else {
+      row("Draws / presentation", "warming or no presentation");
+    }
+    if (rates.routingValid && rates.batchingValid && rates.presentationValid) {
+      row("Fallback / switch / flush",
+          formatPerPresentation(rates.fallbackCommandsPerPresentation) + " / " +
+              formatPerPresentation(rates.backendSwitchesPerPresentation) +
+              " / " +
+              formatPerPresentation(rates.routingFlushesPerPresentation) +
+              " per presentation");
+      using ps2x::performance::TelemetryFlushReason;
+      const auto &flushes = rates.routingFlushReasonsPerPresentation;
+      const double hazards =
+          flushRate(flushes, TelemetryFlushReason::QueueBackpressure) +
+          flushRate(flushes, TelemetryFlushReason::ResourceHazard) +
+          flushRate(flushes, TelemetryFlushReason::PipelineChange);
+      row("Router flush causes / presentation",
+          "switch " +
+              formatPerPresentation(
+                  flushRate(flushes, TelemetryFlushReason::BackendSwitch)) +
+              " | transfer " +
+              formatPerPresentation(
+                  flushRate(flushes, TelemetryFlushReason::Transfer)) +
+              " | readback " +
+              formatPerPresentation(
+                  flushRate(flushes, TelemetryFlushReason::CpuReadback)) +
+              " | hazard " + formatPerPresentation(hazards));
+    } else {
+      row("Fallback / switch / flush", "warming or no presentation");
+    }
+    if (rates.coherencyValid && rates.presentationValid) {
+      row("Vulkan drains / presentation",
+          "resource " +
+              formatPerPresentation(
+                  rates.vulkanResourceHazardDrainsPerPresentation) +
+              " | queue " +
+              formatPerPresentation(
+                  rates.vulkanQueueBackpressureDrainsPerPresentation) +
+              " | pipeline " +
+              formatPerPresentation(
+                  rates.vulkanPipelineChangeDrainsPerPresentation));
+      row("Coherency ops / presentation",
+          "CPU access " +
+              formatPerPresentation(
+                  rates.vulkanCpuAccessPreparationsPerPresentation) +
+              " | up " +
+              formatPerPresentation(
+                  rates.vulkanCpuToGpuOperationsPerPresentation) +
+              " | down " +
+              formatPerPresentation(
+                  rates.vulkanGpuToCpuOperationsPerPresentation));
+      row("Coherency pages / presentation",
+          "up " +
+              formatPerPresentation(rates.vulkanCpuToGpuPagesPerPresentation) +
+              " | down " +
+              formatPerPresentation(rates.vulkanGpuToCpuPagesPerPresentation));
+      const size_t switchIndex = ps2x::performance::flushReasonIndex(
+          ps2x::performance::TelemetryFlushReason::BackendSwitch);
+      row("Switch-caused downloads",
+          formatPerPresentation(
+              rates.vulkanDownloadOperationsByReasonPerPresentation
+                  [switchIndex]) +
+              " ops | " +
+              formatPerPresentation(
+                  rates.vulkanDownloadedPagesByReasonPerPresentation
+                      [switchIndex]) +
+              " pages / presentation");
+    } else {
+      row("Coherency / presentation", "warming or unavailable");
+    }
     row("Vulkan submissions / dispatches",
         formatNumber(rates.vulkanSubmissionsPerSecond) + " / " +
             formatNumber(rates.vulkanDispatchesPerSecond) + "/s");
+    if (rates.presentationValid) {
+      row("Vulkan submit / dispatch per presentation",
+          formatPerPresentation(rates.vulkanSubmissionsPerPresentation) +
+              " / " +
+              formatPerPresentation(rates.vulkanDispatchesPerPresentation));
+    }
     row("Vulkan upload / download",
         formatBytes(rates.vulkanUploadBytesPerSecond) + "/s / " +
             formatBytes(rates.vulkanDownloadBytesPerSecond) + "/s");
+    if (rates.presentationValid) {
+      row("Vulkan transfer / presentation",
+          formatBytes(rates.vulkanUploadBytesPerPresentation) + " up / " +
+              formatBytes(rates.vulkanDownloadBytesPerPresentation) + " down");
+    }
     row("Committed accelerated commands",
         std::to_string(snapshot.gs.vulkanCommittedGpuCommands));
     ImGui::EndTable();

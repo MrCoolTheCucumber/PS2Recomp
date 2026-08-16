@@ -65,6 +65,10 @@ ps2x::performance::TelemetrySnapshot populatedSnapshot() {
   snapshot.gs.routingAcceleratedPixels = 43u;
   snapshot.gs.routingFallbackPixels = 44u;
   snapshot.gs.softwareRasterHostNanoseconds = 45u;
+  snapshot.gs.routingFlushes = 46u;
+  snapshot.gs.routingBackendSwitches = 47u;
+  for (size_t index = 0u; index < kTelemetryFlushReasonCount; ++index)
+    snapshot.gs.routingFlushReasons[index] = 100u + index;
   snapshot.gs.vulkanRoundTripsCompleted = 46u;
   snapshot.gs.vulkanRoundTripsFailed = 47u;
   snapshot.gs.vulkanRequestWaits = 48u;
@@ -77,6 +81,18 @@ ps2x::performance::TelemetrySnapshot populatedSnapshot() {
   snapshot.gs.vulkanFenceWaitNanoseconds = 55u;
   snapshot.gs.vulkanCommittedGpuCommands = 56u;
   snapshot.gs.vulkanVerificationMismatches = 57u;
+  snapshot.gs.vulkanResourceHazardDrains = 58u;
+  snapshot.gs.vulkanQueueBackpressureDrains = 59u;
+  snapshot.gs.vulkanPipelineChangeDrains = 60u;
+  snapshot.gs.vulkanCpuAccessPreparations = 61u;
+  snapshot.gs.vulkanCpuToGpuOperations = 62u;
+  snapshot.gs.vulkanCpuToGpuPages = 63u;
+  snapshot.gs.vulkanGpuToCpuOperations = 64u;
+  snapshot.gs.vulkanGpuToCpuPages = 65u;
+  for (size_t index = 0u; index < kTelemetryFlushReasonCount; ++index) {
+    snapshot.gs.vulkanDownloadOperationsByReason[index] = 200u + index;
+    snapshot.gs.vulkanDownloadedPagesByReason[index] = 300u + index;
+  }
   snapshot.vu1.asyncEnabled = true;
   snapshot.vu1.pendingSlice = true;
   snapshot.vu1.deferredSlice = true;
@@ -132,10 +148,12 @@ void testProtocolRoundTrip() {
         "protocol rejects control methods");
 
   std::string wrongSchema = encoded;
-  const size_t schema = wrongSchema.find("\"schema\":1");
+  const std::string schemaField =
+      "\"schema\":" + std::to_string(kTelemetrySchemaVersion);
+  const size_t schema = wrongSchema.find(schemaField);
   check(schema != std::string::npos, "encoded schema field is present");
   if (schema != std::string::npos)
-    wrongSchema.replace(schema, 10u, "\"schema\":2");
+    wrongSchema.replace(schema, schemaField.size(), "\"schema\":999");
   check(!parseSnapshotResponse(wrongSchema, responseId, decoded, &error),
         "protocol rejects an unknown schema");
 }
@@ -158,6 +176,29 @@ void testRatesAndResetHandling() {
   previous.gs.routingSoftwarePixels = 1'000u;
   previous.gs.routingAcceleratedPixels = 2'000u;
   previous.gs.softwareRasterHostNanoseconds = 50u;
+  previous.gs.routingFlushes = 100u;
+  previous.gs.routingBackendSwitches = 80u;
+  previous.gs.routingFlushReasons[flushReasonIndex(
+      TelemetryFlushReason::BackendSwitch)] = 70u;
+  previous.gs
+      .routingFlushReasons[flushReasonIndex(TelemetryFlushReason::Transfer)] =
+      10u;
+  previous.gs.vulkanQueueSubmissions = 1'000u;
+  previous.gs.vulkanShaderDispatches = 2'000u;
+  previous.gs.vulkanBytesUploaded = 10'000u;
+  previous.gs.vulkanBytesDownloaded = 20'000u;
+  previous.gs.vulkanResourceHazardDrains = 30u;
+  previous.gs.vulkanQueueBackpressureDrains = 40u;
+  previous.gs.vulkanPipelineChangeDrains = 50u;
+  previous.gs.vulkanCpuAccessPreparations = 60u;
+  previous.gs.vulkanCpuToGpuOperations = 70u;
+  previous.gs.vulkanCpuToGpuPages = 80u;
+  previous.gs.vulkanGpuToCpuOperations = 90u;
+  previous.gs.vulkanGpuToCpuPages = 100u;
+  const size_t backendSwitch =
+      flushReasonIndex(TelemetryFlushReason::BackendSwitch);
+  previous.gs.vulkanDownloadOperationsByReason[backendSwitch] = 110u;
+  previous.gs.vulkanDownloadedPagesByReason[backendSwitch] = 120u;
 
   TelemetrySnapshot current = previous;
   current.monotonicNanoseconds = 2'000'000'000u;
@@ -174,10 +215,33 @@ void testRatesAndResetHandling() {
   current.gs.routingSoftwarePixels += 250u;
   current.gs.routingAcceleratedPixels += 750u;
   current.gs.softwareRasterHostNanoseconds += 2'000'000'000u;
+  current.gs.routingFlushes += 12u;
+  current.gs.routingBackendSwitches += 6u;
+  current.gs.routingFlushReasons[backendSwitch] += 6u;
+  current.gs
+      .routingFlushReasons[flushReasonIndex(TelemetryFlushReason::Transfer)] +=
+      3u;
+  current.gs.vulkanQueueSubmissions += 60u;
+  current.gs.vulkanShaderDispatches += 90u;
+  current.gs.vulkanBytesUploaded += 3'000u;
+  current.gs.vulkanBytesDownloaded += 6'000u;
+  current.gs.vulkanResourceHazardDrains += 3u;
+  current.gs.vulkanQueueBackpressureDrains += 6u;
+  current.gs.vulkanPipelineChangeDrains += 9u;
+  current.gs.vulkanCpuAccessPreparations += 15u;
+  current.gs.vulkanCpuToGpuOperations += 9u;
+  current.gs.vulkanCpuToGpuPages += 90u;
+  current.gs.vulkanGpuToCpuOperations += 6u;
+  current.gs.vulkanGpuToCpuPages += 60u;
+  current.gs.vulkanDownloadOperationsByReason[backendSwitch] += 3u;
+  current.gs.vulkanDownloadedPagesByReason[backendSwitch] += 30u;
 
   const TelemetryRates rates = calculateTelemetryRates(previous, current);
   check(rates.valid, "telemetry rate interval is valid");
   check(rates.routingValid, "routing interval is valid");
+  check(rates.presentationValid, "presentation normalization is valid");
+  check(rates.batchingValid, "batching counter interval is valid");
+  check(rates.coherencyValid, "coherency counter interval is valid");
   checkNear(rates.framesPerSecond, 30.0, "presentation FPS");
   checkNear(rates.speedPercent, 100.0, "VSync speed percentage");
   checkNear(rates.gsOwnerBusyPercent, 80.0, "GS owner busy ratio");
@@ -189,12 +253,62 @@ void testRatesAndResetHandling() {
   checkNear(rates.acceleratedPixelPercent, 75.0, "accelerated pixel share");
   checkNear(rates.softwareRasterCorePercent, 200.0,
             "parallel software raster core cost may exceed one core");
+  checkNear(rates.softwareCommandsPerPresentation, 1.0 / 3.0,
+            "software draws per presentation");
+  checkNear(rates.acceleratedCommandsPerPresentation, 1.0,
+            "accelerated draws per presentation");
+  checkNear(rates.noopCommandsPerPresentation, 1.0 / 3.0,
+            "no-op draws per presentation");
+  checkNear(rates.fallbackCommandsPerPresentation, 1.0 / 15.0,
+            "fallback draws per presentation");
+  checkNear(rates.backendSwitchesPerSecond, 6.0, "backend switches per second");
+  checkNear(rates.backendSwitchesPerPresentation, 0.2,
+            "backend switches per presentation");
+  checkNear(rates.routingFlushesPerPresentation, 0.4,
+            "router flushes per presentation");
+  checkNear(rates.routingFlushReasonsPerPresentation[backendSwitch], 0.2,
+            "backend-switch flushes per presentation");
+  checkNear(rates.vulkanSubmissionsPerPresentation, 2.0,
+            "Vulkan submissions per presentation");
+  checkNear(rates.vulkanDispatchesPerPresentation, 3.0,
+            "Vulkan dispatches per presentation");
+  checkNear(rates.vulkanUploadBytesPerPresentation, 100.0,
+            "Vulkan upload bytes per presentation");
+  checkNear(rates.vulkanDownloadBytesPerPresentation, 200.0,
+            "Vulkan download bytes per presentation");
+  checkNear(rates.vulkanResourceHazardDrainsPerPresentation, 0.1,
+            "resource drains per presentation");
+  checkNear(rates.vulkanQueueBackpressureDrainsPerPresentation, 0.2,
+            "queue drains per presentation");
+  checkNear(rates.vulkanPipelineChangeDrainsPerPresentation, 0.3,
+            "pipeline drains per presentation");
+  checkNear(rates.vulkanCpuAccessPreparationsPerPresentation, 0.5,
+            "CPU access preparations per presentation");
+  checkNear(rates.vulkanCpuToGpuOperationsPerPresentation, 0.3,
+            "CPU-to-GPU operations per presentation");
+  checkNear(rates.vulkanCpuToGpuPagesPerPresentation, 3.0,
+            "CPU-to-GPU pages per presentation");
+  checkNear(rates.vulkanGpuToCpuOperationsPerPresentation, 0.2,
+            "GPU-to-CPU operations per presentation");
+  checkNear(rates.vulkanGpuToCpuPagesPerPresentation, 2.0,
+            "GPU-to-CPU pages per presentation");
+  checkNear(
+      rates.vulkanDownloadOperationsByReasonPerPresentation[backendSwitch], 0.1,
+      "switch-caused downloads per presentation");
+  checkNear(rates.vulkanDownloadedPagesByReasonPerPresentation[backendSwitch],
+            1.0, "switch-caused downloaded pages per presentation");
 
   current.monotonicNanoseconds += 1'000'000'000u;
   current.gs.routingSoftwareCommands = 0u;
+  current.gs.routingBackendSwitches = 0u;
+  current.gs.vulkanCpuToGpuOperations = 0u;
   const TelemetryRates resetRates = calculateTelemetryRates(previous, current);
   check(!resetRates.routingValid,
         "routing counter reset never underflows into a bogus rate");
+  check(!resetRates.batchingValid,
+        "batching counter reset never underflows into a bogus rate");
+  check(!resetRates.coherencyValid,
+        "coherency counter reset never underflows into a bogus rate");
 }
 
 void testLinuxThreadParsing() {

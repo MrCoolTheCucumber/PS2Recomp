@@ -94,6 +94,27 @@ bool sendAll(int socket, std::string_view bytes) {
   }
   return true;
 }
+
+ps2x::performance::FlushReasonCounters copyFlushReasonCounters(
+    const std::array<uint64_t, GS_FLUSH_REASON_COUNT> &source) noexcept {
+  return {
+      source[static_cast<size_t>(GsFlushReason::Explicit)],
+      source[static_cast<size_t>(GsFlushReason::Transfer)],
+      source[static_cast<size_t>(GsFlushReason::CpuReadback)],
+      source[static_cast<size_t>(GsFlushReason::FeedbackSnapshot)],
+      source[static_cast<size_t>(GsFlushReason::ClutHazard)],
+      source[static_cast<size_t>(GsFlushReason::Finish)],
+      source[static_cast<size_t>(GsFlushReason::PresentationLatch)],
+      source[static_cast<size_t>(GsFlushReason::DebuggerObservation)],
+      source[static_cast<size_t>(GsFlushReason::BackendSwitch)],
+      source[static_cast<size_t>(GsFlushReason::Reset)],
+      source[static_cast<size_t>(GsFlushReason::SaveLoad)],
+      source[static_cast<size_t>(GsFlushReason::Shutdown)],
+      source[static_cast<size_t>(GsFlushReason::QueueBackpressure)],
+      source[static_cast<size_t>(GsFlushReason::ResourceHazard)],
+      source[static_cast<size_t>(GsFlushReason::PipelineChange)],
+  };
+}
 } // namespace
 
 class PS2PerformanceHudImpl {
@@ -432,6 +453,26 @@ private:
         renderer.backendStatistics.committedGpuCommands;
     snapshot.gs.vulkanVerificationMismatches =
         renderer.backendStatistics.verificationMismatches;
+    snapshot.gs.vulkanResourceHazardDrains =
+        renderer.backendStatistics.resourceHazardDrains;
+    snapshot.gs.vulkanQueueBackpressureDrains =
+        renderer.backendStatistics.queueBackpressureDrains;
+    snapshot.gs.vulkanPipelineChangeDrains =
+        renderer.backendStatistics.pipelineChangeDrains;
+    snapshot.gs.vulkanCpuAccessPreparations =
+        renderer.backendStatistics.cpuAccessPreparations;
+    snapshot.gs.vulkanCpuToGpuOperations =
+        renderer.backendStatistics.coherency.cpuToGpuOperations;
+    snapshot.gs.vulkanCpuToGpuPages =
+        renderer.backendStatistics.coherency.cpuToGpuPages;
+    snapshot.gs.vulkanGpuToCpuOperations =
+        renderer.backendStatistics.coherency.gpuToCpuOperations;
+    snapshot.gs.vulkanGpuToCpuPages =
+        renderer.backendStatistics.coherency.gpuToCpuPages;
+    snapshot.gs.vulkanDownloadOperationsByReason = copyFlushReasonCounters(
+        renderer.backendStatistics.pageDownloadOperationsByReason);
+    snapshot.gs.vulkanDownloadedPagesByReason = copyFlushReasonCounters(
+        renderer.backendStatistics.pagesDownloadedByReason);
 
     const GsBackendCountersResult routing =
         takeGsCommandResult<GsBackendCountersResult>(
@@ -448,6 +489,10 @@ private:
     snapshot.gs.routingFallbackPixels = routing.counters.fallbackPixels;
     snapshot.gs.softwareRasterHostNanoseconds =
         routing.counters.softwareRasterHostNanoseconds;
+    snapshot.gs.routingFlushes = routing.counters.flushes;
+    snapshot.gs.routingBackendSwitches = routing.counters.backendSwitches;
+    snapshot.gs.routingFlushReasons =
+        copyFlushReasonCounters(routing.counters.flushReasons);
     return snapshot;
   }
 

@@ -1,12 +1,45 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
 
 namespace ps2x::performance {
-inline constexpr uint32_t kTelemetrySchemaVersion = 1u;
+inline constexpr uint32_t kTelemetrySchemaVersion = 2u;
 inline constexpr uint64_t kEeCyclesPerSecond = 294'912'000u;
+
+// Matches the semantic order of the runtime's GsFlushReason without exposing
+// renderer headers to the standalone telemetry client.
+enum class TelemetryFlushReason : size_t {
+  Explicit,
+  Transfer,
+  CpuReadback,
+  FeedbackSnapshot,
+  ClutHazard,
+  Finish,
+  PresentationLatch,
+  DebuggerObservation,
+  BackendSwitch,
+  Reset,
+  SaveLoad,
+  Shutdown,
+  QueueBackpressure,
+  ResourceHazard,
+  PipelineChange,
+  Count,
+};
+
+inline constexpr size_t kTelemetryFlushReasonCount =
+    static_cast<size_t>(TelemetryFlushReason::Count);
+using FlushReasonCounters = std::array<uint64_t, kTelemetryFlushReasonCount>;
+using FlushReasonRates = std::array<double, kTelemetryFlushReasonCount>;
+
+[[nodiscard]] constexpr size_t
+flushReasonIndex(TelemetryFlushReason reason) noexcept {
+  return static_cast<size_t>(reason);
+}
 
 struct GuestTelemetry {
   uint64_t eeTick = 0u;
@@ -44,6 +77,9 @@ struct GsTelemetry {
   uint64_t routingAcceleratedPixels = 0u;
   uint64_t routingFallbackPixels = 0u;
   uint64_t softwareRasterHostNanoseconds = 0u;
+  uint64_t routingFlushes = 0u;
+  uint64_t routingBackendSwitches = 0u;
+  FlushReasonCounters routingFlushReasons{};
 
   uint64_t vulkanRoundTripsCompleted = 0u;
   uint64_t vulkanRoundTripsFailed = 0u;
@@ -57,6 +93,16 @@ struct GsTelemetry {
   uint64_t vulkanFenceWaitNanoseconds = 0u;
   uint64_t vulkanCommittedGpuCommands = 0u;
   uint64_t vulkanVerificationMismatches = 0u;
+  uint64_t vulkanResourceHazardDrains = 0u;
+  uint64_t vulkanQueueBackpressureDrains = 0u;
+  uint64_t vulkanPipelineChangeDrains = 0u;
+  uint64_t vulkanCpuAccessPreparations = 0u;
+  uint64_t vulkanCpuToGpuOperations = 0u;
+  uint64_t vulkanCpuToGpuPages = 0u;
+  uint64_t vulkanGpuToCpuOperations = 0u;
+  uint64_t vulkanGpuToCpuPages = 0u;
+  FlushReasonCounters vulkanDownloadOperationsByReason{};
+  FlushReasonCounters vulkanDownloadedPagesByReason{};
 };
 
 struct Vu1Telemetry {
@@ -109,6 +155,9 @@ struct TelemetrySnapshot {
 struct TelemetryRates {
   bool valid = false;
   bool routingValid = false;
+  bool presentationValid = false;
+  bool batchingValid = false;
+  bool coherencyValid = false;
   double elapsedSeconds = 0.0;
   double framesPerSecond = 0.0;
   double speedPercent = 0.0;
@@ -127,14 +176,39 @@ struct TelemetryRates {
   double fallbackCommandsPerSecond = 0.0;
   double softwareCommandsPerSecond = 0.0;
   double acceleratedCommandsPerSecond = 0.0;
+  double noopCommandsPerSecond = 0.0;
   double softwarePixelsPerSecond = 0.0;
   double acceleratedPixelsPerSecond = 0.0;
+  double fallbackCommandsPerPresentation = 0.0;
+  double softwareCommandsPerPresentation = 0.0;
+  double acceleratedCommandsPerPresentation = 0.0;
+  double noopCommandsPerPresentation = 0.0;
+  double backendSwitchesPerSecond = 0.0;
+  double backendSwitchesPerPresentation = 0.0;
+  double routingFlushesPerSecond = 0.0;
+  double routingFlushesPerPresentation = 0.0;
+  FlushReasonRates routingFlushReasonsPerSecond{};
+  FlushReasonRates routingFlushReasonsPerPresentation{};
   double vulkanSubmissionsPerSecond = 0.0;
   double vulkanDispatchesPerSecond = 0.0;
+  double vulkanSubmissionsPerPresentation = 0.0;
+  double vulkanDispatchesPerPresentation = 0.0;
   double vulkanRequestWaitPercent = 0.0;
   double vulkanFenceWaitPercent = 0.0;
   double vulkanUploadBytesPerSecond = 0.0;
   double vulkanDownloadBytesPerSecond = 0.0;
+  double vulkanUploadBytesPerPresentation = 0.0;
+  double vulkanDownloadBytesPerPresentation = 0.0;
+  double vulkanResourceHazardDrainsPerPresentation = 0.0;
+  double vulkanQueueBackpressureDrainsPerPresentation = 0.0;
+  double vulkanPipelineChangeDrainsPerPresentation = 0.0;
+  double vulkanCpuAccessPreparationsPerPresentation = 0.0;
+  double vulkanCpuToGpuOperationsPerPresentation = 0.0;
+  double vulkanCpuToGpuPagesPerPresentation = 0.0;
+  double vulkanGpuToCpuOperationsPerPresentation = 0.0;
+  double vulkanGpuToCpuPagesPerPresentation = 0.0;
+  FlushReasonRates vulkanDownloadOperationsByReasonPerPresentation{};
+  FlushReasonRates vulkanDownloadedPagesByReasonPerPresentation{};
 };
 
 [[nodiscard]] TelemetryRates
