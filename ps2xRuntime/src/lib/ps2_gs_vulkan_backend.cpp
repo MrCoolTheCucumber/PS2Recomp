@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace
@@ -1908,21 +1909,38 @@ void GsVulkanRasterBackend::submit(
          commandIndex < commands.size(); ++commandIndex)
     {
         const GsDrawCommand &command = commands[commandIndex];
-        GsVulkanCt32Sprite sprite{};
-        GsVulkanDepthCt32Sprite depthSprite{};
-        GsVulkanNearestCt32Sprite texturedSprite{};
-        GsVulkanLinearCt32Sprite linearTexturedSprite{};
+        // Only one setup family can consume a command. Keep the large plain-
+        // data records disengaged until classification selects that family;
+        // eagerly value-initializing every alternative costs several
+        // kilobytes of stores for each singleton production submission.
+        using SetupRecord = std::variant<
+            std::monostate,
+            GsVulkanCt32Sprite,
+            GsVulkanDepthCt32Sprite,
+            GsVulkanNearestCt32Sprite,
+            GsVulkanLinearCt32Sprite,
+            GsVulkanFeedbackLinearDepthCt32Sprite,
+            GsVulkanFeedbackNearestDepthCt32Triangle,
+            GsVulkanCt32Triangle,
+            GsVulkanGouraudDepthCt32Triangle,
+            GsVulkanResidentT8GouraudDepthCt32Triangle,
+            GsVulkanT8GouraudDepthCt32Triangle>;
+        SetupRecord setupRecord;
+        GsVulkanCt32Sprite *sprite = nullptr;
+        GsVulkanDepthCt32Sprite *depthSprite = nullptr;
+        GsVulkanNearestCt32Sprite *texturedSprite = nullptr;
+        GsVulkanLinearCt32Sprite *linearTexturedSprite = nullptr;
         GsVulkanFeedbackLinearDepthCt32Sprite
-            feedbackLinearDepthSprite{};
+            *feedbackLinearDepthSprite = nullptr;
         GsVulkanFeedbackNearestDepthCt32Triangle
-            feedbackNearestDepthTriangle{};
-        GsVulkanCt32Triangle triangle{};
+            *feedbackNearestDepthTriangle = nullptr;
+        GsVulkanCt32Triangle *triangle = nullptr;
         GsVulkanGouraudDepthCt32Triangle
-            gouraudDepthTriangle{};
+            *gouraudDepthTriangle = nullptr;
         GsVulkanResidentT8GouraudDepthCt32Triangle
-            t8GouraudDepthTriangle{};
+            *t8GouraudDepthTriangle = nullptr;
         GsVulkanT8GouraudDepthCt32Triangle
-            verifiedT8GouraudDepthTriangle{};
+            *verifiedT8GouraudDepthTriangle = nullptr;
         GsVulkanDecodedPalette t8Palette;
         const GsDrawResources &resources = singleton
             ? (singletonIsFeedbackNearest
@@ -1951,10 +1969,13 @@ void GsVulkanRasterBackend::submit(
                  ? singletonIsFeedbackNearest
                  : commandIsFeedbackNearest[commandIndex] != 0u))
         {
+            feedbackNearestDepthTriangle =
+                &setupRecord.emplace<
+                    GsVulkanFeedbackNearestDepthCt32Triangle>();
             const GsBackendDecision prepared =
                 prepareGsVulkanFeedbackNearestDepthCt32Triangle(
                     command,
-                    feedbackNearestDepthTriangle,
+                    *feedbackNearestDepthTriangle,
                     &resources);
             if (!prepared.supported)
             {
@@ -2012,45 +2033,63 @@ void GsVulkanRasterBackend::submit(
                 }
                 t8Palette = m_impl->cachedDecodedPalette;
             }
-            const GsBackendDecision prepared =
-                prepareGsVulkanPreclassifiedResidentT8GouraudDepthCt32Triangle(
-                    command, 0u, t8GouraudDepthTriangle);
-            if (!prepared.supported)
+            if (m_impl->config.mode != GsRendererMode::Verify)
             {
-                m_impl->failRequest(
-                    "T8 Gouraud triangle preparation for draw " +
-                        std::to_string(command.sequence()),
-                    "frontend did not provide a valid decoded palette or setup record");
+                t8GouraudDepthTriangle =
+                    &setupRecord.emplace<
+                        GsVulkanResidentT8GouraudDepthCt32Triangle>();
+                const GsBackendDecision prepared =
+                    prepareGsVulkanPreclassifiedResidentT8GouraudDepthCt32Triangle(
+                        command, 0u, *t8GouraudDepthTriangle);
+                if (!prepared.supported)
+                {
+                    m_impl->failRequest(
+                        "T8 Gouraud triangle preparation for draw " +
+                            std::to_string(command.sequence()),
+                        "frontend did not provide a valid decoded palette or setup record");
+                }
             }
-            if (m_impl->config.mode == GsRendererMode::Verify &&
-                !prepareGsVulkanT8GouraudDepthCt32Triangle(
-                    command, t8Palette.colors,
-                    verifiedT8GouraudDepthTriangle,
-                    &resources).supported)
+            else
             {
-                m_impl->failRequest(
-                    "T8 Gouraud verification preparation for draw " +
-                        std::to_string(command.sequence()),
-                    "frontend did not provide a valid decoded palette or setup record");
+                verifiedT8GouraudDepthTriangle =
+                    &setupRecord.emplace<
+                        GsVulkanT8GouraudDepthCt32Triangle>();
+                if (!prepareGsVulkanT8GouraudDepthCt32Triangle(
+                        command, t8Palette.colors,
+                        *verifiedT8GouraudDepthTriangle,
+                        &resources).supported)
+                {
+                    m_impl->failRequest(
+                        "T8 Gouraud verification preparation for draw " +
+                            std::to_string(command.sequence()),
+                        "frontend did not provide a valid decoded palette or setup record");
+                }
             }
             isT8GouraudDepthTriangle = true;
         }
         else if (isTriangle)
         {
+            triangle =
+                &setupRecord.emplace<GsVulkanCt32Triangle>();
             const GsBackendDecision triangleDecision =
-                prepareGsVulkanCt32Triangle(command, triangle);
+                prepareGsVulkanCt32Triangle(command, *triangle);
             if (!triangleDecision.supported)
             {
+                gouraudDepthTriangle =
+                    &setupRecord.emplace<
+                        GsVulkanGouraudDepthCt32Triangle>();
                 isGouraudDepthTriangle =
                     prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
-                        command, gouraudDepthTriangle).supported;
+                        command, *gouraudDepthTriangle).supported;
             }
         }
         else if (isTexturedSprite)
         {
+            texturedSprite =
+                &setupRecord.emplace<GsVulkanNearestCt32Sprite>();
             const GsBackendDecision textureDecision =
                 prepareGsVulkanNearestCt32Sprite(
-                    command, texturedSprite);
+                    command, *texturedSprite);
             if (!textureDecision.supported)
             {
                 if ((m_impl->config.mode == GsRendererMode::Hybrid ||
@@ -2058,48 +2097,57 @@ void GsVulkanRasterBackend::submit(
                      m_impl->config.mode == GsRendererMode::GpuStrict) &&
                     resources.framebufferTextureAlias)
                 {
+                    feedbackLinearDepthSprite =
+                        &setupRecord.emplace<
+                            GsVulkanFeedbackLinearDepthCt32Sprite>();
                     const GsBackendDecision feedbackDecision =
                         prepareGsVulkanFeedbackLinearDepthCt32Sprite(
-                            command, feedbackLinearDepthSprite);
+                            command, *feedbackLinearDepthSprite);
                     isFeedbackLinearDepthSprite =
                         feedbackDecision.supported;
                 }
                 if (!isFeedbackLinearDepthSprite)
                 {
+                    linearTexturedSprite =
+                        &setupRecord.emplace<
+                            GsVulkanLinearCt32Sprite>();
                     (void)prepareGsVulkanLinearCt32Sprite(
-                        command, linearTexturedSprite);
+                        command, *linearTexturedSprite);
                     isLinearTexturedSprite = true;
                 }
             }
         }
         else
         {
+            sprite = &setupRecord.emplace<GsVulkanCt32Sprite>();
             const GsBackendDecision spriteDecision =
-                prepareGsVulkanCt32Sprite(command, sprite);
+                prepareGsVulkanCt32Sprite(command, *sprite);
             if (!spriteDecision.supported)
             {
+                depthSprite =
+                    &setupRecord.emplace<GsVulkanDepthCt32Sprite>();
                 GsBackendDecision depthDecision =
                     prepareGsVulkanSourceOverCt32Sprite(
-                        command, depthSprite);
+                        command, *depthSprite);
                 if (!depthDecision.supported)
                 {
                     depthDecision =
                         prepareGsVulkanDepthCt32Sprite(
-                            command, depthSprite);
+                            command, *depthSprite);
                     if (!depthDecision.supported &&
                         depthDecision.reason ==
                             GsFallbackReason::AlphaBlend)
                     {
                         depthDecision =
                             prepareGsVulkanSourceOverDepthCt32Sprite(
-                                command, depthSprite);
+                                command, *depthSprite);
                     }
                 }
                 if (!depthDecision.supported)
                 {
                     const GsBackendDecision framebufferOnlyDecision =
                         prepareGsVulkanFramebufferOnlyAlphaFailDepthCt32Sprite(
-                            command, depthSprite);
+                            command, *depthSprite);
                     if (framebufferOnlyDecision.supported)
                         depthDecision = framebufferOnlyDecision;
                 }
@@ -2137,59 +2185,59 @@ void GsVulkanRasterBackend::submit(
                 executed = m_impl->executor
                     ->executeFeedbackNearestDepthCt32Triangle(
                         initial, feedbackSnapshot,
-                        feedbackNearestDepthTriangle,
+                        *feedbackNearestDepthTriangle,
                         gpuOutput, &executionError);
             }
             else if (isT8GouraudDepthTriangle)
             {
                 executed = m_impl->executor
                     ->executeT8GouraudDepthCt32Triangle(
-                        initial, verifiedT8GouraudDepthTriangle,
+                        initial, *verifiedT8GouraudDepthTriangle,
                         gpuOutput, &executionError);
             }
             else if (isGouraudDepthTriangle)
             {
                 executed = m_impl->executor
                     ->executeGouraudDepthCt32Triangle(
-                        initial, gouraudDepthTriangle,
+                        initial, *gouraudDepthTriangle,
                         gpuOutput, &executionError);
             }
             else if (isTriangle)
             {
                 executed = m_impl->executor->executeCt32Triangle(
-                    initial, triangle, gpuOutput, &executionError);
+                    initial, *triangle, gpuOutput, &executionError);
             }
             else if (isFeedbackLinearDepthSprite)
             {
                 executed = m_impl->executor
                     ->executeFeedbackLinearDepthCt32Sprite(
                         initial, feedbackSnapshot,
-                        feedbackLinearDepthSprite, gpuOutput,
+                        *feedbackLinearDepthSprite, gpuOutput,
                         &executionError);
             }
             else if (isDepthSprite)
             {
                 executed = m_impl->executor->executeDepthCt32Sprite(
-                    initial, depthSprite, gpuOutput, &executionError);
+                    initial, *depthSprite, gpuOutput, &executionError);
             }
             else if (isLinearTexturedSprite)
             {
                 executed =
                     m_impl->executor->executeLinearCt32Sprite(
-                        initial, linearTexturedSprite, gpuOutput,
+                        initial, *linearTexturedSprite, gpuOutput,
                         &executionError);
             }
             else if (isTexturedSprite)
             {
                 executed =
                     m_impl->executor->executeNearestCt32Sprite(
-                        initial, texturedSprite, gpuOutput,
+                        initial, *texturedSprite, gpuOutput,
                         &executionError);
             }
             else
             {
                 executed = m_impl->executor->executeCt32Sprite(
-                    initial, sprite, gpuOutput, &executionError);
+                    initial, *sprite, gpuOutput, &executionError);
             }
             if (!executed ||
                 gpuOutput.size() != GS_VULKAN_VRAM_SIZE)
@@ -2233,7 +2281,7 @@ void GsVulkanRasterBackend::submit(
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
-                        command, feedbackNearestDepthTriangle,
+                        command, *feedbackNearestDepthTriangle,
                         firstDifference, initial,
                         m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError,
@@ -2243,7 +2291,7 @@ void GsVulkanRasterBackend::submit(
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
-                        command, verifiedT8GouraudDepthTriangle,
+                        command, *verifiedT8GouraudDepthTriangle,
                         firstDifference, initial,
                         m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError);
@@ -2252,7 +2300,7 @@ void GsVulkanRasterBackend::submit(
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
-                        command, gouraudDepthTriangle,
+                        command, *gouraudDepthTriangle,
                         firstDifference, initial,
                         m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError);
@@ -2261,7 +2309,7 @@ void GsVulkanRasterBackend::submit(
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
-                        command, triangle, firstDifference,
+                        command, *triangle, firstDifference,
                         initial, m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError);
                 }
@@ -2269,7 +2317,7 @@ void GsVulkanRasterBackend::submit(
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
-                        command, feedbackLinearDepthSprite,
+                        command, *feedbackLinearDepthSprite,
                         firstDifference, initial,
                         m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError,
@@ -2279,7 +2327,7 @@ void GsVulkanRasterBackend::submit(
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
-                        command, depthSprite, firstDifference,
+                        command, *depthSprite, firstDifference,
                         initial, m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError);
                 }
@@ -2287,7 +2335,7 @@ void GsVulkanRasterBackend::submit(
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
-                        command, linearTexturedSprite, firstDifference,
+                        command, *linearTexturedSprite, firstDifference,
                         initial, m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError);
                 }
@@ -2295,7 +2343,7 @@ void GsVulkanRasterBackend::submit(
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
-                        command, texturedSprite, firstDifference,
+                        command, *texturedSprite, firstDifference,
                         initial, m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError);
                 }
@@ -2303,7 +2351,7 @@ void GsVulkanRasterBackend::submit(
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
-                        command, sprite, firstDifference,
+                        command, *sprite, firstDifference,
                         initial, m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError);
                 }
@@ -2433,17 +2481,17 @@ void GsVulkanRasterBackend::submit(
                     m_impl->pendingFeedbackNearestDepthCt32Triangles.front();
                 const bool sameRenderTarget =
                     first.framebufferBaseBlock ==
-                        feedbackNearestDepthTriangle.framebufferBaseBlock &&
+                        feedbackNearestDepthTriangle->framebufferBaseBlock &&
                     first.framebufferWidth ==
-                        feedbackNearestDepthTriangle.framebufferWidth &&
+                        feedbackNearestDepthTriangle->framebufferWidth &&
                     first.depthBaseBlock ==
-                        feedbackNearestDepthTriangle.depthBaseBlock &&
+                        feedbackNearestDepthTriangle->depthBaseBlock &&
                     first.depthPsm ==
-                        feedbackNearestDepthTriangle.depthPsm &&
+                        feedbackNearestDepthTriangle->depthPsm &&
                     first.textureBaseBlock ==
-                        feedbackNearestDepthTriangle.textureBaseBlock &&
+                        feedbackNearestDepthTriangle->textureBaseBlock &&
                     first.textureWidth ==
-                        feedbackNearestDepthTriangle.textureWidth;
+                        feedbackNearestDepthTriangle->textureWidth;
                 const GsVulkanFeedbackSnapshotIdentity identity =
                     m_impl->feedbackSnapshotGeneration
                         ? m_impl->feedbackSnapshotGeneration()
@@ -2465,13 +2513,13 @@ void GsVulkanRasterBackend::submit(
                     m_impl->pendingT8GouraudDepthTriangles.front();
                 const bool sameRenderTarget =
                     first.framebufferBaseBlock ==
-                        t8GouraudDepthTriangle.framebufferBaseBlock &&
+                        t8GouraudDepthTriangle->framebufferBaseBlock &&
                     first.framebufferWidth ==
-                        t8GouraudDepthTriangle.framebufferWidth &&
+                        t8GouraudDepthTriangle->framebufferWidth &&
                     first.depthBaseBlock ==
-                        t8GouraudDepthTriangle.depthBaseBlock &&
+                        t8GouraudDepthTriangle->depthBaseBlock &&
                     first.depthPsm ==
-                        t8GouraudDepthTriangle.depthPsm;
+                        t8GouraudDepthTriangle->depthPsm;
                 GsVramPageMask textureReadPages =
                     resources.texturePages;
                 textureReadPages.unionWith(
@@ -2504,12 +2552,12 @@ void GsVulkanRasterBackend::submit(
                     m_impl->pendingGouraudDepthTriangles.front();
                 const bool sameRenderTarget =
                     first.framebufferBaseBlock ==
-                        gouraudDepthTriangle.framebufferBaseBlock &&
+                        gouraudDepthTriangle->framebufferBaseBlock &&
                     first.framebufferWidth ==
-                        gouraudDepthTriangle.framebufferWidth &&
+                        gouraudDepthTriangle->framebufferWidth &&
                     first.depthBaseBlock ==
-                        gouraudDepthTriangle.depthBaseBlock &&
-                    first.depthPsm == gouraudDepthTriangle.depthPsm;
+                        gouraudDepthTriangle->depthBaseBlock &&
+                    first.depthPsm == gouraudDepthTriangle->depthPsm;
                 if (!sameRenderTarget)
                 {
                     m_impl->drainPendingResidentCommands(
@@ -2563,7 +2611,7 @@ void GsVulkanRasterBackend::submit(
                 {
                     if (m_impl->pendingT8Palettes.empty())
                         m_impl->pendingT8Palettes.emplace_back();
-                    t8GouraudDepthTriangle.paletteIndex = 0u;
+                    t8GouraudDepthTriangle->paletteIndex = 0u;
                 }
                 else
                 {
@@ -2594,7 +2642,7 @@ void GsVulkanRasterBackend::submit(
                         m_impl->pendingT8PaletteCsa = t8Palette.csa;
                         m_impl->pendingT8PaletteIdentityValid = true;
                     }
-                    t8GouraudDepthTriangle.paletteIndex =
+                    t8GouraudDepthTriangle->paletteIndex =
                         static_cast<uint32_t>(
                             m_impl->pendingT8Palettes.size() - 1u);
                 }
@@ -2665,36 +2713,36 @@ void GsVulkanRasterBackend::submit(
             switch (pipeline)
             {
             case Impl::ResidentPipeline::Ct32Sprite:
-                m_impl->pendingSprites.push_back(sprite);
+                m_impl->pendingSprites.push_back(*sprite);
                 break;
             case Impl::ResidentPipeline::DepthCt32Sprite:
-                m_impl->pendingDepthCt32Sprites.push_back(depthSprite);
+                m_impl->pendingDepthCt32Sprites.push_back(*depthSprite);
                 break;
             case Impl::ResidentPipeline::NearestCt32Sprite:
-                m_impl->pendingNearestCt32Sprites.push_back(texturedSprite);
+                m_impl->pendingNearestCt32Sprites.push_back(*texturedSprite);
                 break;
             case Impl::ResidentPipeline::LinearCt32Sprite:
                 m_impl->pendingLinearCt32Sprites.push_back(
-                    linearTexturedSprite);
+                    *linearTexturedSprite);
                 break;
             case Impl::ResidentPipeline::FeedbackLinearDepthCt32Sprite:
                 m_impl->pendingFeedbackLinearDepthCt32Sprites.push_back(
-                    feedbackLinearDepthSprite);
+                    *feedbackLinearDepthSprite);
                 break;
             case Impl::ResidentPipeline::FeedbackNearestDepthCt32Triangle:
                 m_impl->pendingFeedbackNearestDepthCt32Triangles.push_back(
-                    feedbackNearestDepthTriangle);
+                    *feedbackNearestDepthTriangle);
                 break;
             case Impl::ResidentPipeline::Ct32Triangle:
-                m_impl->pendingTriangles.push_back(triangle);
+                m_impl->pendingTriangles.push_back(*triangle);
                 break;
             case Impl::ResidentPipeline::GouraudDepthCt32Triangle:
                 m_impl->pendingGouraudDepthTriangles.push_back(
-                    gouraudDepthTriangle);
+                    *gouraudDepthTriangle);
                 break;
             case Impl::ResidentPipeline::T8GouraudDepthCt32Triangle:
                 m_impl->pendingT8GouraudDepthTriangles.push_back(
-                    t8GouraudDepthTriangle);
+                    *t8GouraudDepthTriangle);
                 break;
             }
             ++m_impl->pendingResidentCommandTotal;
